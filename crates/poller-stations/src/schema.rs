@@ -1,51 +1,70 @@
 //! RDM Stations JSON schema and its mapping to `common::StationReference`.
 //!
-//! Per RSPS5050 P-03-00 Rev A, §6 (see `.superpowers/sdd/task-4-brief.md`),
-//! the field names below (`CrsCode`, `Name`, `Latitude`, `Longitude`,
-//! `StationOperator`, `Accessibility`) are transcribed verbatim from the
-//! spec — but the spec only documents them via the *sibling XML schema*,
-//! not the JSON OpenAPI spec directly, so the exact JSON casing (PascalCase
-//! vs camelCase vs something else) is **unconfirmed**. `rename_all =
-//! "PascalCase"` below is a best-effort guess matching the documented
-//! spelling, not a confirmed fact.
+//! Field names and structure below are taken from the National Rail Station
+//! API OpenAPI spec (v1.0.0, `paths./stations`, `components.schemas.Station`)
+//! — camelCase, confirmed directly from the JSON schema rather than
+//! transcribed from a sibling XML schema.
 //!
-//! To avoid shipping that guess blind, `main.rs`'s `fetch_stations_json`
-//! logs the raw response body at `debug` level *before* this module parses
-//! it. When a real run against the account's RDM endpoint happens, enable
-//! debug logging (`RUST_LOG=poller_stations=debug`), inspect the logged
-//! body, and adjust `rename_all`/per-field `rename` here to match observed
-//! reality if it differs.
+//! The spec's `200` response schema for `GET /stations` documents a bare
+//! JSON array of `Station`. The live API does not match that: a real
+//! response body (observed after a `RDM_TOCS_BASE_URL` misconfiguration
+//! pointed `poller-tocs` at this same product and it logged the response
+//! it couldn't parse) shows the array wrapped in an envelope object,
+//! `{"stations": [...]}`. `parse_stations` follows the observed reality,
+//! not the spec doc, and unwraps that envelope — if the spec is ever
+//! revised or the account's actual endpoint reconfirmed, re-check this.
 //!
-//! `Accessibility` is deliberately left as an opaque `serde_json::Value` —
-//! Global Constraint 7 says JSONB passthrough only, not hand-modeling the
-//! ~14 documented sub-fields (`Helpline`, `InductionLoop`,
-//! `AccessibleTicketMachines`, `RampForTrainAccess`,
-//! `StepFreeAccess.Coverage`, etc).
+//! The spec's `Station` object has dozens of fields covering facilities,
+//! accessibility, ticketing, transport links, car parks, etc. Only the
+//! handful with a direct `StationReference` column (`crsCode`, `name`,
+//! `location`, `stationOperator`) are modeled individually; everything else
+//! (`stationAccessibility`, `staffAssistance`, `toiletsAndChanging`,
+//! `transportLinks`, `lifts`, `ticketBuying`, `loungesAndWaiting`,
+//! `stationFacilities`, `helpAndSupport`, `platformFacilities`, `cycling`,
+//! `dropOffPickUp`, `carParks`, `changeHistory`, `slug`,
+//! `sixteenCharacterName`, `nationalLocationCode`, `minimumConnectionTime`,
+//! `address`, `stationAlerts`, `stationMap`, `staffingLevel`,
+//! `informationServices`) is collected verbatim via `#[serde(flatten)]` into
+//! the `accessibility` JSONB passthrough column — Global Constraint 7 says
+//! don't hand-model this, and the DB schema only has one passthrough column
+//! for it.
 //!
-//! Also unconfirmed: whether `GET /stations` returns a bare JSON array or
-//! wraps it in an envelope object (the spec doesn't name one, unlike the
-//! Incidents schema's `<Incidents>` root) — a bare array is the
-//! least-invented assumption, so that's what `parse_stations` expects.
+//! The spec doesn't document a security scheme, so the `x-apikey` auth
+//! header assumption (same as the other RDM pollers) is unchanged.
 
 use anyhow::Result;
 use common::StationReference;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct RdmStation {
-    pub crs_code: String,
-    pub name: String,
+#[serde(rename_all = "camelCase")]
+pub struct RdmLocation {
     #[serde(default)]
     pub latitude: Option<f64>,
     #[serde(default)]
     pub longitude: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RdmStationOperator {
     #[serde(default)]
-    pub station_operator: Option<String>,
-    /// JSONB passthrough — see module docs. Not decomposed into its ~14
-    /// documented sub-fields.
+    pub operator_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RdmStation {
+    pub crs_code: String,
+    pub name: String,
     #[serde(default)]
-    pub accessibility: serde_json::Value,
+    pub location: Option<RdmLocation>,
+    #[serde(default)]
+    pub station_operator: Option<RdmStationOperator>,
+    /// Every `Station` field not named above, captured verbatim — see
+    /// module docs.
+    #[serde(flatten)]
+    pub rest: serde_json::Value,
 }
 
 impl From<&RdmStation> for StationReference {
@@ -53,59 +72,70 @@ impl From<&RdmStation> for StationReference {
         StationReference {
             crs: station.crs_code.clone(),
             name: station.name.clone(),
-            latitude: station.latitude,
-            longitude: station.longitude,
-            station_operator: station.station_operator.clone(),
-            accessibility: station.accessibility.clone(),
+            latitude: station.location.as_ref().and_then(|l| l.latitude),
+            longitude: station.location.as_ref().and_then(|l| l.longitude),
+            station_operator: station
+                .station_operator
+                .as_ref()
+                .and_then(|so| so.operator_code.clone()),
+            accessibility: station.rest.clone(),
         }
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct StationsResponse {
+    stations: Vec<RdmStation>,
+}
+
 /// Parse a full RDM `/stations` JSON response body into `StationReference`s.
 ///
-/// Expects a bare JSON array (see module docs for why — no envelope name is
-/// documented in the spec).
+/// Expects `{"stations": [...]}` (see module docs — the live API wraps the
+/// array in an envelope despite the spec doc saying otherwise).
 pub fn parse_stations(json: &str) -> Result<Vec<StationReference>> {
-    let stations: Vec<RdmStation> = serde_json::from_str(json)?;
-    Ok(stations.iter().map(StationReference::from).collect())
+    let response: StationsResponse = serde_json::from_str(json)?;
+    Ok(response.stations.iter().map(StationReference::from).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Hand-written sample using the spec's documented field names
-    /// (`CrsCode`, `Name`, `Longitude`/`Latitude`, `StationOperator`,
-    /// `Accessibility`), including a nested `Accessibility` sub-object to
-    /// confirm it round-trips as `serde_json::Value` without being
-    /// decomposed into individual fields.
+    /// Hand-written sample matching the confirmed live shape: envelope
+    /// object (`{"stations": [...]}`), camelCase fields, nested `location`
+    /// and `stationOperator` objects, and unmodeled `Station` fields
+    /// (`slug`, `changeHistory`, ...) present to confirm they round-trip
+    /// verbatim via `#[serde(flatten)]` rather than being decomposed.
     const SAMPLE_JSON: &str = r#"
-        [
-            {
-                "CrsCode": "EUS",
-                "Name": "London Euston",
-                "Latitude": 51.528308,
-                "Longitude": -0.133541,
-                "StationOperator": "VT",
-                "Accessibility": {
-                    "Helpline": "0345 000 0000",
-                    "InductionLoop": true,
-                    "AccessibleTicketMachines": true,
-                    "RampForTrainAccess": true,
-                    "StepFreeAccess": {
-                        "Coverage": "Full"
+        {
+            "stations": [
+                {
+                    "crsCode": "EUS",
+                    "name": "London Euston",
+                    "location": {
+                        "latitude": 51.528308,
+                        "longitude": -0.133541
+                    },
+                    "stationOperator": {
+                        "name": "Network Rail",
+                        "slug": "network-rail",
+                        "operatorCode": "NR"
+                    },
+                    "slug": "london-euston",
+                    "changeHistory": {
+                        "changedBy": "AAP2",
+                        "lastChangedDate": "2026-06-23T21:37:34.000Z"
                     }
+                },
+                {
+                    "crsCode": "ABC",
+                    "name": "A Test Station",
+                    "location": null,
+                    "stationOperator": null,
+                    "slug": "a-test-station"
                 }
-            },
-            {
-                "CrsCode": "ABC",
-                "Name": "A Test Station",
-                "Latitude": null,
-                "Longitude": null,
-                "StationOperator": null,
-                "Accessibility": {}
-            }
-        ]
+            ]
+        }
     "#;
 
     #[test]
@@ -118,25 +148,20 @@ mod tests {
         assert_eq!(euston.name, "London Euston");
         assert_eq!(euston.latitude, Some(51.528308));
         assert_eq!(euston.longitude, Some(-0.133541));
-        assert_eq!(euston.station_operator, Some("VT".to_string()));
+        assert_eq!(euston.station_operator, Some("NR".to_string()));
 
-        // The accessibility sub-object must round-trip verbatim as a
+        // Unmodeled `Station` fields must round-trip verbatim as a
         // `serde_json::Value`, not be decomposed into individual fields.
-        let accessibility = euston.accessibility.as_object().expect("object");
+        let rest = euston.accessibility.as_object().expect("object");
         assert_eq!(
-            accessibility.get("Helpline").and_then(|v| v.as_str()),
-            Some("0345 000 0000")
+            rest.get("slug").and_then(|v| v.as_str()),
+            Some("london-euston")
         );
         assert_eq!(
-            accessibility.get("InductionLoop").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            accessibility
-                .get("StepFreeAccess")
-                .and_then(|v| v.get("Coverage"))
+            rest.get("changeHistory")
+                .and_then(|v| v.get("changedBy"))
                 .and_then(|v| v.as_str()),
-            Some("Full")
+            Some("AAP2")
         );
 
         let second = &stations[1];
@@ -144,6 +169,9 @@ mod tests {
         assert_eq!(second.latitude, None);
         assert_eq!(second.longitude, None);
         assert_eq!(second.station_operator, None);
-        assert_eq!(second.accessibility, serde_json::json!({}));
+        assert_eq!(
+            second.accessibility.get("slug").and_then(|v| v.as_str()),
+            Some("a-test-station")
+        );
     }
 }
