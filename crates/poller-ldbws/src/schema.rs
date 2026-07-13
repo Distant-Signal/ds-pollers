@@ -33,6 +33,21 @@ struct RdmServiceItem {
     cancel_reason: Option<String>,
     #[serde(default, rename = "delayReason")]
     delay_reason: Option<String>,
+    #[serde(default, rename = "subsequentCallingPoints")]
+    subsequent_calling_points: Vec<RdmCallingPointList>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RdmCallingPointList {
+    #[serde(default, rename = "callingPoint")]
+    calling_point: Vec<RdmCallingPoint>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RdmCallingPoint {
+    crs: String,
+    #[serde(default, rename = "isCancelled")]
+    is_cancelled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +76,22 @@ pub fn compute_delay_minutes(std: &str, etd: &str) -> i32 {
 
     let diff = (estimated - scheduled).num_minutes();
     if diff < 0 { (diff + 1440) as i32 } else { diff as i32 }
+}
+
+/// Flattens every calling point Darwin marks `isCancelled: true` across all
+/// of a service's `subsequentCallingPoints` entries (a service can report
+/// more than one when it splits/joins) into a single CRS list. A calling
+/// point that was never scheduled for this service doesn't appear in
+/// `subsequentCallingPoints` at all, so nothing here can mistake a normal
+/// fast-service stopping pattern for a genuine skip.
+fn extract_skipped_stations(service: &RdmServiceItem) -> Vec<String> {
+    service
+        .subsequent_calling_points
+        .iter()
+        .flat_map(|list| list.calling_point.iter())
+        .filter(|cp| cp.is_cancelled)
+        .map(|cp| cp.crs.clone())
+        .collect()
 }
 
 /// Maps one RDM `GetDepBoardWithDetails` JSON response body into the
@@ -92,6 +123,7 @@ pub fn parse_departures(json: &str) -> Result<Vec<StationDeparture>> {
                 cancel_reason: service.cancel_reason.clone(),
                 delay_reason: service.delay_reason.clone(),
                 headcode: None,
+                skipped_stations: extract_skipped_stations(service),
             })
         })
         .collect())
@@ -161,7 +193,15 @@ mod tests {
                     "cancelReason": null,
                     "delayReason": null,
                     "rsid": "GW123500",
-                    "serviceType": "train"
+                    "serviceType": "train",
+                    "subsequentCallingPoints": [
+                        {
+                            "callingPoint": [
+                                {"locationName": "Didcot Parkway", "crs": "DID", "st": "10:22", "isCancelled": true},
+                                {"locationName": "Oxford", "crs": "OXF", "st": "10:40", "isCancelled": false}
+                            ]
+                        }
+                    ]
                 },
                 {
                     "serviceID": "def456==",
@@ -201,11 +241,13 @@ mod tests {
             Some("This train has been delayed by a signalling problem".to_string())
         );
         assert_eq!(first.headcode, None);
+        assert_eq!(first.skipped_stations, Vec::<String>::new());
 
         let second = &departures[1];
         assert_eq!(second.estimated, "On time");
         assert_eq!(second.delay_minutes, 0);
         assert!(!second.is_cancelled);
+        assert_eq!(second.skipped_stations, vec!["DID".to_string()]);
 
         let third = &departures[2];
         assert!(third.is_cancelled);
@@ -214,6 +256,53 @@ mod tests {
             third.cancel_reason,
             Some("This train has been cancelled because of a fault on this train".to_string())
         );
+        assert_eq!(third.skipped_stations, Vec::<String>::new());
+    }
+
+    #[test]
+    fn skipped_stations_flattens_multiple_calling_point_lists() {
+        // A split/joined service reports more than one callingPointList
+        // (one per association) — both must be flattened into one result.
+        let service = RdmServiceItem {
+            service_id: "svc".to_string(),
+            operator_code: "GW".to_string(),
+            destination: vec![RdmServiceLocation { crs: "BRI".to_string() }],
+            std: "10:00".to_string(),
+            etd: "On time".to_string(),
+            is_cancelled: false,
+            cancel_reason: None,
+            delay_reason: None,
+            subsequent_calling_points: vec![
+                RdmCallingPointList {
+                    calling_point: vec![
+                        RdmCallingPoint { crs: "DID".to_string(), is_cancelled: true },
+                        RdmCallingPoint { crs: "SWI".to_string(), is_cancelled: false },
+                    ],
+                },
+                RdmCallingPointList {
+                    calling_point: vec![RdmCallingPoint { crs: "BRI".to_string(), is_cancelled: true }],
+                },
+            ],
+        };
+        let mut skipped = extract_skipped_stations(&service);
+        skipped.sort();
+        assert_eq!(skipped, vec!["BRI".to_string(), "DID".to_string()]);
+    }
+
+    #[test]
+    fn skipped_stations_empty_when_no_calling_points_reported() {
+        let service = RdmServiceItem {
+            service_id: "svc".to_string(),
+            operator_code: "GW".to_string(),
+            destination: vec![RdmServiceLocation { crs: "BRI".to_string() }],
+            std: "10:00".to_string(),
+            etd: "On time".to_string(),
+            is_cancelled: false,
+            cancel_reason: None,
+            delay_reason: None,
+            subsequent_calling_points: vec![],
+        };
+        assert_eq!(extract_skipped_stations(&service), Vec::<String>::new());
     }
 
     #[test]
