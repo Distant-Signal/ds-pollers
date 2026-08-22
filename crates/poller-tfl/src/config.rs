@@ -45,4 +45,23 @@ pub struct Config {
     /// `poller-incidents`, whose feed has a comparable update rhythm.
     #[arg(long, env, default_value_t = 300)]
     pub poll_interval_secs: u64,
+
+    /// Enables the DLR arrivals-diffing pilot (see
+    /// `docs/superpowers/plans/2026-08-22-dlr-arrivals-diffing-pilot.md`).
+    ///
+    /// Defaults **off**: the pilot was built without a real deployment to
+    /// run it against (no Docker or Postgres in the sandbox), so it has
+    /// never completed a clean cycle against the live API. It stays off
+    /// until the plan's Task 8 manual verification checklist has been run
+    /// clean once against a real deployment; after that it can be turned
+    /// on via this flag or `DLR_PILOT_ENABLED` with no redeploy. Off means
+    /// DLR reports `sample_stats: None`, same as every other TfL line.
+    #[arg(long, env, default_value_t = false)]
+    pub dlr_pilot_enabled: bool,
+
+    /// Poplar's Naptan id, used as the `stopPointId` for the DLR
+    /// Timetable poll. Not derived — this pilot covers one fixed station
+    /// only (see the plan's Global Constraints).
+    #[arg(long, env, default_value = "940GZZDLPOP")]
+    pub dlr_pilot_stop_point_id: String,
 }
