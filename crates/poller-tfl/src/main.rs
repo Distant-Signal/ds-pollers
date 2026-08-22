@@ -52,6 +52,20 @@ fn retry_delay(attempt: u32) -> Duration {
     Duration::from_secs(2u64.pow(attempt))
 }
 
+/// Fails startup if `key` is empty (after trimming whitespace). Guards
+/// against orchestrators that set `TFL_APP_KEY` to an empty string rather
+/// than leaving it unset — `clap`'s `env` attribute only enforces
+/// "present", not "non-empty", so that case would otherwise sail through
+/// `Config::parse()` and start polling TfL anonymously.
+fn require_non_empty_key(key: &str) -> anyhow::Result<()> {
+    if key.trim().is_empty() {
+        anyhow::bail!(
+            "TFL_APP_KEY must be set (see api-portal.tfl.gov.uk) — refusing to poll TfL anonymously"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
@@ -61,6 +75,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
+    // `clap` treats a present-but-empty env var as a supplied value, so an
+    // orchestrator (e.g. `docker-compose.yml`'s `TFL_APP_KEY: ${TFL_APP_KEY}`)
+    // that leaves the shell variable unset still gets `Config::parse()` to
+    // succeed with `tfl_app_key = ""` rather than failing — silently sending
+    // every request unauthenticated instead of refusing to start. Catch that
+    // here, before the client is built.
+    require_non_empty_key(&config.tfl_app_key)?;
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
 
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
@@ -162,5 +183,18 @@ mod tests {
         assert_eq!(retry_delay(2), Duration::from_secs(4));
         let total: u64 = (1..MAX_ATTEMPTS).map(|attempt| retry_delay(attempt).as_secs()).sum();
         assert!(total < 300, "total backoff {total}s must not overrun the 300s poll interval");
+    }
+
+    #[test]
+    fn an_empty_key_is_rejected() {
+        assert!(require_non_empty_key("").is_err());
+        // Whitespace-only is what a shell-expanded-but-blank env var can
+        // look like too (e.g. `TFL_APP_KEY=" "`); treat it the same as empty.
+        assert!(require_non_empty_key("   ").is_err());
+    }
+
+    #[test]
+    fn a_real_key_is_accepted() {
+        assert!(require_non_empty_key("abc123").is_ok());
     }
 }
