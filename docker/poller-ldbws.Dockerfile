@@ -1,9 +1,14 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for the `poller-ldbws` service.
 #
-# Builder pin: matches poller-incidents/poller-stations/poller-tocs at
-# rust:1.86-bookworm — this crate pulls in the same reqwest -> idna/icu_*
-# transitive chain requiring rustc 1.86+.
+# Builder pin: matches poller-incidents/poller-stations/poller-tfl/poller-tocs
+# at rust:1.88-bookworm — this crate pulls in the same reqwest -> url -> idna
+# -> idna_adapter -> icu_normalizer/icu_provider transitive chain (through
+# the `common` crate every poller depends on) requiring rustc 1.88+ --
+# confirmed by actually building this image against rust:1.86-bookworm first
+# and hitting:
+#   "error: rustc 1.86.0 is not supported ... icu_provider@2.3.1 requires
+#   rustc 1.88"
 #
 # Build from the repo root so the workspace's Cargo.toml/Cargo.lock and
 # crates/common path dependency are all in the build context:
@@ -16,7 +21,7 @@
 # its own leaves it at "release".
 ARG CARGO_PROFILE=release
 
-FROM rust:1.86-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 ARG CARGO_PROFILE
 
 WORKDIR /app
@@ -26,13 +31,11 @@ COPY . .
 # recompiles only what actually changed instead of the whole dependency
 # tree. Requires the `# syntax=` directive at the top of this file.
 #
-# The target cache id is keyed by rustc version (`cargo-target-1.86`) rather
-# than shared across all seven Rust services. Cargo's fingerprints include the
-# compiler version, so the 1.88 services (api, aggregator, enricher) and the
-# 1.86 ones (the four pollers) would otherwise invalidate and fully recompile
-# each other's artifacts on every alternating build. The registry and git
-# caches hold only downloaded sources, so sharing those across all seven is
-# safe.
+# The target cache id is keyed by rustc version (`cargo-target-1.88`). Every
+# Rust service in this workspace now builds with the same rustc version, so
+# this id is shared across all of them -- see docker-compose.yml's top-of-file
+# comment for the full list. The registry and git caches hold only downloaded
+# sources, so sharing those across all of them is safe too.
 #
 # `sharing=locked` because docker-compose builds services in parallel, and
 # concurrent cargo invocations must not share one target dir unserialised.
@@ -44,7 +47,7 @@ COPY . .
 # RUN — which is why the runtime stage below copies from /usr/local/bin/poller-ldbws.
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=cargo-target-1.86,target=/app/target,sharing=locked \
+    --mount=type=cache,id=cargo-target-1.88,target=/app/target,sharing=locked \
     if [ "$CARGO_PROFILE" = "release" ]; then \
       cargo build --release --bin poller-ldbws; \
     else \
