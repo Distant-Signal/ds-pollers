@@ -254,7 +254,7 @@ async fn fetch_status_json(client: &Client, config: &Config) -> anyhow::Result<S
 /// through here: a 429 or a 5xx has a body too, and handing that body to a
 /// parser produces a confusing serde error in place of the real cause.
 ///
-/// `what` names the call in errors, logs, and the `nr_status_tfl_fetch_total`
+/// `what` names the call in errors, logs, and the `distant_signal_tfl_fetch_total`
 /// metric's `what` label (e.g. `"line-status"`).
 async fn fetch_json(client: &Client, url: &str, config: &Config, what: &str) -> anyhow::Result<String> {
     let mut attempt = 0;
