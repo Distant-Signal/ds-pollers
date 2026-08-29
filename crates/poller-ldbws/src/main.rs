@@ -41,6 +41,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
+    if config.metrics_enabled {
+        common::metrics::install(config.metrics_port)?;
+    }
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
 
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
@@ -53,7 +56,21 @@ async fn main() -> anyhow::Result<()> {
     loop {
         interval.tick().await;
 
-        if let Err(err) = poll_once(&client, &config).await {
+        let cycle_start = std::time::Instant::now();
+        let result = poll_once(&client, &config).await;
+        metrics::histogram!(
+            common::metrics::metric_name("poller_cycle_duration_seconds"),
+            "poller" => "ldbws"
+        )
+        .record(cycle_start.elapsed().as_secs_f64());
+        metrics::counter!(
+            common::metrics::metric_name("poller_cycle_total"),
+            "poller" => "ldbws",
+            "result" => if result.is_ok() { "success" } else { "failure" }
+        )
+        .increment(1);
+
+        if let Err(err) = result {
             tracing::error!(error = ?err, "poll cycle failed; will retry next interval");
         }
     }

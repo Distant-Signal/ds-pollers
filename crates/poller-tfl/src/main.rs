@@ -89,6 +89,9 @@ async fn main() -> anyhow::Result<()> {
     // every request unauthenticated instead of refusing to start. Catch that
     // here, before the client is built.
     require_non_empty_key(&config.tfl_app_key)?;
+    if config.metrics_enabled {
+        common::metrics::install(config.metrics_port)?;
+    }
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
 
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
@@ -103,7 +106,21 @@ async fn main() -> anyhow::Result<()> {
     loop {
         interval.tick().await;
 
-        if let Err(err) = poll_once(&client, &config, &mut dlr_state).await {
+        let cycle_start = std::time::Instant::now();
+        let result = poll_once(&client, &config, &mut dlr_state).await;
+        metrics::histogram!(
+            common::metrics::metric_name("poller_cycle_duration_seconds"),
+            "poller" => "tfl"
+        )
+        .record(cycle_start.elapsed().as_secs_f64());
+        metrics::counter!(
+            common::metrics::metric_name("poller_cycle_total"),
+            "poller" => "tfl",
+            "result" => if result.is_ok() { "success" } else { "failure" }
+        )
+        .increment(1);
+
+        if let Err(err) = result {
             tracing::error!(error = ?err, "poll cycle failed; will retry next interval");
         }
     }
@@ -179,7 +196,7 @@ async fn poll_dlr_sample_stats(
     state: &mut dlr::inference::DlrMatchState,
 ) -> anyhow::Result<Option<common::SampleStats>> {
     let arrivals_url = format!("{}/Line/dlr/Arrivals", config.tfl_base_url.trim_end_matches('/'));
-    let arrivals_body = fetch_json(client, &arrivals_url, config, "DLR arrivals").await?;
+    let arrivals_body = fetch_json(client, &arrivals_url, config, "dlr-arrivals").await?;
     // `/Line/dlr/Arrivals` covers the whole DLR network in one call (see
     // `dlr::arrivals`'s module docs), but `match_trips` matches purely on
     // time and documents its own precondition as "the live prediction (at
@@ -210,7 +227,7 @@ async fn poll_dlr_sample_stats(
         config.tfl_base_url.trim_end_matches('/'),
         config.dlr_pilot_stop_point_id
     );
-    let timetable_body = fetch_json(client, &timetable_url, config, "DLR timetable").await?;
+    let timetable_body = fetch_json(client, &timetable_url, config, "dlr-timetable").await?;
     let now = Utc::now();
     // TfL's timetable service day is a *London* day, not a UTC one — the
     // published `hour`/`minute` pairs are local wall-clock times (see
@@ -233,13 +250,21 @@ async fn fetch_status_json(client: &Client, config: &Config) -> anyhow::Result<S
 }
 
 /// One authenticated GET against TfL, with this poller's shared status
-/// checking and in-cycle backoff. Every TfL call goes through here: a 429
-/// or a 5xx has a body too, and handing that body to a parser produces a
-/// confusing serde error in place of the real cause.
+/// checking, in-cycle backoff, and outcome metric. Every TfL call goes
+/// through here: a 429 or a 5xx has a body too, and handing that body to a
+/// parser produces a confusing serde error in place of the real cause.
 ///
-/// `what` names the call in errors and logs only (e.g. `"line-status"`).
+/// `what` names the call in errors, logs, and the `nr_status_tfl_fetch_total`
+/// metric's `what` label (e.g. `"line-status"`).
 async fn fetch_json(client: &Client, url: &str, config: &Config, what: &str) -> anyhow::Result<String> {
     let mut attempt = 0;
+    // Tracks the status code of the most recent retryable failure, if any
+    // -- this is what distinguishes a same-cycle "succeeded on the first
+    // try" outcome from "succeeded after backing off from a 429/5xx",
+    // which the plain success/failure result of the call alone can't tell
+    // apart. See docs/superpowers/specs/2026-08-29-metrics-design.md's v1
+    // scope item 3.
+    let mut retried_status: Option<StatusCode> = None;
     loop {
         let response = client
             .get(url)
@@ -249,15 +274,33 @@ async fn fetch_json(client: &Client, url: &str, config: &Config, what: &str) -> 
         let status = response.status();
 
         if status.is_success() {
+            let outcome = match retried_status {
+                None => "success",
+                Some(s) if s == StatusCode::TOO_MANY_REQUESTS => "retried_429",
+                Some(_) => "retried_5xx",
+            };
+            metrics::counter!(
+                common::metrics::metric_name("tfl_fetch_total"),
+                "what" => what.to_string(),
+                "outcome" => outcome
+            )
+            .increment(1);
             return Ok(response.text().await?);
         }
 
         attempt += 1;
         if attempt >= MAX_ATTEMPTS || !should_retry(status) {
+            metrics::counter!(
+                common::metrics::metric_name("tfl_fetch_total"),
+                "what" => what.to_string(),
+                "outcome" => "exhausted"
+            )
+            .increment(1);
             let body = response.text().await.unwrap_or_default();
             anyhow::bail!("TfL {what} fetch failed: {status} {body}");
         }
 
+        retried_status = Some(status);
         let delay = retry_delay(attempt);
         tracing::warn!(%status, attempt, delay_secs = delay.as_secs(), "TfL {what} fetch failed; retrying");
         tokio::time::sleep(delay).await;
