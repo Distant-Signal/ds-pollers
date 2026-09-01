@@ -141,12 +141,15 @@ async fn poll_once(client: &Client, config: &Config, dlr_state: &mut dlr::infere
     if config.dlr_pilot_enabled {
         match poll_dlr_sample_stats(client, config, dlr_state).await {
             Ok(Some(stats)) => merge_dlr_sample_stats(&mut reports, stats),
-            Ok(None) => {}
+            Ok(None) => mark_dlr_pending(&mut reports),
             Err(err) => {
                 // The DLR pilot failing must never take down the rest of
                 // the TfL line-status batch — log and post everything
                 // else as normal, same as any other line keeps reporting
-                // if one call in a multi-call cycle has a bad day.
+                // if one call in a multi-call cycle has a bad day. Left at
+                // whatever schema.rs already set (NoCoverage) for
+                // sample_availability -- a known, accepted simplification,
+                // not a gap this task claims to close (Decision 4).
                 tracing::warn!(error = ?err, "DLR arrivals-diffing pilot failed this cycle; continuing without it");
             }
         }
@@ -181,6 +184,25 @@ fn merge_dlr_sample_stats(reports: &mut [common::LineStatusReport], stats: commo
     for report in reports.iter_mut().filter(|r| r.id == line_id) {
         for status in &mut report.statuses {
             status.sample_stats = Some(stats.clone());
+            status.sample_availability = common::SampleAvailability::Available(stats.clone());
+        }
+    }
+}
+
+/// The DLR pilot has no tunable `min_sample_size`-equivalent -- it
+/// structurally needs at least one resolved trip before it can report
+/// anything, so `required: 1` is literally true (not a borrowed LDBWS
+/// constant) and `observed: 0` accurately reports "zero trips have
+/// resolved yet." An honest, deliberately imperfect reuse of
+/// `BelowThreshold`'s shape for a mechanically different producer
+/// (per-trip resolution warm-up, not a station-count threshold) -- see
+/// docs/superpowers/specs/2026-09-01-line-status-sample-coverage-design.md
+/// Decision 4 and its Open Question 2.
+fn mark_dlr_pending(reports: &mut [common::LineStatusReport]) {
+    let line_id = dlr_line_id();
+    for report in reports.iter_mut().filter(|r| r.id == line_id) {
+        for status in &mut report.statuses {
+            status.sample_availability = common::SampleAvailability::BelowThreshold { observed: 0, required: 1 };
         }
     }
 }
@@ -363,6 +385,7 @@ mod tests {
                     disruption: None,
                     data_quality: common::DataQuality::Tfl,
                     sample_stats: None,
+                    sample_availability: common::SampleAvailability::NoCoverage,
                 }],
             },
             common::LineStatusReport {
@@ -377,6 +400,7 @@ mod tests {
                     disruption: None,
                     data_quality: common::DataQuality::Tfl,
                     sample_stats: None,
+                    sample_availability: common::SampleAvailability::NoCoverage,
                 }],
             },
         ];
@@ -384,7 +408,40 @@ mod tests {
 
         merge_dlr_sample_stats(&mut reports, stats.clone());
 
-        assert_eq!(reports[0].statuses[0].sample_stats, Some(stats));
+        assert_eq!(reports[0].statuses[0].sample_stats, Some(stats.clone()));
         assert_eq!(reports[1].statuses[0].sample_stats, None);
+        assert_eq!(reports[0].statuses[0].sample_availability, common::SampleAvailability::Available(stats));
+        assert_eq!(
+            reports[1].statuses[0].sample_availability,
+            common::SampleAvailability::NoCoverage,
+            "unaffected line's availability must be untouched"
+        );
+    }
+
+    #[test]
+    fn dlr_ok_none_marks_below_threshold_pending_on_the_matching_line_only() {
+        let mut reports = vec![common::LineStatusReport {
+            id: "tfl-dlr".to_string(),
+            name: "DLR".to_string(),
+            mode_name: "dlr".to_string(),
+            operators: vec!["TfL".to_string()],
+            statuses: vec![common::LineStatus {
+                severity: common::Severity::GoodService,
+                reason: "Good Service".to_string(),
+                validity: common::ValidityPeriod { from_date: Utc::now(), to_date: None, is_now: true },
+                disruption: None,
+                data_quality: common::DataQuality::Tfl,
+                sample_stats: None,
+                sample_availability: common::SampleAvailability::NoCoverage,
+            }],
+        }];
+
+        mark_dlr_pending(&mut reports);
+
+        assert_eq!(
+            reports[0].statuses[0].sample_availability,
+            common::SampleAvailability::BelowThreshold { observed: 0, required: 1 }
+        );
+        assert_eq!(reports[0].statuses[0].sample_stats, None, "Ok(None) must not fabricate sample_stats");
     }
 }
