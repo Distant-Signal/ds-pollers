@@ -8,5 +8,5 @@
 //! one pilot station (Poplar). No other TfL line does this.
 
 pub mod arrivals;
-pub mod timetable;
 pub mod inference;
+pub mod timetable;

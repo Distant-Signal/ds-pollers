@@ -154,12 +154,15 @@ mod tests {
 
         // First entry: Bow Church → Stratford (real data structure with extra fields)
         let p = &predictions[0];
-        assert_eq!(p.vehicle_id, "");  // TfL always sends empty string for DLR vehicleId
+        assert_eq!(p.vehicle_id, ""); // TfL always sends empty string for DLR vehicleId
         assert_eq!(p.naptan_id, "940GZZDLBOW");
         assert_eq!(p.station_name, "Bow Church DLR Station");
         assert_eq!(p.destination_name, "Stratford DLR Station");
         assert_eq!(p.direction, "inbound");
-        assert_eq!(p.expected_arrival, "2026-08-22T13:30:09Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            p.expected_arrival,
+            "2026-08-22T13:30:09Z".parse::<DateTime<Utc>>().unwrap()
+        );
         assert_eq!(p.time_to_station, 277);
 
         // Third entry: Poplar (the pilot station)
@@ -168,7 +171,10 @@ mod tests {
         assert_eq!(p3.naptan_id, "940GZZDLPOP");
         assert_eq!(p3.station_name, "Poplar DLR Station");
         assert_eq!(p3.destination_name, "Stratford DLR Station");
-        assert_eq!(p3.expected_arrival, "2026-08-22T13:29:08Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            p3.expected_arrival,
+            "2026-08-22T13:29:08Z".parse::<DateTime<Utc>>().unwrap()
+        );
         assert_eq!(p3.time_to_station, 216);
     }
 

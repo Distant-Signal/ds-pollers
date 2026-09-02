@@ -94,7 +94,11 @@ struct StationsResponse {
 /// array in an envelope despite the spec doc saying otherwise).
 pub fn parse_stations(json: &str) -> Result<Vec<StationReference>> {
     let response: StationsResponse = serde_json::from_str(json)?;
-    Ok(response.stations.iter().map(StationReference::from).collect())
+    Ok(response
+        .stations
+        .iter()
+        .map(StationReference::from)
+        .collect())
 }
 
 #[cfg(test)]

@@ -47,9 +47,18 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
 
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
-    let delay = ingest::time_until_next_poll(&client, &config.api_ingest_url, &config.internal_token, poll_interval).await;
+    let delay = ingest::time_until_next_poll(
+        &client,
+        &config.api_ingest_url,
+        &config.internal_token,
+        poll_interval,
+    )
+    .await;
     if !delay.is_zero() {
-        tracing::info!(delay_secs = delay.as_secs(), "data still fresh from a prior run; delaying first poll");
+        tracing::info!(
+            delay_secs = delay.as_secs(),
+            "data still fresh from a prior run; delaying first poll"
+        );
     }
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + delay, poll_interval);
 

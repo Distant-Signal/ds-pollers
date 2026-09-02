@@ -75,7 +75,11 @@ pub fn compute_delay_minutes(std: &str, etd: &str) -> i32 {
     };
 
     let diff = (estimated - scheduled).num_minutes();
-    if diff < 0 { (diff + 1440) as i32 } else { diff as i32 }
+    if diff < 0 {
+        (diff + 1440) as i32
+    } else {
+        diff as i32
+    }
 }
 
 /// Flattens every calling point Darwin marks `isCancelled: true` across all
@@ -266,7 +270,9 @@ mod tests {
         let service = RdmServiceItem {
             service_id: "svc".to_string(),
             operator_code: "GW".to_string(),
-            destination: vec![RdmServiceLocation { crs: "BRI".to_string() }],
+            destination: vec![RdmServiceLocation {
+                crs: "BRI".to_string(),
+            }],
             std: "10:00".to_string(),
             etd: "On time".to_string(),
             is_cancelled: false,
@@ -275,12 +281,21 @@ mod tests {
             subsequent_calling_points: vec![
                 RdmCallingPointList {
                     calling_point: vec![
-                        RdmCallingPoint { crs: "DID".to_string(), is_cancelled: true },
-                        RdmCallingPoint { crs: "SWI".to_string(), is_cancelled: false },
+                        RdmCallingPoint {
+                            crs: "DID".to_string(),
+                            is_cancelled: true,
+                        },
+                        RdmCallingPoint {
+                            crs: "SWI".to_string(),
+                            is_cancelled: false,
+                        },
                     ],
                 },
                 RdmCallingPointList {
-                    calling_point: vec![RdmCallingPoint { crs: "BRI".to_string(), is_cancelled: true }],
+                    calling_point: vec![RdmCallingPoint {
+                        crs: "BRI".to_string(),
+                        is_cancelled: true,
+                    }],
                 },
             ],
         };
@@ -294,7 +309,9 @@ mod tests {
         let service = RdmServiceItem {
             service_id: "svc".to_string(),
             operator_code: "GW".to_string(),
-            destination: vec![RdmServiceLocation { crs: "BRI".to_string() }],
+            destination: vec![RdmServiceLocation {
+                crs: "BRI".to_string(),
+            }],
             std: "10:00".to_string(),
             etd: "On time".to_string(),
             is_cancelled: false,

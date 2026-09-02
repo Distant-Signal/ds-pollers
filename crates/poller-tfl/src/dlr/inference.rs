@@ -63,15 +63,26 @@ pub fn match_trips(
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| !claimed[*i])
-                .map(|(i, p)| (i, p, (p.expected_arrival - trip.scheduled_departure).num_minutes().abs()))
+                .map(|(i, p)| {
+                    (
+                        i,
+                        p,
+                        (p.expected_arrival - trip.scheduled_departure)
+                            .num_minutes()
+                            .abs(),
+                    )
+                })
                 .filter(|(_, _, diff)| *diff <= MATCH_WINDOW_MINUTES)
                 .min_by_key(|(_, _, diff)| *diff);
 
             match best {
                 Some((i, p, _)) => {
                     claimed[i] = true;
-                    let delay_minutes = (p.expected_arrival - trip.scheduled_departure).num_minutes();
-                    MatchedTrip::Matched { delay_minutes: delay_minutes.max(0) }
+                    let delay_minutes =
+                        (p.expected_arrival - trip.scheduled_departure).num_minutes();
+                    MatchedTrip::Matched {
+                        delay_minutes: delay_minutes.max(0),
+                    }
                 }
                 None => MatchedTrip::Pending,
             }
@@ -154,7 +165,10 @@ pub struct DlrMatchState {
 
 impl DlrMatchState {
     pub fn new() -> Self {
-        DlrMatchState { pending: Vec::new(), resolved: Vec::new() }
+        DlrMatchState {
+            pending: Vec::new(),
+            resolved: Vec::new(),
+        }
     }
 
     /// Runs one poll cycle: adds newly-seen scheduled trips to the pending
@@ -188,13 +202,18 @@ impl DlrMatchState {
                 && t.scheduled_departure >= earliest
                 && t.scheduled_departure <= latest
         }) {
-            self.pending.push(PendingTrip { scheduled_departure: trip.scheduled_departure });
+            self.pending.push(PendingTrip {
+                scheduled_departure: trip.scheduled_departure,
+            });
         }
 
         let pending_as_trips: Vec<ScheduledTrip> = self
             .pending
             .iter()
-            .map(|p| ScheduledTrip { scheduled_departure: p.scheduled_departure, interval_id: None })
+            .map(|p| ScheduledTrip {
+                scheduled_departure: p.scheduled_departure,
+                interval_id: None,
+            })
             .collect();
         let matches = match_trips(pending_as_trips, predictions, now);
 
@@ -224,23 +243,41 @@ impl DlrMatchState {
         }
         self.pending = still_pending;
 
-        self.resolved.retain(|r| (now - r.resolved_at).num_minutes() < RESOLVED_RETENTION_MINUTES);
+        self.resolved
+            .retain(|r| (now - r.resolved_at).num_minutes() < RESOLVED_RETENTION_MINUTES);
 
         if self.resolved.is_empty() {
             return None;
         }
 
         let total = self.resolved.len();
-        let cancelled = self.resolved.iter().filter(|r| r.delay_minutes.is_none()).count();
-        let running: Vec<i64> = self.resolved.iter().filter_map(|r| r.delay_minutes).collect();
-        let delayed = running.iter().filter(|&&d| d >= DLR_DELAY_THRESHOLD_MINUTES).count();
+        let cancelled = self
+            .resolved
+            .iter()
+            .filter(|r| r.delay_minutes.is_none())
+            .count();
+        let running: Vec<i64> = self
+            .resolved
+            .iter()
+            .filter_map(|r| r.delay_minutes)
+            .collect();
+        let delayed = running
+            .iter()
+            .filter(|&&d| d >= DLR_DELAY_THRESHOLD_MINUTES)
+            .count();
         let avg_delay_minutes = if running.is_empty() {
             0.0
         } else {
             running.iter().sum::<i64>() as f64 / running.len() as f64
         };
 
-        Some(common::SampleStats { total, delayed, cancelled, skipped: 0, avg_delay_minutes })
+        Some(common::SampleStats {
+            total,
+            delayed,
+            cancelled,
+            skipped: 0,
+            avg_delay_minutes,
+        })
     }
 }
 
@@ -256,7 +293,8 @@ mod tests {
 
     fn trip(minute: u32) -> ScheduledTrip {
         ScheduledTrip {
-            scheduled_departure: "2026-08-22T10:00:00Z".parse::<DateTime<Utc>>().unwrap() + chrono::Duration::minutes(minute as i64),
+            scheduled_departure: "2026-08-22T10:00:00Z".parse::<DateTime<Utc>>().unwrap()
+                + chrono::Duration::minutes(minute as i64),
             interval_id: None,
         }
     }
@@ -277,13 +315,21 @@ mod tests {
 
     #[test]
     fn an_on_time_prediction_matches_with_zero_delay() {
-        let result = match_trips(vec![trip(0)], &[prediction(0)], "2026-08-22T10:00:00Z".parse().unwrap());
+        let result = match_trips(
+            vec![trip(0)],
+            &[prediction(0)],
+            "2026-08-22T10:00:00Z".parse().unwrap(),
+        );
         assert_eq!(result, vec![MatchedTrip::Matched { delay_minutes: 0 }]);
     }
 
     #[test]
     fn a_late_prediction_matches_with_the_observed_delay() {
-        let result = match_trips(vec![trip(0)], &[prediction(6)], "2026-08-22T10:00:00Z".parse().unwrap());
+        let result = match_trips(
+            vec![trip(0)],
+            &[prediction(6)],
+            "2026-08-22T10:00:00Z".parse().unwrap(),
+        );
         // 6 minutes is outside MATCH_WINDOW_MINUTES (3), so this should be
         // Pending, not a 6-minute-late match — window too tight to claim a
         // 6-minute-late train as "this trip" rather than a later one.
@@ -292,7 +338,11 @@ mod tests {
 
     #[test]
     fn a_prediction_within_the_match_window_computes_its_delay() {
-        let result = match_trips(vec![trip(0)], &[prediction(2)], "2026-08-22T10:00:00Z".parse().unwrap());
+        let result = match_trips(
+            vec![trip(0)],
+            &[prediction(2)],
+            "2026-08-22T10:00:00Z".parse().unwrap(),
+        );
         assert_eq!(result, vec![MatchedTrip::Matched { delay_minutes: 2 }]);
     }
 
@@ -307,13 +357,27 @@ mod tests {
         // Two trips 4 minutes apart (DLR's typical headway), one
         // prediction. The closer trip claims it; the other stays Pending
         // rather than both being marked on-time from the same train.
-        let result = match_trips(vec![trip(0), trip(4)], &[prediction(0)], "2026-08-22T10:00:00Z".parse().unwrap());
-        assert_eq!(result, vec![MatchedTrip::Matched { delay_minutes: 0 }, MatchedTrip::Pending]);
+        let result = match_trips(
+            vec![trip(0), trip(4)],
+            &[prediction(0)],
+            "2026-08-22T10:00:00Z".parse().unwrap(),
+        );
+        assert_eq!(
+            result,
+            vec![
+                MatchedTrip::Matched { delay_minutes: 0 },
+                MatchedTrip::Pending
+            ]
+        );
     }
 
     #[test]
     fn an_early_prediction_is_clamped_to_zero_delay_not_negative() {
-        let result = match_trips(vec![trip(2)], &[prediction(0)], "2026-08-22T10:00:00Z".parse().unwrap());
+        let result = match_trips(
+            vec![trip(2)],
+            &[prediction(0)],
+            "2026-08-22T10:00:00Z".parse().unwrap(),
+        );
         assert_eq!(result, vec![MatchedTrip::Matched { delay_minutes: 0 }]);
     }
 
@@ -321,7 +385,11 @@ mod tests {
     fn a_matched_trip_resolves_immediately() {
         let mut state = DlrMatchState::new();
         let stats = state
-            .resolve(vec![trip(0)], &[prediction(0)], "2026-08-22T10:00:00Z".parse().unwrap())
+            .resolve(
+                vec![trip(0)],
+                &[prediction(0)],
+                "2026-08-22T10:00:00Z".parse().unwrap(),
+            )
             .expect("one resolved trip");
         assert_eq!(stats.total, 1);
         assert_eq!(stats.cancelled, 0);
@@ -352,7 +420,11 @@ mod tests {
     #[test]
     fn resolved_trips_age_out_after_the_retention_window() {
         let mut state = DlrMatchState::new();
-        state.resolve(vec![trip(0)], &[prediction(0)], "2026-08-22T10:00:00Z".parse().unwrap());
+        state.resolve(
+            vec![trip(0)],
+            &[prediction(0)],
+            "2026-08-22T10:00:00Z".parse().unwrap(),
+        );
         // 61 minutes later, with no new trips at all: the earlier resolved
         // trip should have aged out, leaving nothing to report.
         let stats = state.resolve(vec![], &[], "2026-08-22T11:01:00Z".parse().unwrap());
@@ -369,7 +441,11 @@ mod tests {
         // runs before it, so the admission window would happily let it
         // back in on all three — only the resolved-set check stops that.
         let mut state = DlrMatchState::new();
-        let cycles = ["2026-08-22T10:00:00Z", "2026-08-22T10:02:00Z", "2026-08-22T10:04:00Z"];
+        let cycles = [
+            "2026-08-22T10:00:00Z",
+            "2026-08-22T10:02:00Z",
+            "2026-08-22T10:04:00Z",
+        ];
         for cycle in cycles {
             let stats = state
                 .resolve(vec![trip(20)], &[prediction(20)], cycle.parse().unwrap())
@@ -395,7 +471,10 @@ mod tests {
             })
             .collect();
         let stats = state.resolve(days_schedule, &[], "2026-08-22T14:00:00Z".parse().unwrap());
-        assert_eq!(stats, None, "past trips must not be tracked, let alone cancelled");
+        assert_eq!(
+            stats, None,
+            "past trips must not be tracked, let alone cancelled"
+        );
     }
 
     #[test]
@@ -412,12 +491,22 @@ mod tests {
             interval_id: None,
         };
         let schedule = vec![hours_ago, trip(10)];
-        assert_eq!(state.resolve(schedule.clone(), &[], "2026-08-22T10:00:00Z".parse().unwrap()), None);
+        assert_eq!(
+            state.resolve(
+                schedule.clone(),
+                &[],
+                "2026-08-22T10:00:00Z".parse().unwrap()
+            ),
+            None
+        );
         // 10:10's trip never showed up, and it is now 15 minutes overdue.
         let stats = state
             .resolve(schedule, &[], "2026-08-22T10:25:00Z".parse().unwrap())
             .expect("the overdue trip should have resolved as cancelled");
-        assert_eq!(stats.total, 1, "the 08:00 trip must not be counted: {stats:?}");
+        assert_eq!(
+            stats.total, 1,
+            "the 08:00 trip must not be counted: {stats:?}"
+        );
         assert_eq!(stats.cancelled, 1);
     }
 
@@ -429,11 +518,18 @@ mod tests {
         // to `ADMISSION_LOOKBACK_MINUTES` guards the relation between the
         // two bounds; this covers the behaviour it exists for.)
         let mut state = DlrMatchState::new();
-        state.resolve(vec![trip(0)], &[prediction(0)], "2026-08-22T10:00:00Z".parse().unwrap());
+        state.resolve(
+            vec![trip(0)],
+            &[prediction(0)],
+            "2026-08-22T10:00:00Z".parse().unwrap(),
+        );
         // 61 minutes on, the 10:00 trip ages out of `resolved` — eviction
         // runs after admission, so this cycle is still covered by the
         // resolved-set check.
-        assert_eq!(state.resolve(vec![trip(0)], &[], "2026-08-22T11:01:00Z".parse().unwrap()), None);
+        assert_eq!(
+            state.resolve(vec![trip(0)], &[], "2026-08-22T11:01:00Z".parse().unwrap()),
+            None
+        );
         // The cycle after that, `resolved` is empty and nothing remembers
         // the trip any more — only the admission window keeps the same
         // schedule entry, handed in yet again, from being picked up and
@@ -478,12 +574,18 @@ mod tests {
         }
 
         let stats = latest.expect("an hour of on-time trips should have resolved");
-        assert_eq!(stats.cancelled, 0, "an on-time railway must report no cancellations: {stats:?}");
+        assert_eq!(
+            stats.cancelled, 0,
+            "an on-time railway must report no cancellations: {stats:?}"
+        );
         assert_eq!(stats.delayed, 0);
         // 55 minutes of poll cycles over a 10-minute headway, each trip
         // counted exactly once — not once per cycle it stays in the
         // timetable payload.
-        assert!((5..=7).contains(&stats.total), "unexpected sample size: {stats:?}");
+        assert!(
+            (5..=7).contains(&stats.total),
+            "unexpected sample size: {stats:?}"
+        );
     }
 
     #[test]
@@ -493,7 +595,11 @@ mod tests {
         // Same trip handed in again next cycle (the timetable poll always
         // returns the same day's full schedule) — must not be double-counted.
         let stats = state
-            .resolve(vec![trip(0)], &[prediction(0)], "2026-08-22T10:01:00Z".parse().unwrap())
+            .resolve(
+                vec![trip(0)],
+                &[prediction(0)],
+                "2026-08-22T10:01:00Z".parse().unwrap(),
+            )
             .expect("the trip should resolve exactly once");
         assert_eq!(stats.total, 1);
     }

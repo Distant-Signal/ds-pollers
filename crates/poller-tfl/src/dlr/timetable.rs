@@ -150,7 +150,11 @@ pub fn parse_timetable(json: &str, service_date: NaiveDate) -> Result<Vec<Schedu
             let naive = service_date
                 .and_hms_opt(hour % 24, minute, 0)
                 .ok_or_else(|| {
-                    anyhow::anyhow!("invalid knownJourney time {}:{}", journey.hour, journey.minute)
+                    anyhow::anyhow!(
+                        "invalid knownJourney time {}:{}",
+                        journey.hour,
+                        journey.minute
+                    )
                 })?
                 + Duration::days((hour / 24) as i64);
             // A local time that doesn't exist (the spring-forward gap)
@@ -159,7 +163,10 @@ pub fn parse_timetable(json: &str, service_date: NaiveDate) -> Result<Vec<Schedu
             let Some(scheduled_departure) = london_to_utc(naive) else {
                 continue;
             };
-            trips.push(ScheduledTrip { scheduled_departure, interval_id: journey.interval_id });
+            trips.push(ScheduledTrip {
+                scheduled_departure,
+                interval_id: journey.interval_id,
+            });
         }
     }
     Ok(trips)
@@ -231,7 +238,8 @@ mod tests {
     // constant is exactly what hid the `hour: "24"`/`"25"` bug (the real
     // file has 35 such journeys and the trimmed one has none), so these
     // tests deliberately exercise the committed capture itself.
-    const REAL_TIMETABLE_JSON: &str = include_str!("../../tests/fixtures/dlr_timetable_poplar.json");
+    const REAL_TIMETABLE_JSON: &str =
+        include_str!("../../tests/fixtures/dlr_timetable_poplar.json");
 
     fn weekday_service_date() -> NaiveDate {
         // 2026-08-22 is a Saturday; use the following Monday for weekday tests.
@@ -248,7 +256,8 @@ mod tests {
 
     #[test]
     fn parses_known_journeys_into_scheduled_trips_on_the_given_date() {
-        let trips = parse_timetable(DLR_TIMETABLE_JSON, weekday_service_date()).expect("should parse");
+        let trips =
+            parse_timetable(DLR_TIMETABLE_JSON, weekday_service_date()).expect("should parse");
         // 2 journeys from route 0's "Monday - Friday" + 1 from route 1's "Monday - Friday" = 3.
         assert_eq!(trips.len(), 3);
         // 2026-08-24 is in British Summer Time, so London 10:02 is 09:02Z.
@@ -269,7 +278,8 @@ mod tests {
 
     #[test]
     fn a_saturday_service_date_only_pulls_from_the_saturday_schedule() {
-        let trips = parse_timetable(DLR_TIMETABLE_JSON, saturday_service_date()).expect("should parse");
+        let trips =
+            parse_timetable(DLR_TIMETABLE_JSON, saturday_service_date()).expect("should parse");
         // 1 journey from route 0's "Saturdays and Public Holidays" + 1 from route 1's = 2.
         assert_eq!(trips.len(), 2);
         assert_eq!(
@@ -287,7 +297,8 @@ mod tests {
         // The weekday fixture's first journey is 10:02. On 2026-08-24
         // (BST, UTC+1) that instant is 09:02Z — if this comes back as
         // 10:02Z the local-to-UTC conversion isn't happening at all.
-        let trips = parse_timetable(DLR_TIMETABLE_JSON, weekday_service_date()).expect("should parse");
+        let trips =
+            parse_timetable(DLR_TIMETABLE_JSON, weekday_service_date()).expect("should parse");
         assert_eq!(
             trips[0].scheduled_departure,
             "2026-08-24T09:02:00Z".parse::<DateTime<Utc>>().unwrap()
@@ -348,7 +359,11 @@ mod tests {
     #[test]
     fn the_real_captured_timetable_parses_for_a_weekday_service_date() {
         let trips = parse_timetable(REAL_TIMETABLE_JSON, weekday_service_date());
-        assert!(trips.is_ok(), "real fixture must parse for a weekday: {:?}", trips.err());
+        assert!(
+            trips.is_ok(),
+            "real fixture must parse for a weekday: {:?}",
+            trips.err()
+        );
         // 243 + 195 "Monday - Friday" journeys across the capture's 2 routes.
         assert_eq!(trips.unwrap().len(), 438);
     }
@@ -356,7 +371,11 @@ mod tests {
     #[test]
     fn the_real_captured_timetable_parses_for_a_saturday_service_date() {
         let trips = parse_timetable(REAL_TIMETABLE_JSON, saturday_service_date());
-        assert!(trips.is_ok(), "real fixture must parse for a Saturday: {:?}", trips.err());
+        assert!(
+            trips.is_ok(),
+            "real fixture must parse for a Saturday: {:?}",
+            trips.err()
+        );
         // 233 + 163 "Saturdays and Public Holidays" journeys.
         assert_eq!(trips.unwrap().len(), 396);
     }
@@ -364,7 +383,11 @@ mod tests {
     #[test]
     fn the_real_captured_timetable_parses_for_a_sunday_service_date() {
         let trips = parse_timetable(REAL_TIMETABLE_JSON, sunday_service_date());
-        assert!(trips.is_ok(), "real fixture must parse for a Sunday: {:?}", trips.err());
+        assert!(
+            trips.is_ok(),
+            "real fixture must parse for a Sunday: {:?}",
+            trips.err()
+        );
         // 203 + 133 "Sunday" journeys.
         assert_eq!(trips.unwrap().len(), 336);
     }
@@ -376,15 +399,25 @@ mod tests {
         // its own service date rather than erroring the parse. Compared in
         // London local time, since that is the calendar the timetable's own
         // rollover is expressed in.
-        for service_date in [weekday_service_date(), saturday_service_date(), sunday_service_date()] {
+        for service_date in [
+            weekday_service_date(),
+            saturday_service_date(),
+            sunday_service_date(),
+        ] {
             let trips = parse_timetable(REAL_TIMETABLE_JSON, service_date).expect("should parse");
             let rolled_over = trips
                 .iter()
                 .filter(|t| {
-                    t.scheduled_departure.with_timezone(&chrono_tz::Europe::London).date_naive() > service_date
+                    t.scheduled_departure
+                        .with_timezone(&chrono_tz::Europe::London)
+                        .date_naive()
+                        > service_date
                 })
                 .count();
-            assert!(rolled_over > 0, "expected after-midnight journeys for {service_date}");
+            assert!(
+                rolled_over > 0,
+                "expected after-midnight journeys for {service_date}"
+            );
         }
     }
 
@@ -412,6 +445,10 @@ mod tests {
     #[test]
     fn a_response_with_no_journeys_parses_to_an_empty_list() {
         let json = r#"{"lineId":"dlr","lineName":"DLR","direction":"outbound","timetable":{"departureStopId":"940GZZDLPOP","routes":[]}}"#;
-        assert!(parse_timetable(json, weekday_service_date()).expect("should parse").is_empty());
+        assert!(
+            parse_timetable(json, weekday_service_date())
+                .expect("should parse")
+                .is_empty()
+        );
     }
 }

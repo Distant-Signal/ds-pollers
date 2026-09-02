@@ -26,8 +26,8 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use common::{
-    DataQuality, Disruption, LineStatus, LineStatusReport, Severity, TFL_LINE_ID_PREFIX, TFL_OPERATOR,
-    ValidityPeriod, severity_from_tfl_code,
+    DataQuality, Disruption, LineStatus, LineStatusReport, Severity, TFL_LINE_ID_PREFIX,
+    TFL_OPERATOR, ValidityPeriod, severity_from_tfl_code,
 };
 use serde::Deserialize;
 
@@ -193,7 +193,11 @@ pub fn select_validity(
             to_date: period.to_date,
             is_now: period.is_now || period_covers_now(period, now),
         },
-        None => ValidityPeriod { from_date: fallback, to_date: None, is_now: true },
+        None => ValidityPeriod {
+            from_date: fallback,
+            to_date: None,
+            is_now: true,
+        },
     }
 }
 
@@ -254,7 +258,8 @@ mod tests {
 
     #[test]
     fn parses_a_real_response_and_maps_every_field() {
-        let reports = parse_line_status(TRAM_STATUS_JSON, now()).expect("live capture should parse");
+        let reports =
+            parse_line_status(TRAM_STATUS_JSON, now()).expect("live capture should parse");
         assert_eq!(reports.len(), 1);
         let report = &reports[0];
 
@@ -270,22 +275,43 @@ mod tests {
         // TfL 20 is "Service Closed"; OUR 20 is the NR extension
         // `Recovering`. This assertion is the regression guard for that.
         assert_eq!(status.severity, Severity::ServiceClosed);
-        assert_eq!(status.reason, "London Tramlink: Service will resume later this morning.");
-        assert_eq!(status.validity.from_date, "2026-08-22T01:46:28Z".parse::<DateTime<Utc>>().unwrap());
-        assert_eq!(status.validity.to_date, Some("2026-08-22T05:05:09Z".parse::<DateTime<Utc>>().unwrap()));
+        assert_eq!(
+            status.reason,
+            "London Tramlink: Service will resume later this morning."
+        );
+        assert_eq!(
+            status.validity.from_date,
+            "2026-08-22T01:46:28Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(
+            status.validity.to_date,
+            Some("2026-08-22T05:05:09Z".parse::<DateTime<Utc>>().unwrap())
+        );
         assert!(status.validity.is_now);
         assert!(matches!(status.data_quality, DataQuality::Tfl));
         assert!(status.sample_stats.is_none());
-        assert!(matches!(status.sample_availability, common::SampleAvailability::NoCoverage));
+        assert!(matches!(
+            status.sample_availability,
+            common::SampleAvailability::NoCoverage
+        ));
 
-        let disruption = status.disruption.as_ref().expect("disruption should be carried through");
+        let disruption = status
+            .disruption
+            .as_ref()
+            .expect("disruption should be carried through");
         assert_eq!(disruption.category, "RealTime");
-        assert_eq!(disruption.description, "London Tramlink: Service will resume later this morning.");
+        assert_eq!(
+            disruption.description,
+            "London Tramlink: Service will resume later this morning."
+        );
         // v1 is line-status only: TfL's affectedStops are Naptan ids, which
         // this app's CHAR(3) CRS columns cannot hold.
         assert!(disruption.affected_stops.is_empty());
         assert!(disruption.affected_routes.is_empty());
-        assert_eq!(disruption.source.as_deref(), Some("tfl-line-status-tfl-tram"));
+        assert_eq!(
+            disruption.source.as_deref(),
+            Some("tfl-line-status-tfl-tram")
+        );
         assert_eq!(disruption.impact_type, None);
     }
 
@@ -373,7 +399,10 @@ mod tests {
 
         let reports = parse_line_status(json, now()).expect("should parse");
         let validity = &reports[0].statuses[0].validity;
-        assert_eq!(validity.from_date, "2026-08-22T02:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            validity.from_date,
+            "2026-08-22T02:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
         assert_eq!(validity.to_date, None);
         assert!(validity.is_now);
         // With no `reason`, TfL's own description is the only prose there is.
@@ -393,7 +422,10 @@ mod tests {
             is_now: false,
         };
         let chosen = select_validity(&[ended, current], now(), now());
-        assert_eq!(chosen.from_date, "2026-08-22T02:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            chosen.from_date,
+            "2026-08-22T02:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
         // `isNow` was false on the wire but the window contains `now`, so
         // the stored flag says what it means — the same correction the
         // aggregator's `validity_for_output` makes for incidents.
@@ -413,7 +445,10 @@ mod tests {
             is_now: false,
         };
         let chosen = select_validity(&[later, sooner], now(), now());
-        assert_eq!(chosen.from_date, "2026-08-25T00:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            chosen.from_date,
+            "2026-08-25T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
         assert!(!chosen.is_now);
     }
 }

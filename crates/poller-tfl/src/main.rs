@@ -95,10 +95,18 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
 
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
-    let delay =
-        ingest::time_until_next_poll(&client, &config.api_ingest_url, &config.internal_token, poll_interval).await;
+    let delay = ingest::time_until_next_poll(
+        &client,
+        &config.api_ingest_url,
+        &config.internal_token,
+        poll_interval,
+    )
+    .await;
     if !delay.is_zero() {
-        tracing::info!(delay_secs = delay.as_secs(), "data still fresh from a prior run; delaying first poll");
+        tracing::info!(
+            delay_secs = delay.as_secs(),
+            "data still fresh from a prior run; delaying first poll"
+        );
     }
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + delay, poll_interval);
 
@@ -126,7 +134,11 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn poll_once(client: &Client, config: &Config, dlr_state: &mut dlr::inference::DlrMatchState) -> anyhow::Result<()> {
+async fn poll_once(
+    client: &Client,
+    config: &Config,
+    dlr_state: &mut dlr::inference::DlrMatchState,
+) -> anyhow::Result<()> {
     let body = fetch_status_json(client, config).await?;
     let mut reports = schema::parse_line_status(&body, Utc::now())?;
 
@@ -135,7 +147,10 @@ async fn poll_once(client: &Client, config: &Config, dlr_state: &mut dlr::infere
     // "TfL has no lines any more" and blank the whole section. The api side
     // guards this too; this is the half that knows it is a fault.
     if reports.is_empty() {
-        anyhow::bail!("TfL returned no lines for modes {}; refusing to post an empty batch", config.tfl_modes);
+        anyhow::bail!(
+            "TfL returned no lines for modes {}; refusing to post an empty batch",
+            config.tfl_modes
+        );
     }
 
     if config.dlr_pilot_enabled {
@@ -202,7 +217,10 @@ fn mark_dlr_pending(reports: &mut [common::LineStatusReport]) {
     let line_id = dlr_line_id();
     for report in reports.iter_mut().filter(|r| r.id == line_id) {
         for status in &mut report.statuses {
-            status.sample_availability = common::SampleAvailability::BelowThreshold { observed: 0, required: 1 };
+            status.sample_availability = common::SampleAvailability::BelowThreshold {
+                observed: 0,
+                required: 1,
+            };
         }
     }
 }
@@ -217,7 +235,10 @@ async fn poll_dlr_sample_stats(
     config: &Config,
     state: &mut dlr::inference::DlrMatchState,
 ) -> anyhow::Result<Option<common::SampleStats>> {
-    let arrivals_url = format!("{}/Line/dlr/Arrivals", config.tfl_base_url.trim_end_matches('/'));
+    let arrivals_url = format!(
+        "{}/Line/dlr/Arrivals",
+        config.tfl_base_url.trim_end_matches('/')
+    );
     let arrivals_body = fetch_json(client, &arrivals_url, config, "dlr-arrivals").await?;
     // `/Line/dlr/Arrivals` covers the whole DLR network in one call (see
     // `dlr::arrivals`'s module docs), but `match_trips` matches purely on
@@ -234,7 +255,9 @@ async fn poll_dlr_sample_stats(
     // claimed as evidence an outbound trip ran.
     let predictions: Vec<_> = dlr::arrivals::parse_arrivals(&arrivals_body)?
         .into_iter()
-        .filter(|p| p.naptan_id == config.dlr_pilot_stop_point_id && p.direction == DLR_PILOT_DIRECTION)
+        .filter(|p| {
+            p.naptan_id == config.dlr_pilot_stop_point_id && p.direction == DLR_PILOT_DIRECTION
+        })
         .collect();
 
     // Poplar sits on a junction served by multiple DLR routes; without a
@@ -278,7 +301,12 @@ async fn fetch_status_json(client: &Client, config: &Config) -> anyhow::Result<S
 ///
 /// `what` names the call in errors, logs, and the `distant_signal_tfl_fetch_total`
 /// metric's `what` label (e.g. `"line-status"`).
-async fn fetch_json(client: &Client, url: &str, config: &Config, what: &str) -> anyhow::Result<String> {
+async fn fetch_json(
+    client: &Client,
+    url: &str,
+    config: &Config,
+    what: &str,
+) -> anyhow::Result<String> {
     let mut attempt = 0;
     // Tracks the status code of the most recent retryable failure, if any
     // -- this is what distinguishes a same-cycle "succeeded on the first
@@ -353,8 +381,13 @@ mod tests {
     fn backoff_fits_inside_one_poll_interval() {
         assert_eq!(retry_delay(1), Duration::from_secs(2));
         assert_eq!(retry_delay(2), Duration::from_secs(4));
-        let total: u64 = (1..MAX_ATTEMPTS).map(|attempt| retry_delay(attempt).as_secs()).sum();
-        assert!(total < 300, "total backoff {total}s must not overrun the 300s poll interval");
+        let total: u64 = (1..MAX_ATTEMPTS)
+            .map(|attempt| retry_delay(attempt).as_secs())
+            .sum();
+        assert!(
+            total < 300,
+            "total backoff {total}s must not overrun the 300s poll interval"
+        );
     }
 
     #[test]
@@ -381,7 +414,11 @@ mod tests {
                 statuses: vec![common::LineStatus {
                     severity: common::Severity::GoodService,
                     reason: "Good Service".to_string(),
-                    validity: common::ValidityPeriod { from_date: Utc::now(), to_date: None, is_now: true },
+                    validity: common::ValidityPeriod {
+                        from_date: Utc::now(),
+                        to_date: None,
+                        is_now: true,
+                    },
                     disruption: None,
                     data_quality: common::DataQuality::Tfl,
                     sample_stats: None,
@@ -396,7 +433,11 @@ mod tests {
                 statuses: vec![common::LineStatus {
                     severity: common::Severity::GoodService,
                     reason: "Good Service".to_string(),
-                    validity: common::ValidityPeriod { from_date: Utc::now(), to_date: None, is_now: true },
+                    validity: common::ValidityPeriod {
+                        from_date: Utc::now(),
+                        to_date: None,
+                        is_now: true,
+                    },
                     disruption: None,
                     data_quality: common::DataQuality::Tfl,
                     sample_stats: None,
@@ -404,13 +445,22 @@ mod tests {
                 }],
             },
         ];
-        let stats = common::SampleStats { total: 10, delayed: 2, cancelled: 1, skipped: 0, avg_delay_minutes: 3.5 };
+        let stats = common::SampleStats {
+            total: 10,
+            delayed: 2,
+            cancelled: 1,
+            skipped: 0,
+            avg_delay_minutes: 3.5,
+        };
 
         merge_dlr_sample_stats(&mut reports, stats.clone());
 
         assert_eq!(reports[0].statuses[0].sample_stats, Some(stats.clone()));
         assert_eq!(reports[1].statuses[0].sample_stats, None);
-        assert_eq!(reports[0].statuses[0].sample_availability, common::SampleAvailability::Available(stats));
+        assert_eq!(
+            reports[0].statuses[0].sample_availability,
+            common::SampleAvailability::Available(stats)
+        );
         assert_eq!(
             reports[1].statuses[0].sample_availability,
             common::SampleAvailability::NoCoverage,
@@ -428,7 +478,11 @@ mod tests {
             statuses: vec![common::LineStatus {
                 severity: common::Severity::GoodService,
                 reason: "Good Service".to_string(),
-                validity: common::ValidityPeriod { from_date: Utc::now(), to_date: None, is_now: true },
+                validity: common::ValidityPeriod {
+                    from_date: Utc::now(),
+                    to_date: None,
+                    is_now: true,
+                },
                 disruption: None,
                 data_quality: common::DataQuality::Tfl,
                 sample_stats: None,
@@ -440,8 +494,14 @@ mod tests {
 
         assert_eq!(
             reports[0].statuses[0].sample_availability,
-            common::SampleAvailability::BelowThreshold { observed: 0, required: 1 }
+            common::SampleAvailability::BelowThreshold {
+                observed: 0,
+                required: 1
+            }
         );
-        assert_eq!(reports[0].statuses[0].sample_stats, None, "Ok(None) must not fabricate sample_stats");
+        assert_eq!(
+            reports[0].statuses[0].sample_stats, None,
+            "Ok(None) must not fabricate sample_stats"
+        );
     }
 }
