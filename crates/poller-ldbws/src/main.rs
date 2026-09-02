@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use clap::Parser;
-use common::ingest::{self, INTERNAL_TOKEN_HEADER, RDM_AUTH_HEADER_NAME};
+use common::ingest::{self, RDM_AUTH_HEADER_NAME};
 use common::{StationDeparture, StationSample};
 use config::Config;
 use reqwest::Client;
@@ -45,12 +45,20 @@ async fn main() -> anyhow::Result<()> {
         common::metrics::install(config.metrics_port)?;
     }
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
+    let internal_oauth =
+        common::oauth_client::OAuthTokenCache::new(common::oauth_client::OAuthCredentials {
+            token_url: config.internal_oauth_token_url.clone(),
+            client_id: config.internal_oauth_client_id.clone(),
+            scope: config.internal_oauth_scope.clone(),
+            username: config.internal_oauth_username.clone(),
+            password: config.internal_oauth_password.clone(),
+        });
 
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let delay = ingest::time_until_next_poll(
         &client,
         &config.api_ingest_url,
-        &config.internal_token,
+        &internal_oauth,
         poll_interval,
     )
     .await;
@@ -66,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         interval.tick().await;
 
         let cycle_start = std::time::Instant::now();
-        let result = poll_once(&client, &config).await;
+        let result = poll_once(&client, &config, &internal_oauth).await;
         metrics::histogram!(
             common::metrics::metric_name("poller_cycle_duration_seconds"),
             "poller" => "ldbws"
@@ -85,8 +93,12 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn poll_once(client: &Client, config: &Config) -> anyhow::Result<()> {
-    let stations = fetch_sample_stations(client, config).await?;
+async fn poll_once(
+    client: &Client,
+    config: &Config,
+    internal_oauth: &common::oauth_client::OAuthTokenCache,
+) -> anyhow::Result<()> {
+    let stations = fetch_sample_stations(client, config, internal_oauth).await?;
     tracing::info!(count = stations.len(), "fetched station list to sample");
 
     let mut samples = Vec::with_capacity(stations.len());
@@ -112,7 +124,7 @@ async fn poll_once(client: &Client, config: &Config) -> anyhow::Result<()> {
     ingest::post_batch(
         client,
         &config.api_ingest_url,
-        &config.internal_token,
+        internal_oauth,
         &samples,
         "station samples",
     )
@@ -121,12 +133,17 @@ async fn poll_once(client: &Client, config: &Config) -> anyhow::Result<()> {
 
 /// Calls the `api` crate's own `/private/sample-stations` endpoint — not an
 /// RDM endpoint — to get the deduplicated CRS list computed from the
-/// loaded line catalogue. Sent with the internal token, not the RDM API
-/// key.
-async fn fetch_sample_stations(client: &Client, config: &Config) -> anyhow::Result<Vec<String>> {
+/// loaded line catalogue. Sent with an internal-oauth bearer token, not
+/// the RDM API key.
+async fn fetch_sample_stations(
+    client: &Client,
+    config: &Config,
+    tokens: &common::oauth_client::OAuthTokenCache,
+) -> anyhow::Result<Vec<String>> {
+    let token = tokens.get_token(client).await?;
     let response = client
         .get(&config.api_sample_stations_url)
-        .header(INTERNAL_TOKEN_HEADER, &config.internal_token)
+        .bearer_auth(&token)
         .send()
         .await?
         .error_for_status()?;

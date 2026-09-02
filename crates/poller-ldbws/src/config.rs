@@ -39,10 +39,24 @@ pub struct Config {
     #[arg(long, env, default_value = "http://api:8080/private/station-samples")]
     pub api_ingest_url: String,
 
-    /// Shared secret sent via `X-Internal-Token` to reach both `api`
-    /// endpoints above (see `crates/api/src/auth.rs`).
+    /// Shared, non-secret OAuth2 client-credentials config (same value
+    /// across all 8 real callers) -- see
+    /// docs/superpowers/specs/2026-09-02-internal-service-oauth2-design.md
+    /// Decision 6.
     #[arg(long, env)]
-    pub internal_token: String,
+    pub internal_oauth_token_url: String,
+    #[arg(long, env)]
+    pub internal_oauth_client_id: String,
+    #[arg(long, env, default_value = "groups")]
+    pub internal_oauth_scope: String,
+    /// This service's own Authentik service-account credential --
+    /// per-service, distinct from every other caller's. `username` is
+    /// identifying, not itself the secret; `password` (an Authentik
+    /// app-password) is the actual secret.
+    #[arg(long, env)]
+    pub internal_oauth_username: String,
+    #[arg(long, env)]
+    pub internal_oauth_password: String,
 
     /// DESIGN.md §4's aggregator polling cadence target is "30-60s"; 60 is
     /// the conservative end, given this feed's real rate limit is
