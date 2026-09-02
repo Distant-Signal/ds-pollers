@@ -141,6 +141,7 @@ fn map_status(
             affected_stops: vec![],
             affected_routes: vec![],
             source: Some(format!("tfl-line-status-{line_id}")),
+            impact_type: None, // TfL never runs the enricher's extraction pipeline
         }),
         data_quality: DataQuality::Tfl,
         // LDBWS-derived delay/cancellation counts. There is no TfL
@@ -285,6 +286,7 @@ mod tests {
         assert!(disruption.affected_stops.is_empty());
         assert!(disruption.affected_routes.is_empty());
         assert_eq!(disruption.source.as_deref(), Some("tfl-line-status-tfl-tram"));
+        assert_eq!(disruption.impact_type, None);
     }
 
     #[test]
