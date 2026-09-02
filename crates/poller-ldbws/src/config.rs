@@ -24,9 +24,24 @@ pub struct Config {
     pub rdm_api_key: String,
 
     /// Number of services requested per station per cycle (LDBWS's own
-    /// `numRows` query parameter). Kept at the upstream API's own default
-    /// (10) rather than inventing a "better" number without evidence of
-    /// what the aggregator's inference logic actually needs.
+    /// `numRows` query parameter), used as the *first* attempt each cycle.
+    /// Kept at the upstream API's own default (10) rather than lowering it
+    /// globally: the repo owner's own empirical finding (a smaller
+    /// `numRows` succeeds where 10 fails for a busy terminus like PAD
+    /// during rush hour, evidenced by a persisting "500 Internal Server
+    /// Error" from `GetDepBoardWithDetails`) points at a busyness-scaled
+    /// upstream limit, not a value that's simply too high everywhere --
+    /// lowering the global default would needlessly shrink every quiet
+    /// station's data too, while still potentially being wrong for the
+    /// busiest days at the busiest few. `main.rs`'s `fetch_departures`
+    /// instead retries a 500 with progressively smaller `numRows` values
+    /// (see `numrows_step_down`) *per station, per cycle*, so this value
+    /// stays the richest one that's actually asked for, with a station-
+    /// local fallback only when the upstream evidence says it's needed.
+    /// See docs/superpowers/specs/2026-08-31-sample-data-availability-design.md's
+    /// Correction 1: the aggregator's `min_sample_size` default is only 3
+    /// relevant departures, pooled across a whole line's stations, so a
+    /// reduced `numRows` at one busy station is far from a lossy trade.
     #[arg(long, env, default_value_t = 10)]
     pub num_rows: u32,
 
