@@ -148,6 +148,13 @@ fn map_status(
         // equivalent and v1 does not sample TfL arrivals.
         sample_stats: None,
         sample_availability: common::SampleAvailability::NoCoverage,
+        // No full-coverage (TRUST-vs-schedule) producer targets TfL modes
+        // -- out of scope per
+        // docs/superpowers/specs/2026-09-03-full-coverage-metrics-transition-design.md's
+        // own scoping (Decision 5: "Case 1 [TfL-quality lines] is
+        // completely outside this document's scope").
+        full_coverage_stats: None,
+        full_coverage_availability: common::FullCoverageAvailability::NotEnabled,
     }
 }
 

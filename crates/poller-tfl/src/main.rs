@@ -432,6 +432,8 @@ mod tests {
                     data_quality: common::DataQuality::Tfl,
                     sample_stats: None,
                     sample_availability: common::SampleAvailability::NoCoverage,
+                    full_coverage_stats: None,
+                    full_coverage_availability: common::FullCoverageAvailability::NotEnabled,
                 }],
             },
             common::LineStatusReport {
@@ -451,6 +453,8 @@ mod tests {
                     data_quality: common::DataQuality::Tfl,
                     sample_stats: None,
                     sample_availability: common::SampleAvailability::NoCoverage,
+                    full_coverage_stats: None,
+                    full_coverage_availability: common::FullCoverageAvailability::NotEnabled,
                 }],
             },
         ];
@@ -496,6 +500,8 @@ mod tests {
                 data_quality: common::DataQuality::Tfl,
                 sample_stats: None,
                 sample_availability: common::SampleAvailability::NoCoverage,
+                full_coverage_stats: None,
+                full_coverage_availability: common::FullCoverageAvailability::NotEnabled,
             }],
         }];
 
