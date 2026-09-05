@@ -127,15 +127,7 @@ async fn fetch_sample_stations(
     config: &Config,
     tokens: &common::oauth_client::OAuthTokenCache,
 ) -> anyhow::Result<Vec<String>> {
-    let token = tokens.get_token(client).await?;
-    let response = client
-        .get(&config.api_sample_stations_url)
-        .bearer_auth(&token)
-        .send()
-        .await?
-        .error_for_status()?;
-
-    Ok(response.json::<Vec<String>>().await?)
+    common::ingest::get_json(client, &config.api_sample_stations_url, tokens).await
 }
 
 /// The two ways a single `GetDepBoardWithDetails` attempt can fail:
