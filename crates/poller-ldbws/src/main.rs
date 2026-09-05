@@ -63,56 +63,21 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
-    if config.metrics_enabled {
-        common::metrics::install(config.metrics_port)?;
-    }
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
-    let internal_oauth =
-        common::oauth_client::OAuthTokenCache::new(common::oauth_client::OAuthCredentials {
-            token_url: config.internal_oauth_token_url.clone(),
-            client_id: config.internal_oauth_client_id.clone(),
-            scope: config.internal_oauth_scope.clone(),
-            username: config.internal_oauth_username.clone(),
-            password: config.internal_oauth_password.clone(),
-        });
-
+    let internal_oauth = config.internal_oauth.token_cache();
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
-    let delay = ingest::time_until_next_poll(
+
+    common::poller_loop::run_poll_loop(
+        "ldbws",
         &client,
         &config.api_ingest_url,
         &internal_oauth,
         poll_interval,
+        config.metrics.metrics_enabled,
+        config.metrics_port,
+        || poll_once(&client, &config, &internal_oauth),
     )
-    .await;
-    if !delay.is_zero() {
-        tracing::info!(
-            delay_secs = delay.as_secs(),
-            "data still fresh from a prior run; delaying first poll"
-        );
-    }
-    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + delay, poll_interval);
-
-    loop {
-        interval.tick().await;
-
-        let cycle_start = std::time::Instant::now();
-        let result = poll_once(&client, &config, &internal_oauth).await;
-        metrics::histogram!(
-            common::metrics::metric_name("poller_cycle_duration_seconds"),
-            "poller" => "ldbws"
-        )
-        .record(cycle_start.elapsed().as_secs_f64());
-        metrics::counter!(
-            common::metrics::metric_name("poller_cycle_total"),
-            "poller" => "ldbws",
-            "result" => if result.is_ok() { "success" } else { "failure" }
-        )
-        .increment(1);
-
-        if let Err(err) = result {
-            tracing::error!(error = ?err, "poll cycle failed; will retry next interval");
-        }
-    }
+    .await
 }
 
 async fn poll_once(
@@ -301,13 +266,12 @@ async fn fetch_departures(
             }
             Err(FetchError::Other(err)) => return Err(err),
             Err(FetchError::Status(status, body)) => {
-                let next_num_rows = if attempt < MAX_NUMROWS_ATTEMPTS
-                    && should_retry_with_smaller_rows(status)
-                {
-                    numrows_step_down(num_rows)
-                } else {
-                    None
-                };
+                let next_num_rows =
+                    if attempt < MAX_NUMROWS_ATTEMPTS && should_retry_with_smaller_rows(status) {
+                        numrows_step_down(num_rows)
+                    } else {
+                        None
+                    };
 
                 let Some(next_num_rows) = next_num_rows else {
                     if fell_back {
@@ -357,7 +321,9 @@ mod tests {
 
     #[test]
     fn only_server_errors_trigger_a_numrows_retry() {
-        assert!(should_retry_with_smaller_rows(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(should_retry_with_smaller_rows(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
         assert!(should_retry_with_smaller_rows(StatusCode::BAD_GATEWAY));
         assert!(should_retry_with_smaller_rows(
             StatusCode::SERVICE_UNAVAILABLE
@@ -387,14 +353,18 @@ mod tests {
             num_rows,
             api_sample_stations_url: "http://api:8080/private/sample-stations".to_string(),
             api_ingest_url: "http://api:8080/private/station-samples".to_string(),
-            internal_oauth_token_url: "http://auth.invalid/token".to_string(),
-            internal_oauth_client_id: "distant-signal-internal".to_string(),
-            internal_oauth_scope: "groups".to_string(),
-            internal_oauth_username: "svc-poller-ldbws".to_string(),
-            internal_oauth_password: "app-password".to_string(),
+            internal_oauth: common::oauth_client::InternalOAuthArgs {
+                internal_oauth_token_url: "http://auth.invalid/token".to_string(),
+                internal_oauth_client_id: "distant-signal-internal".to_string(),
+                internal_oauth_scope: "groups".to_string(),
+                internal_oauth_username: "svc-poller-ldbws".to_string(),
+                internal_oauth_password: "app-password".to_string(),
+            },
             poll_interval_secs: 60,
             metrics_port: 9091,
-            metrics_enabled: false,
+            metrics: common::service_args::MetricsArgs {
+                metrics_enabled: false,
+            },
         }
     }
 

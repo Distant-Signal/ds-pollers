@@ -89,57 +89,57 @@ async fn main() -> anyhow::Result<()> {
     // every request unauthenticated instead of refusing to start. Catch that
     // here, before the client is built.
     require_non_empty_key(&config.tfl_app_key)?;
-    if config.metrics_enabled {
-        common::metrics::install(config.metrics_port)?;
-    }
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
-    let internal_oauth =
-        common::oauth_client::OAuthTokenCache::new(common::oauth_client::OAuthCredentials {
-            token_url: config.internal_oauth_token_url.clone(),
-            client_id: config.internal_oauth_client_id.clone(),
-            scope: config.internal_oauth_scope.clone(),
-            username: config.internal_oauth_username.clone(),
-            password: config.internal_oauth_password.clone(),
-        });
-
+    let internal_oauth = config.internal_oauth.token_cache();
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
-    let delay = ingest::time_until_next_poll(
+    // `Rc<RefCell<_>>`, not a bare `&mut dlr_state` capture: `run_poll_loop`'s
+    // `cycle: FnMut() -> Fut` cannot let a per-call `Fut` borrow the
+    // closure's own captured environment past that call (a plain `FnMut`
+    // has no way to tie a returned future's borrow to one specific
+    // invocation the way `AsyncFnMut` does -- see this plan's Open
+    // Question 2, which did not anticipate this). Cloning the `Rc` into
+    // each `async move` block instead gives that future its own owned
+    // handle, independent of the closure's `self`. The cycle body below
+    // takes the state out of the `RefCell` by value (`mem::take`, valid
+    // since `DlrMatchState: Default`) before awaiting and stores it back
+    // afterward, rather than holding a `borrow_mut()` guard across the
+    // `.await` -- clippy's `await_holding_refcell_ref` correctly flags
+    // that as unsound in general; this loop never has two cycles
+    // in flight at once, but avoiding the guard-across-await pattern
+    // entirely is simpler than arguing why it would be fine to allow here.
+    let dlr_state = std::rc::Rc::new(std::cell::RefCell::new(dlr::inference::DlrMatchState::new()));
+
+    common::poller_loop::run_poll_loop(
+        "tfl",
         &client,
         &config.api_ingest_url,
         &internal_oauth,
         poll_interval,
+        config.metrics.metrics_enabled,
+        config.metrics_port,
+        || {
+            // Reborrow each of `client`/`config`/`internal_oauth` as a
+            // plain (Copy) reference right before the `async move` block:
+            // the block needs `move` for `dlr_state`'s fresh `Rc` clone
+            // (above), but `async move` captures every named variable it
+            // touches by move -- rebinding these three to local `&T`
+            // values first means the block only moves the (trivially
+            // Copy) reference itself, not the long-lived `Client`/
+            // `Config`/`OAuthTokenCache` values these closures share
+            // across every cycle.
+            let dlr_state = std::rc::Rc::clone(&dlr_state);
+            let client = &client;
+            let config = &config;
+            let internal_oauth = &internal_oauth;
+            async move {
+                let mut state = std::mem::take(&mut *dlr_state.borrow_mut());
+                let result = poll_once(client, config, &mut state, internal_oauth).await;
+                *dlr_state.borrow_mut() = state;
+                result
+            }
+        },
     )
-    .await;
-    if !delay.is_zero() {
-        tracing::info!(
-            delay_secs = delay.as_secs(),
-            "data still fresh from a prior run; delaying first poll"
-        );
-    }
-    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + delay, poll_interval);
-
-    let mut dlr_state = dlr::inference::DlrMatchState::new();
-    loop {
-        interval.tick().await;
-
-        let cycle_start = std::time::Instant::now();
-        let result = poll_once(&client, &config, &mut dlr_state, &internal_oauth).await;
-        metrics::histogram!(
-            common::metrics::metric_name("poller_cycle_duration_seconds"),
-            "poller" => "tfl"
-        )
-        .record(cycle_start.elapsed().as_secs_f64());
-        metrics::counter!(
-            common::metrics::metric_name("poller_cycle_total"),
-            "poller" => "tfl",
-            "result" => if result.is_ok() { "success" } else { "failure" }
-        )
-        .increment(1);
-
-        if let Err(err) = result {
-            tracing::error!(error = ?err, "poll cycle failed; will retry next interval");
-        }
-    }
+    .await
 }
 
 async fn poll_once(

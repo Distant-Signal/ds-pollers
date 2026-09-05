@@ -25,44 +25,20 @@ pub struct Config {
     pub api_ingest_url: String,
 
     /// Shared, non-secret OAuth2 client-credentials config (same value
-    /// across all 8 real callers) -- see
-    /// docs/superpowers/specs/2026-09-02-internal-service-oauth2-design.md
-    /// Decision 6.
-    #[arg(long, env)]
-    pub internal_oauth_token_url: String,
-    #[arg(long, env)]
-    pub internal_oauth_client_id: String,
-    #[arg(long, env, default_value = "groups")]
-    pub internal_oauth_scope: String,
-    /// This service's own Authentik service-account credential --
-    /// per-service, distinct from every other caller's. `username` is
-    /// identifying, not itself the secret; `password` (an Authentik
-    /// app-password) is the actual secret.
-    #[arg(long, env)]
-    pub internal_oauth_username: String,
-    #[arg(long, env)]
-    pub internal_oauth_password: String,
+    /// across all 9 real callers).
+    #[command(flatten)]
+    pub internal_oauth: common::oauth_client::InternalOAuthArgs,
 
     /// RSPS5050 P-03-00 Rev A §3: "At least once every 24 hours."
     #[arg(long, env, default_value_t = 86400)]
     pub poll_interval_secs: u64,
 
-    /// Port for this poller's Prometheus `/metrics` endpoint. See
-    /// docs/superpowers/plans/2026-08-29-metrics.md's Global Constraints
-    /// for why this differs from api.service.port -- api reuses its
-    /// existing HTTP listener, this poller has none, so it needs a new one.
+    /// Port for this poller's Prometheus `/metrics` endpoint. Stays a
+    /// plain field, not part of `MetricsArgs` -- its default differs per
+    /// crate and `docker-compose.yml` relies on the code default.
     #[arg(long, env, default_value_t = 9091)]
     pub metrics_port: u16,
 
-    /// Whether to start this service's Prometheus `/metrics` listener at
-    /// all. Distinct from `metrics_port` (which port to use IF started) --
-    /// this is what actually satisfies "metrics.enabled=false leaves the
-    /// service working exactly as it does today" (see the Helm chart's
-    /// `metrics.enabled` value and this branch's final whole-branch
-    /// review, Important finding #2): omitting the containerPort/env/
-    /// annotations in the chart alone does not stop the process from
-    /// listening, since Kubernetes container ports are purely
-    /// declarative.
-    #[arg(long, env, default_value_t = true)]
-    pub metrics_enabled: bool,
+    #[command(flatten)]
+    pub metrics: common::service_args::MetricsArgs,
 }
