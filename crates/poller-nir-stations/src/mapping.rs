@@ -385,7 +385,7 @@ mod tests {
         // digit vs. the Halts row (54.292897179999997 vs.
         // 54.292897000000004) -- asserting on the exact value confirms
         // which row won, not just that dedup happened at all.
-        assert_eq!(poyntzpass[0].latitude, Some(54.292897179999997));
+        assert_eq!(poyntzpass[0].latitude, Some(54.292_897_18));
     }
 
     #[test]
