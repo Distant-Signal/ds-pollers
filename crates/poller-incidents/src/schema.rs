@@ -9,7 +9,12 @@
 //!   once), so it's a `Vec`, not a single from/to pair.
 //! - There is no structured CRS/station code field anywhere in this schema
 //!   — `Affects.RoutesAffected` is free text only, and is deliberately left
-//!   unparsed here (a separate, already-flagged DESIGN.md gap).
+//!   unparsed here (a separate, already-flagged DESIGN.md gap). That is why
+//!   `affected_stations` below is `vec![]` and must stay that way rather
+//!   than being guessed at: line attribution is done downstream, by
+//!   `common::matcher` at ingest (`api`'s `upsert_incidents`), over the
+//!   prose and the structured operator list — the same matcher the
+//!   aggregator runs for live status.
 //! - `IncidentPriority` has no documented value table, so it is carried as
 //!   a raw integer with zero reinterpretation.
 
