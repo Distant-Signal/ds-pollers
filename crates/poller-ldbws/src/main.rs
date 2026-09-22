@@ -17,8 +17,11 @@
 //! no bulk/multi-station LDBWS operation.
 
 mod config;
+mod platform_history;
 mod schema;
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -26,6 +29,7 @@ use clap::Parser;
 use common::ingest::{self, RDM_AUTH_HEADER_NAME};
 use common::{StationDeparture, StationSample};
 use config::Config;
+use platform_history::PlatformHistory;
 use reqwest::{Client, StatusCode};
 
 /// Per-request timeout — see the other three pollers' identical rationale.
@@ -66,6 +70,13 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let internal_oauth = config.internal_oauth.token_cache();
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
+    // `Rc<RefCell<_>>`, mirroring `poller-tfl`'s own `dlr_state` exactly
+    // (see that crate's `main.rs` for the full reasoning) -- `run_poll_loop`'s
+    // `cycle: FnMut() -> Fut` can't let a per-call `Fut` borrow the
+    // closure's captured environment past that one call, so each cycle
+    // clones the `Rc` into its own `async move` block instead of capturing
+    // `platform_history` by reference.
+    let platform_history = Rc::new(RefCell::new(PlatformHistory::new()));
 
     common::poller_loop::run_poll_loop(
         "ldbws",
@@ -75,7 +86,18 @@ async fn main() -> anyhow::Result<()> {
         poll_interval,
         config.metrics.metrics_enabled,
         config.metrics_port,
-        || poll_once(&client, &config, &internal_oauth),
+        || {
+            let platform_history = Rc::clone(&platform_history);
+            let client = &client;
+            let config = &config;
+            let internal_oauth = &internal_oauth;
+            async move {
+                let mut history = std::mem::take(&mut *platform_history.borrow_mut());
+                let result = poll_once(client, config, &mut history, internal_oauth).await;
+                *platform_history.borrow_mut() = history;
+                result
+            }
+        },
     )
     .await
 }
@@ -83,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
 async fn poll_once(
     client: &Client,
     config: &Config,
+    platform_history: &mut PlatformHistory,
     internal_oauth: &common::oauth_client::OAuthTokenCache,
 ) -> anyhow::Result<()> {
     let stations = fetch_sample_stations(client, config, internal_oauth).await?;
@@ -92,11 +115,14 @@ async fn poll_once(
 
     for crs in &stations {
         match fetch_departures(client, config, crs).await {
-            Ok(departures) => samples.push(StationSample {
-                crs: crs.clone(),
-                polled_at: Utc::now(),
-                departures,
-            }),
+            Ok(mut departures) => {
+                platform_history.apply(crs, &mut departures);
+                samples.push(StationSample {
+                    crs: crs.clone(),
+                    polled_at: Utc::now(),
+                    departures,
+                })
+            }
             Err(err) => {
                 tracing::error!(crs = %crs, error = ?err, "failed to sample station; skipping");
             }

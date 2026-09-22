@@ -35,6 +35,19 @@ struct RdmServiceItem {
     delay_reason: Option<String>,
     #[serde(default, rename = "subsequentCallingPoints")]
     subsequent_calling_points: Vec<RdmCallingPointList>,
+    /// The CURRENT (not "planned") platform this station's own departure
+    /// board reports for this service -- Darwin/RDM merges any late
+    /// alteration into this single field and does not separately expose
+    /// what was originally published. `None` both when the key is absent
+    /// AND when it's present as JSON `null` (an unallocated platform) --
+    /// this API gives no way to tell those two "unknown" cases apart, so
+    /// neither is fabricated as a distinct state. `parse_departures` copies
+    /// this straight into `StationDeparture.platform`; a genuine
+    /// planned-vs-actual distinction is reconstructed downstream, across
+    /// polls, by `platform_history::PlatformHistory` -- this feed has no
+    /// such distinction of its own to parse.
+    #[serde(default)]
+    platform: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +141,13 @@ pub fn parse_departures(json: &str) -> Result<Vec<StationDeparture>> {
                 delay_reason: service.delay_reason.clone(),
                 headcode: None,
                 skipped_stations: extract_skipped_stations(service),
+                platform: service.platform.clone(),
+                // See `StationDeparture.planned_platform`'s own doc
+                // comment -- this single-poll parse has no history to draw
+                // a "planned" value from; `platform_history::PlatformHistory`
+                // fills this in afterwards, once per polled station, from
+                // this process's own memory of earlier polls.
+                planned_platform: None,
             })
         })
         .collect())
@@ -246,12 +266,18 @@ mod tests {
         );
         assert_eq!(first.headcode, None);
         assert_eq!(first.skipped_stations, Vec::<String>::new());
+        assert_eq!(first.platform, Some("6".to_string()));
+        // `planned_platform` is filled in later by `PlatformHistory` (see
+        // `platform_history.rs`), never by this parsing step -- a single
+        // JSON body carries no cross-poll history of its own.
+        assert_eq!(first.planned_platform, None);
 
         let second = &departures[1];
         assert_eq!(second.estimated, "On time");
         assert_eq!(second.delay_minutes, 0);
         assert!(!second.is_cancelled);
         assert_eq!(second.skipped_stations, vec!["DID".to_string()]);
+        assert_eq!(second.platform, Some("9".to_string()));
 
         let third = &departures[2];
         assert!(third.is_cancelled);
@@ -261,6 +287,12 @@ mod tests {
             Some("This train has been cancelled because of a fault on this train".to_string())
         );
         assert_eq!(third.skipped_stations, Vec::<String>::new());
+        // The sample fixture's third service has `"platform": null` -- an
+        // unallocated platform, distinct from the field being absent
+        // entirely (also `None` on the wire, but a genuinely different
+        // real-world fact -- see `RdmServiceItem::platform`'s own doc
+        // comment).
+        assert_eq!(third.platform, None);
     }
 
     #[test]
@@ -298,6 +330,7 @@ mod tests {
                     }],
                 },
             ],
+            platform: None,
         };
         let mut skipped = extract_skipped_stations(&service);
         skipped.sort();
@@ -318,6 +351,7 @@ mod tests {
             cancel_reason: None,
             delay_reason: None,
             subsequent_calling_points: vec![],
+            platform: None,
         };
         assert_eq!(extract_skipped_stations(&service), Vec::<String>::new());
     }
