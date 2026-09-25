@@ -58,6 +58,28 @@ const MAX_NUMROWS_ATTEMPTS: u32 = 4;
 /// and a run of fallback attempts must not hammer it back-to-back.
 const NUMROWS_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// Upper bound on how long the whole per-station sampling loop in
+/// `poll_once` may run in a single cycle, regardless of how many stations
+/// there are or how slow individual upstream responses are.
+///
+/// Signal Box Audit, poll-area Low finding -- "per-station pollers have no
+/// per-cycle time budget": before this, the loop over every sample station
+/// (`lines/*.toml`'s deduplicated `sample_stations`, easily 100+ entries)
+/// had no cap of its own -- `fetch_departures`'s per-request
+/// `REQUEST_TIMEOUT` (30s) plus up to `MAX_NUMROWS_ATTEMPTS` retries with
+/// `NUMROWS_RETRY_DELAY` waits bounds *one* station, but nothing bounded
+/// the sum across all of them, so enough individually-slow (not even
+/// hanging) stations in one cycle could still let that cycle run for many
+/// multiples of `poll_interval_secs`, degrading every subsequent cycle
+/// gracelessly rather than boundedly. 45s is comfortably under this
+/// crate's own 60s conservative `poll_interval_secs` default (see
+/// `config.rs`) so a budget-exceeded cycle still yields back well before
+/// the next tick would otherwise be starved entirely -- deliberately NOT
+/// derived from `poll_interval_secs` itself, an operator-configured value
+/// with no guaranteed relationship to how long sampling every station
+/// should take.
+const CYCLE_TIME_BUDGET: Duration = Duration::from_secs(45);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
@@ -111,23 +133,14 @@ async fn poll_once(
     let stations = fetch_sample_stations(client, config, internal_oauth).await?;
     tracing::info!(count = stations.len(), "fetched station list to sample");
 
-    let mut samples = Vec::with_capacity(stations.len());
-
-    for crs in &stations {
-        match fetch_departures(client, config, crs).await {
-            Ok(mut departures) => {
-                platform_history.apply(crs, &mut departures);
-                samples.push(StationSample {
-                    crs: crs.clone(),
-                    polled_at: Utc::now(),
-                    departures,
-                })
-            }
-            Err(err) => {
-                tracing::error!(crs = %crs, error = ?err, "failed to sample station; skipping");
-            }
-        }
-    }
+    let samples = sample_stations_within_budget(
+        client,
+        config,
+        platform_history,
+        &stations,
+        CYCLE_TIME_BUDGET,
+    )
+    .await;
 
     if samples.is_empty() {
         tracing::warn!("no station samples collected this cycle; nothing to post");
@@ -142,6 +155,70 @@ async fn poll_once(
         "station samples",
     )
     .await
+}
+
+/// Samples every station in `stations`, but never for longer than
+/// `budget` in total: if the per-station loop (see `sample_all_stations`)
+/// hasn't finished within `budget`, it's aborted in place and whatever
+/// samples were already collected are returned as-is, with a warning
+/// logged. `budget` is a parameter (rather than reading `CYCLE_TIME_BUDGET`
+/// directly) purely so tests can exercise the timeout path with a budget
+/// measured in milliseconds instead of `CYCLE_TIME_BUDGET`'s real 45s.
+async fn sample_stations_within_budget(
+    client: &Client,
+    config: &Config,
+    platform_history: &mut PlatformHistory,
+    stations: &[String],
+    budget: Duration,
+) -> Vec<StationSample> {
+    let mut samples = Vec::with_capacity(stations.len());
+    let outcome = tokio::time::timeout(
+        budget,
+        sample_all_stations(client, config, platform_history, stations, &mut samples),
+    )
+    .await;
+
+    if outcome.is_err() {
+        tracing::warn!(
+            stations_total = stations.len(),
+            stations_sampled = samples.len(),
+            budget_secs = budget.as_secs_f64(),
+            "per-cycle station-sampling time budget exceeded; moving on with what was \
+             collected so far rather than blocking this and every subsequent cycle"
+        );
+    }
+
+    samples
+}
+
+/// The per-station loop itself, extracted so `sample_stations_within_budget`
+/// can wrap it in `tokio::time::timeout` -- when the timeout fires, this
+/// future (and its local state) is dropped mid-iteration, but every sample
+/// already pushed into the caller-owned `samples` accumulator before that
+/// point survives, since it's a `&mut` borrow of state the caller owns,
+/// not state local to this future.
+async fn sample_all_stations(
+    client: &Client,
+    config: &Config,
+    platform_history: &mut PlatformHistory,
+    stations: &[String],
+    samples: &mut Vec<StationSample>,
+) {
+    for crs in stations {
+        match fetch_departures(client, config, crs).await {
+            Ok(mut departures) => {
+                platform_history.apply(crs, &mut departures);
+                samples.push(StationSample {
+                    crs: crs.clone(),
+                    polled_at: Utc::now(),
+                    departures,
+                })
+            }
+            Err(err) => {
+                tracing::error!(crs = %crs, error = ?err, "failed to sample station; skipping");
+            }
+        }
+    }
 }
 
 /// Calls the `api` crate's own `/private/sample-stations` endpoint — not an
@@ -511,6 +588,83 @@ mod tests {
             requests.len(),
             1,
             "a 401 must not trigger any numRows fallback retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cycle_time_budget_bounds_total_sampling_time_across_slow_stations() {
+        // Three stations, each individually well within a single request's
+        // own timeout, but slow enough that all three together would take
+        // far longer than the tiny budget this test gives the whole loop.
+        // Without the budget, this would take >= 3 * 150ms; with it, the
+        // loop must give up once the 200ms budget elapses.
+        let server = MockServer::start().await;
+        for crs in ["AAA", "BBB", "CCC"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/GetDepBoardWithDetails/{crs}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(ONE_SERVICE_BODY)
+                        .set_delay(Duration::from_millis(150)),
+                )
+                .mount(&server)
+                .await;
+        }
+        let config = test_config(server.uri(), 10);
+        let client = Client::new();
+        let stations = vec!["AAA".to_string(), "BBB".to_string(), "CCC".to_string()];
+        let mut history = PlatformHistory::new();
+
+        let start = std::time::Instant::now();
+        let samples = sample_stations_within_budget(
+            &client,
+            &config,
+            &mut history,
+            &stations,
+            Duration::from_millis(200),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(150 * 3),
+            "the budget should have cut the loop short well before all three \
+             150ms-delayed stations finished, took {elapsed:?}"
+        );
+        assert!(
+            samples.len() < stations.len(),
+            "a budget-cut cycle must not have sampled every station: {samples:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generous_budget_does_not_truncate_a_normal_cycle() {
+        let server = MockServer::start().await;
+        for crs in ["AAA", "BBB"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/GetDepBoardWithDetails/{crs}")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ONE_SERVICE_BODY))
+                .mount(&server)
+                .await;
+        }
+        let config = test_config(server.uri(), 10);
+        let client = Client::new();
+        let stations = vec!["AAA".to_string(), "BBB".to_string()];
+        let mut history = PlatformHistory::new();
+
+        let samples = sample_stations_within_budget(
+            &client,
+            &config,
+            &mut history,
+            &stations,
+            CYCLE_TIME_BUDGET,
+        )
+        .await;
+
+        assert_eq!(
+            samples.len(),
+            2,
+            "a fast cycle well within budget must sample every station"
         );
     }
 }

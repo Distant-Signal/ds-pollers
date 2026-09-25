@@ -43,14 +43,39 @@ struct RawRow {
     long: f64,
 }
 
+/// Signal Box Audit, poll-area Low finding -- "one bad CSV row fails a
+/// whole reference-catalogue reload": this used to
+/// `.collect::<Result<Vec<_>, _>>()` the whole deserialized row iterator,
+/// so a single malformed row anywhere in either OpenDataNI CSV (a
+/// mis-typed `Lat`/`Long`, a stray encoding hiccup, a genuinely corrupt
+/// line) failed the ENTIRE reload -- every other, perfectly good row in
+/// that file silently failing to update too, unlike the per-item batch
+/// isolation the other 4 poller schemas already got in the High/Medium
+/// pass (see e.g. `poller-stations::schema::parse_stations`'s own doc
+/// comment for the JSON-side version of this same fix). Each row is now
+/// deserialized independently and a malformed one is skipped (and logged)
+/// rather than taking the whole reload down with it. A genuinely
+/// unreadable CSV (missing/renamed header columns) degrades to "every row
+/// fails and gets logged", not a silent empty result -- `map_stations`'
+/// caller already treats an empty catalogue as noteworthy via its own
+/// `stations.len()` logging in `main.rs`.
 fn parse_rows(csv_bytes: &[u8]) -> anyhow::Result<Vec<RawRow>> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .from_reader(csv_bytes);
-    reader
+    Ok(reader
         .deserialize::<RawRow>()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| anyhow::anyhow!("failed to parse OpenDataNI CSV: {err}"))
+        .filter_map(|result| match result {
+            Ok(row) => Some(row),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "skipping malformed OpenDataNI CSV row rather than failing the whole reload"
+                );
+                None
+            }
+        })
+        .collect())
 }
 
 fn is_disused(comment: &Option<String>) -> bool {
@@ -127,6 +152,7 @@ pub fn map_stations(
     let halt_rows = parse_rows(halts_csv)?;
 
     let mut seen_bare_names: HashSet<String> = HashSet::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
     let mut stations = Vec::new();
 
     for row in station_rows {
@@ -134,13 +160,7 @@ pub fn map_stations(
             continue;
         }
         seen_bare_names.insert(bare_name(&row.name).to_string());
-        stations.push(IslandOfIrelandStation {
-            id: slugify(&row.name),
-            name: row.name,
-            network: IslandOfIrelandNetwork::NorthernIreland,
-            latitude: Some(row.lat),
-            longitude: Some(row.long),
-        });
+        push_station_if_id_is_new(&mut stations, &mut seen_ids, row);
     }
 
     for row in halt_rows {
@@ -152,16 +172,52 @@ pub fn map_stations(
             continue;
         }
         seen_bare_names.insert(bare);
-        stations.push(IslandOfIrelandStation {
-            id: slugify(&row.name),
-            name: row.name,
-            network: IslandOfIrelandNetwork::NorthernIreland,
-            latitude: Some(row.lat),
-            longitude: Some(row.long),
-        });
+        push_station_if_id_is_new(&mut stations, &mut seen_ids, row);
     }
 
     Ok(stations)
+}
+
+/// Pushes `row` onto `stations` as an `IslandOfIrelandStation`, unless its
+/// `slugify`'d id has already been claimed by an earlier row in this same
+/// reload.
+///
+/// Signal Box Audit, poll-area Low finding -- "slug collisions also
+/// overwrite silently on upsert" (the second half of the same finding as
+/// `parse_rows`'s per-row-resilience fix above): `api`'s
+/// `/private/island-of-ireland-stations` ingestion upserts by this exact
+/// `id`, so two DIFFERENT rows that happen to `slugify` to the same id
+/// (e.g. a future OpenDataNI CSV update introducing a name whose
+/// punctuation collapses onto an already-used slug) would silently
+/// overwrite one station's coordinates with the other's on every single
+/// reload, with no error or log anywhere -- the `seen_bare_names` dedup
+/// above doesn't catch this case at all, since it only compares bare
+/// names for the deliberate cross-dataset Poyntzpass-style dedup, not the
+/// ids actually sent downstream. The first row to claim a given id wins;
+/// every later collider is skipped with a warning instead of silently
+/// relying on the upsert to sort it out.
+fn push_station_if_id_is_new(
+    stations: &mut Vec<IslandOfIrelandStation>,
+    seen_ids: &mut HashSet<String>,
+    row: RawRow,
+) {
+    let id = slugify(&row.name);
+    if !seen_ids.insert(id.clone()) {
+        tracing::warn!(
+            id,
+            name = %row.name,
+            "station id collides with an already-added row's id; skipping this row to avoid \
+             a silent overwrite on upsert"
+        );
+        return;
+    }
+    stations.push(IslandOfIrelandStation {
+        id,
+        name: row.name,
+        network: IslandOfIrelandNetwork::NorthernIreland,
+        latitude: Some(row.lat),
+        longitude: Some(row.long),
+    });
 }
 
 /// Hand-curated, NOT CSV-parsed -- OpenDataNI publishes no per-line
@@ -397,6 +453,61 @@ mod tests {
                 .iter()
                 .all(|s| s.network == IslandOfIrelandNetwork::NorthernIreland)
         );
+    }
+
+    #[test]
+    fn a_malformed_row_is_skipped_not_fatal_to_the_whole_reload() {
+        // The third row's Lat column is unparsable as an f64 -- must be
+        // skipped (and logged), not fail the entire reload and lose the
+        // two perfectly good rows around it.
+        let stations_csv = format!(
+            "\u{FEFF}{STATIONS_CSV_HEADER}\
+             3,BELFAST - CENTRAL RAIL STATION,RAIL STATION,334663,373896,,54.595358900000001,-5.917282820000000\n\
+             99,BROKEN ROW,RAIL STATION,0,0,,NOT_A_NUMBER,-5.0\n\
+             20,BANGOR RAIL STATION,RAIL STATION,350361,381476,,54.658980000000000,-5.669660000000000\n"
+        )
+        .into_bytes();
+
+        let stations = map_stations(&stations_csv, &halts_fixture())
+            .expect("one malformed row must not fail the whole reload");
+        assert!(stations.iter().any(|s| s.id == "nir-belfast-central"));
+        assert!(stations.iter().any(|s| s.id == "nir-bangor"));
+        assert!(
+            !stations.iter().any(|s| s.name == "BROKEN ROW"),
+            "the malformed row itself must not appear"
+        );
+    }
+
+    #[test]
+    fn a_slug_collision_keeps_the_first_row_and_skips_the_second() {
+        // Two rows with genuinely different names that happen to
+        // `slugify` to the same id -- simulates a future CSV update
+        // introducing a name whose punctuation collapses onto an
+        // already-used slug. Without collision detection, both would be
+        // pushed and the downstream `api` upsert (keyed by `id`) would
+        // silently let the second overwrite the first on every reload.
+        // "MOIRA RAIL STATION" and "MOIRA RAIL HALT" are different literal
+        // names, but `bare_name` strips either suffix down to the same
+        // "MOIRA", so both slugify to "nir-moira" -- a real collision
+        // this function's own id-check must catch, not just two rows
+        // sharing one literal name.
+        let stations_csv = format!(
+            "\u{FEFF}{STATIONS_CSV_HEADER}\
+             1,MOIRA RAIL STATION,RAIL STATION,0,0,,54.1,-6.1\n\
+             2,MOIRA RAIL HALT,RAIL STATION,0,0,,54.2,-6.2\n"
+        )
+        .into_bytes();
+        let empty_halts = format!("\u{FEFF}{STATIONS_CSV_HEADER}").into_bytes();
+
+        let stations = map_stations(&stations_csv, &empty_halts).unwrap();
+        let moira: Vec<_> = stations.iter().filter(|s| s.id == "nir-moira").collect();
+        assert_eq!(
+            moira.len(),
+            1,
+            "a slug collision must not produce two stations sharing one id: {moira:?}"
+        );
+        // The first row to claim the id wins.
+        assert_eq!(moira[0].latitude, Some(54.1));
     }
 
     #[test]

@@ -7,7 +7,15 @@ use clap::Parser;
 /// "no confirmed endpoint path" gap to fail loudly over. The subscription
 /// key still has none — an unset key must stop the process at startup
 /// rather than have it poll anonymously and get rate-limited later.
-#[derive(Debug, Parser)]
+///
+/// Signal Box Audit, poll-area Low finding -- "secret-bearing config
+/// structs derive Debug": does NOT derive `Debug`. `tfl_app_key` is a real
+/// TfL subscription key; a derived `Debug` would print it in full to any
+/// future `tracing::debug!("{config:?}")`, matching the same class of bug
+/// already fixed for `common::oauth_client::OAuthCredentials` and
+/// `common::service_args::KafkaConnectionArgs`. The hand-written impl
+/// below redacts it.
+#[derive(Parser)]
 pub struct Config {
     /// TfL Unified API root, without a trailing path. The binary appends
     /// `/Line/Mode/{modes}/Status` itself.
@@ -73,4 +81,60 @@ pub struct Config {
 
     #[command(flatten)]
     pub metrics: common::service_args::MetricsArgs,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("tfl_base_url", &self.tfl_base_url)
+            .field("tfl_app_key", &"[REDACTED]")
+            .field("tfl_modes", &self.tfl_modes)
+            .field("api_ingest_url", &self.api_ingest_url)
+            .field("internal_oauth", &self.internal_oauth)
+            .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("dlr_pilot_enabled", &self.dlr_pilot_enabled)
+            .field("dlr_pilot_stop_point_id", &self.dlr_pilot_stop_point_id)
+            .field("metrics_port", &self.metrics_port)
+            .field("metrics", &self.metrics)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod config_debug_tests {
+    use clap::Parser;
+
+    use super::Config;
+
+    #[test]
+    fn debug_redacts_the_tfl_app_key() {
+        let config = Config::try_parse_from([
+            "poller-tfl",
+            "--tfl-app-key",
+            "super-secret-tfl-key",
+            "--internal-oauth-token-url",
+            "http://authentik.example/token",
+            "--internal-oauth-client-id",
+            "client-id",
+            "--internal-oauth-username",
+            "svc-account",
+            "--internal-oauth-password",
+            "svc-password",
+        ])
+        .expect("required args should parse");
+
+        let debug_output = format!("{config:?}");
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "tfl_app_key must be redacted: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains("super-secret-tfl-key"),
+            "the real tfl_app_key must never appear in Debug output: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains("svc-password"),
+            "the real internal_oauth password must never appear in Debug output: {debug_output}"
+        );
+    }
 }

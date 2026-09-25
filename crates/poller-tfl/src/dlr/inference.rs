@@ -126,6 +126,31 @@ const CANCELLATION_GRACE_MINUTES: i64 = 15;
 /// disruption from hours ago as if it were still happening.
 const RESOLVED_RETENTION_MINUTES: i64 = 60;
 
+/// How many past cycles' prediction counts `DlrMatchState` remembers, used
+/// solely to build the "was I blind?" baseline below. Six cycles at this
+/// pilot's 300s poll interval is half an hour of history -- long enough to
+/// smooth over a couple of genuinely quiet minutes, short enough that a
+/// baseline still reflects roughly "now", not a stale reading from hours
+/// ago.
+const RECENT_PREDICTION_HISTORY: usize = 6;
+
+/// The recent baseline must average at least this many predictions per
+/// cycle before a near-zero cycle is trusted as evidence of an outage
+/// rather than just noise from a baseline that was already thin. DLR's
+/// live Arrivals feed reports across the whole network, so a healthy
+/// baseline is expected to be comfortably above this.
+const MIN_BASELINE_PREDICTIONS_FOR_OUTAGE_CHECK: f64 = 3.0;
+
+/// A cycle's prediction count is treated as possible evidence of a feed
+/// outage (as opposed to a genuine quiet period) once it falls at or below
+/// this fraction of the recent baseline. 10% is deliberately aggressive --
+/// this guard only ever *withholds* a cancellation inference for a cycle,
+/// never fabricates one, so a false positive here just delays a real
+/// cancellation by one cycle, while a false negative mass-cancels every
+/// pending trip on a feed outage. Erring toward more false positives is
+/// the safer trade.
+const OUTAGE_PREDICTION_RATIO: f64 = 0.1;
+
 /// How far *ahead* of `now` a scheduled trip is picked up for tracking.
 /// The Timetable poll returns the whole service day every cycle, so this
 /// is what stops the state from holding hundreds of trips that cannot be
@@ -161,6 +186,12 @@ const _: () = assert!(
 pub struct DlrMatchState {
     pending: Vec<PendingTrip>,
     resolved: Vec<ResolvedTrip>,
+    /// This cycle's and the last `RECENT_PREDICTION_HISTORY - 1` cycles'
+    /// `predictions.len()`, oldest first. Exists solely so `resolve` can
+    /// tell "the feed itself may have gone dark this cycle" from "every
+    /// pending trip genuinely got cancelled" before promoting anything --
+    /// see `resolve`'s "was I blind?" guard.
+    recent_prediction_counts: std::collections::VecDeque<usize>,
 }
 
 impl DlrMatchState {
@@ -168,6 +199,9 @@ impl DlrMatchState {
         DlrMatchState {
             pending: Vec::new(),
             resolved: Vec::new(),
+            recent_prediction_counts: std::collections::VecDeque::with_capacity(
+                RECENT_PREDICTION_HISTORY,
+            ),
         }
     }
 
@@ -179,16 +213,61 @@ impl DlrMatchState {
     /// every cycle, so both filters are load-bearing),
     /// matches everything pending against this cycle's predictions,
     /// promotes newly-matched or grace-window-expired trips into
-    /// `resolved`, evicts resolved trips older than
-    /// `RESOLVED_RETENTION_MINUTES`, and returns the resulting
-    /// `SampleStats` — `None` if nothing has resolved yet (e.g. right
-    /// after startup).
+    /// `resolved` -- unless a "was I blind?" guard suspects this cycle's
+    /// near-empty prediction count reflects a dead Arrivals feed rather
+    /// than a wave of genuine cancellations (see below) -- evicts resolved
+    /// trips older than `RESOLVED_RETENTION_MINUTES`, and returns the
+    /// resulting `SampleStats` — `None` if nothing has resolved yet (e.g.
+    /// right after startup).
+    ///
+    /// Signal Box Audit, poll-area Low finding -- "no 'was I blind?' guard
+    /// on cancellation inference": cancellation here is inferred purely
+    /// from *absence* -- a pending trip with no matching prediction past
+    /// `CANCELLATION_GRACE_MINUTES`. That reasoning silently assumes the
+    /// Arrivals feed itself is working; if the feed instead had an outage
+    /// (empty response, upstream 5xx swallowed upstream as "no
+    /// predictions", a bad deploy) every trip pending at that moment would
+    /// look cancelled and get promoted to `resolved` together, reporting a
+    /// mass cancellation that never happened. Guarded by comparing this
+    /// cycle's `predictions.len()` against a short rolling baseline
+    /// (`recent_prediction_counts`): once the baseline itself is
+    /// established and healthy (`MIN_BASELINE_PREDICTIONS_FOR_OUTAGE_CHECK`)
+    /// and this cycle's count collapses to `OUTAGE_PREDICTION_RATIO` of it
+    /// or below, cancellation promotion is skipped for the cycle (trips
+    /// stay `Pending` and get another chance once the feed recovers) with
+    /// a warning logged, rather than trusting the silence. This never
+    /// blocks a *matched* trip from resolving -- only the "nothing showed
+    /// up, so it must be cancelled" inference is withheld.
     pub fn resolve(
         &mut self,
         trips: Vec<ScheduledTrip>,
         predictions: &[Prediction],
         now: DateTime<Utc>,
     ) -> Option<common::SampleStats> {
+        let baseline_established = self.recent_prediction_counts.len() >= RECENT_PREDICTION_HISTORY;
+        let baseline_avg = if self.recent_prediction_counts.is_empty() {
+            0.0
+        } else {
+            self.recent_prediction_counts.iter().sum::<usize>() as f64
+                / self.recent_prediction_counts.len() as f64
+        };
+        let feed_looks_blind = baseline_established
+            && baseline_avg >= MIN_BASELINE_PREDICTIONS_FOR_OUTAGE_CHECK
+            && (predictions.len() as f64) <= baseline_avg * OUTAGE_PREDICTION_RATIO;
+        if feed_looks_blind {
+            tracing::warn!(
+                predictions_this_cycle = predictions.len(),
+                recent_baseline_avg = baseline_avg,
+                "DLR Arrivals prediction count collapsed far below its recent baseline; \
+                 skipping cancellation inference this cycle in case the feed itself went \
+                 blind, rather than risk mass-cancelling every pending trip"
+            );
+        }
+        self.recent_prediction_counts.push_back(predictions.len());
+        if self.recent_prediction_counts.len() > RECENT_PREDICTION_HISTORY {
+            self.recent_prediction_counts.pop_front();
+        }
+
         let known: std::collections::HashSet<DateTime<Utc>> = self
             .pending
             .iter()
@@ -229,7 +308,7 @@ impl DlrMatchState {
                 }
                 MatchedTrip::Pending => {
                     let overdue = (now - pending_trip.scheduled_departure).num_minutes();
-                    if overdue >= CANCELLATION_GRACE_MINUTES {
+                    if overdue >= CANCELLATION_GRACE_MINUTES && !feed_looks_blind {
                         self.resolved.push(ResolvedTrip {
                             scheduled_departure: pending_trip.scheduled_departure,
                             resolved_at: now,
@@ -602,5 +681,74 @@ mod tests {
             )
             .expect("the trip should resolve exactly once");
         assert_eq!(stats.total, 1);
+    }
+
+    #[test]
+    fn a_feed_outage_does_not_mass_cancel_pending_trips() {
+        let mut state = DlrMatchState::new();
+        let base: DateTime<Utc> = "2026-08-22T10:00:00Z".parse().unwrap();
+
+        // Establish a healthy baseline: several cycles, each with five
+        // trips all matched immediately by five predictions, so
+        // `recent_prediction_counts` reflects a feed averaging five
+        // predictions per cycle.
+        for cycle in 0..RECENT_PREDICTION_HISTORY as i64 {
+            let now = base + chrono::Duration::minutes(cycle * 5);
+            let trips: Vec<ScheduledTrip> = (0..5)
+                .map(|n| ScheduledTrip {
+                    scheduled_departure: now + chrono::Duration::minutes(n),
+                    interval_id: None,
+                })
+                .collect();
+            let predictions: Vec<Prediction> = trips
+                .iter()
+                .map(|t| Prediction {
+                    expected_arrival: t.scheduled_departure,
+                    ..prediction(0)
+                })
+                .collect();
+            state.resolve(trips, &predictions, now);
+        }
+
+        // Now the Arrivals feed itself goes completely dark: a new trip is
+        // admitted, but every subsequent cycle sees zero predictions at
+        // all -- not because it was cancelled, but because the whole feed
+        // stopped returning data.
+        let outage_departure = base + chrono::Duration::minutes(30);
+        let outage_trip = ScheduledTrip {
+            scheduled_departure: outage_departure,
+            interval_id: None,
+        };
+        state.resolve(vec![outage_trip.clone()], &[], outage_departure);
+        // 16 minutes later: past the normal CANCELLATION_GRACE_MINUTES
+        // (15), which without the outage guard would promote this trip to
+        // `resolved` as cancelled.
+        let stats = state
+            .resolve(
+                vec![outage_trip],
+                &[],
+                outage_departure + chrono::Duration::minutes(16),
+            )
+            .expect("the healthy baseline trips are still within the retention window");
+        assert_eq!(
+            stats.cancelled, 0,
+            "a feed outage must not be inferred as a mass cancellation: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn without_an_established_baseline_cancellation_still_infers_normally() {
+        // Guards against the guard itself over-firing: with no history
+        // yet (a cold start), an empty-predictions cycle past the grace
+        // window must still resolve as cancelled -- this is exactly
+        // `a_trip_still_unmatched_past_the_grace_window_is_cancelled`'s
+        // scenario, re-asserted here to make the "no baseline yet" branch
+        // explicit.
+        let mut state = DlrMatchState::new();
+        state.resolve(vec![trip(0)], &[], "2026-08-22T10:00:00Z".parse().unwrap());
+        let stats = state
+            .resolve(vec![], &[], "2026-08-22T10:16:00Z".parse().unwrap())
+            .expect("the overdue trip should have resolved as cancelled");
+        assert_eq!(stats.cancelled, 1);
     }
 }

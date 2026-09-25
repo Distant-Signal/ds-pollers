@@ -26,7 +26,18 @@ pub const USER_AGENT: &str = "distant-signal-poller-nir-stations/1.0 (+https://g
 /// body) -- same "genuinely public endpoint gets a working default"
 /// precedent `poller-irish-rail-gtfs::Config::gtfs_url`'s own doc comment
 /// already established (`crates/poller-irish-rail-gtfs/src/config.rs:1-12`).
-#[derive(Debug, Parser)]
+///
+/// Signal Box Audit, poll-area Low finding -- "secret-bearing config
+/// structs derive Debug": does NOT derive `Debug`. `internal_oauth_password`
+/// is a real Authentik service-account credential; a derived `Debug` would
+/// print it in full to any future `tracing::debug!("{config:?}")`, matching
+/// the same class of bug already fixed for
+/// `common::oauth_client::OAuthCredentials`/`InternalOAuthArgs` (this crate
+/// hand-rolls the individual `internal_oauth_*` fields rather than
+/// flattening `InternalOAuthArgs` in, matching `poller-irish-rail-gtfs`'s
+/// own precedent, and therefore needs its own redacting impl). The
+/// hand-written impl below redacts it.
+#[derive(Parser)]
 pub struct Config {
     /// OpenDataNI's "Northern Ireland Railways Stations" CSV.
     #[arg(
@@ -87,4 +98,56 @@ pub struct Config {
     pub metrics_port: u16,
     #[arg(long, env, default_value_t = true)]
     pub metrics_enabled: bool,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("stations_csv_url", &self.stations_csv_url)
+            .field("halts_csv_url", &self.halts_csv_url)
+            .field("api_stations_ingest_url", &self.api_stations_ingest_url)
+            .field("api_lines_ingest_url", &self.api_lines_ingest_url)
+            .field("internal_oauth_token_url", &self.internal_oauth_token_url)
+            .field("internal_oauth_client_id", &self.internal_oauth_client_id)
+            .field("internal_oauth_scope", &self.internal_oauth_scope)
+            .field("internal_oauth_username", &self.internal_oauth_username)
+            .field("internal_oauth_password", &"[REDACTED]")
+            .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("metrics_port", &self.metrics_port)
+            .field("metrics_enabled", &self.metrics_enabled)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod config_debug_tests {
+    use clap::Parser;
+
+    use super::Config;
+
+    #[test]
+    fn debug_redacts_the_internal_oauth_password() {
+        let config = Config::try_parse_from([
+            "poller-nir-stations",
+            "--internal-oauth-token-url",
+            "http://authentik.example/token",
+            "--internal-oauth-client-id",
+            "client-id",
+            "--internal-oauth-username",
+            "svc-account",
+            "--internal-oauth-password",
+            "super-secret-password",
+        ])
+        .expect("required args should parse");
+
+        let debug_output = format!("{config:?}");
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "internal_oauth_password must be redacted: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains("super-secret-password"),
+            "the real internal_oauth_password must never appear in Debug output: {debug_output}"
+        );
+    }
 }

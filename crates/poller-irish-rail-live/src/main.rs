@@ -28,6 +28,29 @@ use reqwest::Client;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Upper bound on how long the whole per-station sampling loop in
+/// `poll_once` may run in a single cycle, regardless of how many stations
+/// `getAllStationsXML` returns or how slow individual upstream responses
+/// are.
+///
+/// Signal Box Audit, poll-area Low finding -- "per-station pollers have no
+/// per-cycle time budget": before this, the loop over every station this
+/// crate discovers (171 per this crate's own live confirmation -- see
+/// `config.rs`'s module docs) had no cap of its own -- `REQUEST_TIMEOUT`
+/// (30s) bounds *one* station's call, but nothing bounded the sum across
+/// all of them, so enough individually-slow (not even hanging) stations in
+/// one cycle could let that cycle run for many multiples of
+/// `poll_interval_secs`, degrading every subsequent cycle gracelessly
+/// rather than boundedly -- a real risk against `api.irishrail.ie`'s own
+/// unconfirmed capacity (see `config.rs`'s `poll_interval_secs` doc
+/// comment). 240s leaves a comfortable margin under this crate's own 300s
+/// conservative `poll_interval_secs` default so a budget-exceeded cycle
+/// still yields back well before the next tick would otherwise be starved
+/// entirely -- deliberately NOT derived from `poll_interval_secs` itself,
+/// an operator-configured value with no guaranteed relationship to how
+/// long sampling every station should take.
+const CYCLE_TIME_BUDGET: Duration = Duration::from_secs(240);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
@@ -69,15 +92,8 @@ async fn poll_once(
         "fetched station code list to sample"
     );
 
-    let mut samples = Vec::with_capacity(station_codes.len());
-    for code in &station_codes {
-        match fetch_station_departures(client, config, code).await {
-            Ok(departures) => samples.push(schema::to_sample(code, departures)),
-            Err(err) => {
-                tracing::error!(station_code = %code, error = ?err, "failed to sample station; skipping");
-            }
-        }
-    }
+    let samples =
+        sample_stations_within_budget(client, config, &station_codes, CYCLE_TIME_BUDGET).await;
 
     if samples.is_empty() {
         tracing::warn!("no station samples collected this cycle; nothing to post");
@@ -92,6 +108,61 @@ async fn poll_once(
         "island-of-ireland station samples",
     )
     .await
+}
+
+/// Samples every code in `station_codes`, but never for longer than
+/// `budget` in total: if the per-station loop (see `sample_all_stations`)
+/// hasn't finished within `budget`, it's aborted in place and whatever
+/// samples were already collected are returned as-is, with a warning
+/// logged. `budget` is a parameter (rather than reading `CYCLE_TIME_BUDGET`
+/// directly) purely so tests can exercise the timeout path with a budget
+/// measured in milliseconds instead of `CYCLE_TIME_BUDGET`'s real 240s.
+async fn sample_stations_within_budget(
+    client: &Client,
+    config: &Config,
+    station_codes: &[String],
+    budget: Duration,
+) -> Vec<common::island_of_ireland::IslandOfIrelandStationSample> {
+    let mut samples = Vec::with_capacity(station_codes.len());
+    let outcome = tokio::time::timeout(
+        budget,
+        sample_all_stations(client, config, station_codes, &mut samples),
+    )
+    .await;
+
+    if outcome.is_err() {
+        tracing::warn!(
+            stations_total = station_codes.len(),
+            stations_sampled = samples.len(),
+            budget_secs = budget.as_secs_f64(),
+            "per-cycle station-sampling time budget exceeded; moving on with what was \
+             collected so far rather than blocking this and every subsequent cycle"
+        );
+    }
+
+    samples
+}
+
+/// The per-station loop itself, extracted so `sample_stations_within_budget`
+/// can wrap it in `tokio::time::timeout` -- when the timeout fires, this
+/// future (and its local state) is dropped mid-iteration, but every sample
+/// already pushed into the caller-owned `samples` accumulator before that
+/// point survives, since it's a `&mut` borrow of state the caller owns,
+/// not state local to this future.
+async fn sample_all_stations(
+    client: &Client,
+    config: &Config,
+    station_codes: &[String],
+    samples: &mut Vec<common::island_of_ireland::IslandOfIrelandStationSample>,
+) {
+    for code in station_codes {
+        match fetch_station_departures(client, config, code).await {
+            Ok(departures) => samples.push(schema::to_sample(code, departures)),
+            Err(err) => {
+                tracing::error!(station_code = %code, error = ?err, "failed to sample station; skipping");
+            }
+        }
+    }
 }
 
 async fn fetch_all_station_codes(client: &Client, config: &Config) -> anyhow::Result<Vec<String>> {
@@ -232,6 +303,75 @@ mod tests {
             result.is_ok(),
             "a station code containing '&'/'=' must still be delivered as one decoded value: {:?}",
             result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cycle_time_budget_bounds_total_sampling_time_across_slow_stations() {
+        // Three stations, each individually well within a single request's
+        // own timeout, but slow enough that all three together would take
+        // far longer than the tiny budget this test gives the whole loop.
+        let server = MockServer::start().await;
+        for code in ["AAA", "BBB", "CCC"] {
+            Mock::given(method("GET"))
+                .and(path("/getStationDataByCodeXML"))
+                .and(query_param("StationCode", code))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(EMPTY_STATION_BODY)
+                        .set_delay(Duration::from_millis(150)),
+                )
+                .mount(&server)
+                .await;
+        }
+        let config = test_config(server.uri());
+        let client = Client::new();
+        let station_codes = vec!["AAA".to_string(), "BBB".to_string(), "CCC".to_string()];
+
+        let start = std::time::Instant::now();
+        let samples = sample_stations_within_budget(
+            &client,
+            &config,
+            &station_codes,
+            Duration::from_millis(200),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(150 * 3),
+            "the budget should have cut the loop short well before all three \
+             150ms-delayed stations finished, took {elapsed:?}"
+        );
+        assert!(
+            samples.len() < station_codes.len(),
+            "a budget-cut cycle must not have sampled every station: {samples:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generous_budget_does_not_truncate_a_normal_cycle() {
+        let server = MockServer::start().await;
+        for code in ["AAA", "BBB"] {
+            Mock::given(method("GET"))
+                .and(path("/getStationDataByCodeXML"))
+                .and(query_param("StationCode", code))
+                .respond_with(ResponseTemplate::new(200).set_body_string(EMPTY_STATION_BODY))
+                .mount(&server)
+                .await;
+        }
+        let config = test_config(server.uri());
+        let client = Client::new();
+        let station_codes = vec!["AAA".to_string(), "BBB".to_string()];
+
+        let samples =
+            sample_stations_within_budget(&client, &config, &station_codes, CYCLE_TIME_BUDGET)
+                .await;
+
+        assert_eq!(
+            samples.len(),
+            2,
+            "a fast cycle well within budget must sample every station"
         );
     }
 }

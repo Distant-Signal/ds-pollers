@@ -10,7 +10,18 @@ use clap::Parser;
 /// `poller-tfl`'s own precedent (`TFL_BASE_URL` defaults to the real TfL
 /// API root) for "a genuinely public endpoint gets a working default,
 /// unlike an account-gated one."
-#[derive(Debug, Parser)]
+///
+/// Signal Box Audit, poll-area Low finding -- "secret-bearing config
+/// structs derive Debug": does NOT derive `Debug`. `internal_oauth_password`
+/// is a real Authentik service-account credential; a derived `Debug` would
+/// print it in full to any future `tracing::debug!("{config:?}")`, matching
+/// the same class of bug already fixed for
+/// `common::oauth_client::OAuthCredentials`/`InternalOAuthArgs` (this crate
+/// predates the shared-args dedup pass, so it still hand-rolls the
+/// individual `internal_oauth_*` fields rather than flattening
+/// `InternalOAuthArgs` in, and therefore needs its own redacting impl). The
+/// hand-written impl below redacts it.
+#[derive(Parser)]
 pub struct Config {
     /// Transport for Ireland's public GTFS zip for Iarnród Éireann.
     #[arg(
@@ -64,4 +75,55 @@ pub struct Config {
     pub metrics_port: u16,
     #[arg(long, env, default_value_t = true)]
     pub metrics_enabled: bool,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("gtfs_url", &self.gtfs_url)
+            .field("api_stations_ingest_url", &self.api_stations_ingest_url)
+            .field("api_lines_ingest_url", &self.api_lines_ingest_url)
+            .field("internal_oauth_token_url", &self.internal_oauth_token_url)
+            .field("internal_oauth_client_id", &self.internal_oauth_client_id)
+            .field("internal_oauth_scope", &self.internal_oauth_scope)
+            .field("internal_oauth_username", &self.internal_oauth_username)
+            .field("internal_oauth_password", &"[REDACTED]")
+            .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("metrics_port", &self.metrics_port)
+            .field("metrics_enabled", &self.metrics_enabled)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod config_debug_tests {
+    use clap::Parser;
+
+    use super::Config;
+
+    #[test]
+    fn debug_redacts_the_internal_oauth_password() {
+        let config = Config::try_parse_from([
+            "poller-irish-rail-gtfs",
+            "--internal-oauth-token-url",
+            "http://authentik.example/token",
+            "--internal-oauth-client-id",
+            "client-id",
+            "--internal-oauth-username",
+            "svc-account",
+            "--internal-oauth-password",
+            "super-secret-password",
+        ])
+        .expect("required args should parse");
+
+        let debug_output = format!("{config:?}");
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "internal_oauth_password must be redacted: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains("super-secret-password"),
+            "the real internal_oauth_password must never appear in Debug output: {debug_output}"
+        );
+    }
 }
