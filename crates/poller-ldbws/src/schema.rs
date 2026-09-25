@@ -82,14 +82,31 @@ fn parse_hhmm(s: &str) -> Option<chrono::NaiveTime> {
 ///
 /// Handles the midnight wraparound case (e.g. std="23:55", etd="00:05" is
 /// a 10-minute delay, not -1430).
+///
+/// A small negative `diff` is NOT a wraparound, though -- Darwin routinely
+/// publishes an `etd` a minute or two BEFORE `std` for a re-timed or
+/// early-running service. Applying the +1440 correction uniformly to every
+/// negative diff (the previous behaviour here) turned that ordinary "1
+/// minute early" case into a reported ~1439-minute delay, which then
+/// skewed the aggregator's averaged per-line delay stats into a false
+/// "delays" severity tier from a single bad sample. A genuine midnight
+/// wraparound instead produces a diff close to -1440 (std shortly before
+/// midnight, etd shortly after) -- so only a diff more negative than
+/// `WRAPAROUND_THRESHOLD_MINUTES` is treated as a wraparound; anything
+/// less negative than that is just an early/on-time service and clamps to
+/// 0 delay.
+const WRAPAROUND_THRESHOLD_MINUTES: i64 = -720;
+
 pub fn compute_delay_minutes(std: &str, etd: &str) -> i32 {
     let (Some(scheduled), Some(estimated)) = (parse_hhmm(std), parse_hhmm(etd)) else {
         return 0;
     };
 
     let diff = (estimated - scheduled).num_minutes();
-    if diff < 0 {
+    if diff < WRAPAROUND_THRESHOLD_MINUTES {
         (diff + 1440) as i32
+    } else if diff < 0 {
+        0
     } else {
         diff as i32
     }
@@ -170,6 +187,35 @@ mod tests {
     #[test]
     fn midnight_wraparound_is_handled() {
         assert_eq!(compute_delay_minutes("23:55", "00:05"), 10);
+    }
+
+    #[test]
+    fn a_slightly_early_estimate_clamps_to_zero_not_1439_minutes() {
+        // The real bug: a re-timed/early-running service with etd a minute
+        // or two before std used to get the same +1440 wraparound
+        // correction as a genuine midnight rollover, reporting ~1439
+        // minutes of "delay" for a train that's actually early or on time.
+        assert_eq!(compute_delay_minutes("10:05", "10:03"), 0);
+        assert_eq!(compute_delay_minutes("10:05", "10:04"), 0);
+        assert_eq!(compute_delay_minutes("00:10", "00:05"), 0);
+    }
+
+    #[test]
+    fn a_genuine_midnight_wraparound_still_gets_the_1440_correction() {
+        // Regression guard for the fix above: only a large negative diff
+        // (std shortly before midnight, etd shortly after) should still be
+        // treated as a wraparound, not just clamped to 0.
+        assert_eq!(compute_delay_minutes("23:58", "00:02"), 4);
+        assert_eq!(compute_delay_minutes("23:00", "00:30"), 90);
+    }
+
+    #[test]
+    fn a_diff_right_at_the_wraparound_threshold_is_still_early_not_wrapped() {
+        // -720 minutes (12 hours) is a plausible same-day "early" diff for
+        // a std/etd pair on opposite sides of noon, not a real wraparound
+        // -- it must clamp to 0, not add 1440 and report a 720-minute
+        // delay.
+        assert_eq!(compute_delay_minutes("12:00", "00:00"), 0);
     }
 
     #[test]

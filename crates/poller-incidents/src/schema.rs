@@ -25,13 +25,6 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct Incidents {
-    #[serde(default, rename = "PtIncident")]
-    pub pt_incident: Vec<PtIncident>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
 pub struct PtIncident {
     pub incident_number: String,
     pub summary: String,
@@ -118,13 +111,99 @@ impl From<&PtIncident> for IncidentMessage {
 }
 
 /// Parse a full RDM `Incidents` XML document body into `IncidentMessage`s.
+///
+/// Deliberately does NOT deserialize the whole `<Incidents>` document as one
+/// strongly-typed `Incidents { pt_incident: Vec<PtIncident> }` in a single
+/// `quick_xml::de::from_str` call: one malformed `<PtIncident>` anywhere in
+/// the batch (a missing required field, an unparseable `<StartTime>`, ...)
+/// would fail that whole call, silently stopping every OTHER incident in the
+/// response from updating too. Instead `parse_repeated_elements` isolates
+/// each `<PtIncident>` element and deserializes it independently, skipping
+/// (and logging) just the malformed ones -- mirroring the per-station
+/// isolation `poller-ldbws` already does for its own batch of stations.
 pub fn parse_incidents(xml: &str) -> Result<Vec<IncidentMessage>> {
-    let incidents: Incidents = quick_xml::de::from_str(xml)?;
-    Ok(incidents
-        .pt_incident
-        .iter()
-        .map(IncidentMessage::from)
-        .collect())
+    let incidents: Vec<PtIncident> = parse_repeated_elements(xml, "PtIncident")?;
+    Ok(incidents.iter().map(IncidentMessage::from).collect())
+}
+
+/// Isolates every top-level `<{tag_name}>...</{tag_name}>` element in `xml`
+/// and deserializes each one independently into `T`, skipping (and logging
+/// a warning for) any element that fails to deserialize on its own, rather
+/// than letting one malformed element fail deserialization of the entire
+/// document via a single `quick_xml::de::from_str::<Vec<T>>` call.
+///
+/// Works by driving `quick_xml::Reader` directly: for each `Start`/`Empty`
+/// event whose local name matches `tag_name`, it captures the exact raw
+/// byte span from that tag's opening `<` through its closing `>` (using
+/// `Reader::buffer_position()` before the tag and after `read_to_end`
+/// consumes its matching end tag -- `quick_xml`'s own doctest for
+/// `buffer_position` confirms this positions land exactly on those
+/// boundaries) and re-parses that standalone fragment with
+/// `quick_xml::de::from_str::<T>`. This only fails the WHOLE parse if the
+/// document isn't well-formed XML at all (a genuinely unrecoverable input,
+/// same as before); a single element that's well-formed XML but doesn't
+/// match `T`'s shape is skipped on its own.
+fn parse_repeated_elements<T: serde::de::DeserializeOwned>(
+    xml: &str,
+    tag_name: &str,
+) -> Result<Vec<T>> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let tag_bytes = tag_name.as_bytes();
+    let mut items = Vec::new();
+
+    loop {
+        let start_pos = reader.buffer_position() as usize;
+        let event = reader.read_event().map_err(|err| {
+            anyhow::anyhow!("malformed XML while scanning for <{tag_name}> elements: {err}")
+        })?;
+        match event {
+            Event::Eof => break,
+            Event::Empty(e) if e.name().as_ref() == tag_bytes => {
+                let end_pos = reader.buffer_position() as usize;
+                deserialize_fragment_or_warn(&mut items, &xml[start_pos..end_pos], tag_name);
+            }
+            Event::Start(e) if e.name().as_ref() == tag_bytes => {
+                let end_tag = e.to_end().into_owned();
+                if let Err(err) = reader.read_to_end(end_tag.name()) {
+                    // A genuinely unbalanced `<{tag_name}>` (no matching
+                    // close tag anywhere in the rest of the document) means
+                    // the document itself is not well-formed XML -- there
+                    // is no reliable fragment boundary to isolate, so this
+                    // (unlike a single malformed element) does fail the
+                    // whole parse.
+                    return Err(anyhow::anyhow!(
+                        "malformed XML: unterminated <{tag_name}> element: {err}"
+                    ));
+                }
+                let end_pos = reader.buffer_position() as usize;
+                deserialize_fragment_or_warn(&mut items, &xml[start_pos..end_pos], tag_name);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(items)
+}
+
+fn deserialize_fragment_or_warn<T: serde::de::DeserializeOwned>(
+    items: &mut Vec<T>,
+    fragment: &str,
+    tag_name: &str,
+) {
+    match quick_xml::de::from_str::<T>(fragment) {
+        Ok(item) => items.push(item),
+        Err(err) => {
+            tracing::warn!(
+                tag = tag_name,
+                error = %err,
+                "skipping malformed <{tag_name}> element rather than failing the whole batch"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -236,5 +315,74 @@ mod tests {
         assert!(!messages[0].is_cleared);
         assert!(messages[0].is_planned);
         assert_eq!(messages[0].operators, Vec::<String>::new());
+    }
+
+    #[test]
+    fn one_malformed_incident_is_skipped_not_the_whole_batch() {
+        // The real bug: deserializing the whole `<Incidents>` document as
+        // one `Vec<PtIncident>` in a single call meant one malformed
+        // `<PtIncident>` (here, a required `<IncidentPriority>` that isn't
+        // an integer) failed the ENTIRE batch, silently stopping every
+        // OTHER incident in the response from updating too.
+        let xml = r#"
+            <Incidents>
+                <PtIncident>
+                    <IncidentNumber>GOOD-1</IncidentNumber>
+                    <Summary>Signal failure at Reading</Summary>
+                    <Description>Disruption caused by a signal failure.</Description>
+                    <Planned>false</Planned>
+                    <ValidityPeriod>
+                        <StartTime>2026-07-01T08:00:00Z</StartTime>
+                    </ValidityPeriod>
+                    <IncidentPriority>2</IncidentPriority>
+                </PtIncident>
+                <PtIncident>
+                    <IncidentNumber>BAD-1</IncidentNumber>
+                    <Summary>Malformed incident</Summary>
+                    <Description>This one has a non-integer priority.</Description>
+                    <Planned>false</Planned>
+                    <ValidityPeriod>
+                        <StartTime>2026-07-01T08:00:00Z</StartTime>
+                    </ValidityPeriod>
+                    <IncidentPriority>not-a-number</IncidentPriority>
+                </PtIncident>
+                <PtIncident>
+                    <IncidentNumber>GOOD-2</IncidentNumber>
+                    <Summary>Points failure at Oxford</Summary>
+                    <Description>Disruption caused by a points failure.</Description>
+                    <Planned>false</Planned>
+                    <ValidityPeriod>
+                        <StartTime>2026-07-01T08:00:00Z</StartTime>
+                    </ValidityPeriod>
+                    <IncidentPriority>3</IncidentPriority>
+                </PtIncident>
+            </Incidents>
+        "#;
+
+        let messages = parse_incidents(xml)
+            .expect("one malformed incident must not fail the whole batch parse");
+        assert_eq!(
+            messages.len(),
+            2,
+            "both well-formed incidents must survive; only the malformed one is skipped"
+        );
+        let ids: Vec<&str> = messages.iter().map(|m| m.incident_id.as_str()).collect();
+        assert_eq!(ids, vec!["GOOD-1", "GOOD-2"]);
+    }
+
+    #[test]
+    fn genuinely_malformed_xml_still_fails_the_whole_parse() {
+        // Not every failure is recoverable -- if the document itself isn't
+        // well-formed XML (here, an unterminated `<PtIncident>` with no
+        // matching close tag anywhere), there's no reliable fragment
+        // boundary to isolate, so this must still surface as an error
+        // rather than silently returning a partial/wrong result.
+        let xml = r#"
+            <Incidents>
+                <PtIncident>
+                    <IncidentNumber>UNCLOSED</IncidentNumber>
+            </Incidents>
+        "#;
+        assert!(parse_incidents(xml).is_err());
     }
 }

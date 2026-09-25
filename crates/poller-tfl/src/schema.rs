@@ -89,8 +89,37 @@ pub struct TflDisruption {
 /// deterministic under test — the same convention
 /// `common::ingest::duration_until_next_poll` and the aggregator's
 /// `next_rail_day_boundary` use.
+///
+/// Deliberately does NOT deserialize the whole response as one
+/// strongly-typed `Vec<TflLine>` in a single `serde_json::from_str` call:
+/// one malformed line entry anywhere in the array (an unexpected type for
+/// `statusSeverity`, a missing required field, ...) would fail that whole
+/// call, silently stopping every OTHER line in the response from updating
+/// too. Instead the array is first parsed loosely as `Vec<serde_json::Value>`
+/// and each element is deserialized into `TflLine` independently, skipping
+/// (and logging) just the malformed ones -- mirroring the per-station
+/// isolation `poller-ldbws` already does for its own batch of stations. A
+/// genuinely invalid JSON document (not just one bad element) still fails
+/// outright at the outer `Vec<serde_json::Value>` parse -- that failure is
+/// not recoverable per-element.
 pub fn parse_line_status(json: &str, now: DateTime<Utc>) -> Result<Vec<LineStatusReport>> {
-    let lines: Vec<TflLine> = serde_json::from_str(json)?;
+    let raw_lines: Vec<serde_json::Value> = serde_json::from_str(json)?;
+    let lines: Vec<TflLine> = raw_lines
+        .into_iter()
+        .filter_map(
+            |value| match serde_json::from_value::<TflLine>(value.clone()) {
+                Ok(line) => Some(line),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        line = ?value,
+                        "skipping malformed TfL line status entry rather than failing the whole batch"
+                    );
+                    None
+                }
+            },
+        )
+        .collect();
     Ok(lines.iter().map(|line| to_report(line, now)).collect())
 }
 
@@ -437,6 +466,59 @@ mod tests {
         // the stored flag says what it means — the same correction the
         // aggregator's `validity_for_output` makes for incidents.
         assert!(chosen.is_now);
+    }
+
+    #[test]
+    fn one_malformed_line_is_skipped_not_the_whole_batch() {
+        // The real bug: deserializing the whole response as one
+        // `Vec<TflLine>` in a single call meant one malformed line entry
+        // (here, `statusSeverity` sent as a string instead of a number)
+        // failed the ENTIRE batch, silently stopping every OTHER line in
+        // the response from updating too.
+        let json = r#"[
+          {
+            "id": "victoria",
+            "name": "Victoria",
+            "modeName": "tube",
+            "modified": "2026-08-22T02:00:00Z",
+            "lineStatuses": [
+              { "statusSeverity": 10, "statusSeverityDescription": "Good Service", "validityPeriods": [] }
+            ]
+          },
+          {
+            "id": "central",
+            "name": "Central",
+            "modeName": "tube",
+            "modified": "2026-08-22T02:00:00Z",
+            "lineStatuses": [
+              { "statusSeverity": "not-a-number", "statusSeverityDescription": "Malformed", "validityPeriods": [] }
+            ]
+          },
+          {
+            "id": "circle",
+            "name": "Circle",
+            "modeName": "tube",
+            "modified": "2026-08-22T02:00:00Z",
+            "lineStatuses": [
+              { "statusSeverity": 10, "statusSeverityDescription": "Good Service", "validityPeriods": [] }
+            ]
+          }
+        ]"#;
+
+        let reports = parse_line_status(json, now())
+            .expect("one malformed line entry must not fail the whole batch parse");
+        assert_eq!(
+            reports.len(),
+            2,
+            "both well-formed lines must survive; only the malformed one is skipped"
+        );
+        let ids: Vec<&str> = reports.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["tfl-victoria", "tfl-circle"]);
+    }
+
+    #[test]
+    fn genuinely_invalid_json_still_fails_the_whole_parse() {
+        assert!(parse_line_status("not json at all", now()).is_err());
     }
 
     #[test]

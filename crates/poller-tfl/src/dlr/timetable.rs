@@ -139,24 +139,56 @@ pub fn parse_timetable(json: &str, service_date: NaiveDate) -> Result<Vec<Schedu
             continue;
         };
         for journey in &schedule.known_journeys {
-            let hour: u32 = journey.hour.parse()?;
-            let minute: u32 = journey.minute.parse()?;
+            // `hour`/`minute` are TfL-supplied strings with no documented
+            // upper bound. A single malformed or absurd value (a real
+            // captured non-numeric value, or something like
+            // `"4294967295"`, still a valid `u32`) must skip only THIS
+            // journey, not fail the whole route/timetable via `?` -- one
+            // bad entry in a 400+-journey response is exactly the partial-
+            // failure shape this parser is otherwise careful to tolerate
+            // (see the schedule-name-mismatch skip above).
+            let (Ok(hour), Ok(minute)) =
+                (journey.hour.parse::<u32>(), journey.minute.parse::<u32>())
+            else {
+                tracing::warn!(
+                    hour = %journey.hour,
+                    minute = %journey.minute,
+                    "knownJourney hour/minute is not a valid non-negative integer; skipping this journey"
+                );
+                continue;
+            };
             // TfL publishes after-midnight departures as part of the
             // previous service day, using hours 24, 25, ... (35 such
             // journeys exist in the captured Poplar timetable, across
             // every day-type). `NaiveDate::and_hms_opt` rejects hour >=
             // 24, so roll the excess into the date instead of erroring
             // — which would otherwise fail every real Timetable parse.
-            let naive = service_date
-                .and_hms_opt(hour % 24, minute, 0)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid knownJourney time {}:{}",
-                        journey.hour,
-                        journey.minute
-                    )
-                })?
-                + Duration::days((hour / 24) as i64);
+            // This also rejects an out-of-range `minute` (>= 60) the same
+            // way, skipping just this journey.
+            let Some(base) = service_date.and_hms_opt(hour % 24, minute, 0) else {
+                tracing::warn!(
+                    hour = %journey.hour,
+                    minute = %journey.minute,
+                    "invalid knownJourney time; skipping this journey"
+                );
+                continue;
+            };
+            // `NaiveDateTime`'s `Add<Duration>` impl (the previous `+
+            // Duration::days(..)` here) panics on overflow via
+            // `checked_add_signed(..).expect(..)` -- an absurd `hour`
+            // value (e.g. `"4294967295"`, a valid u32) computes a
+            // days-offset far outside what a `NaiveDate` can represent and
+            // would crash the whole poll cycle. `checked_add_signed`
+            // itself never panics; an out-of-range result degrades to
+            // skipping just this journey instead.
+            let Some(naive) = base.checked_add_signed(Duration::days(i64::from(hour / 24))) else {
+                tracing::warn!(
+                    hour = %journey.hour,
+                    "knownJourney hour is too large to resolve to a representable date; \
+                     skipping this journey"
+                );
+                continue;
+            };
             // A local time that doesn't exist (the spring-forward gap)
             // names no instant, so there is no departure to report; skip
             // that journey rather than fail the day's whole timetable.
@@ -440,6 +472,108 @@ mod tests {
         }"#;
         let trips = parse_timetable(json, weekday_service_date()).expect("should parse");
         assert!(trips.is_empty());
+    }
+
+    #[test]
+    fn an_absurdly_large_hour_is_skipped_not_a_panic() {
+        // A real captured `intervalId` is a JSON integer, but `hour`/
+        // `minute` are still bare strings with no documented upper bound.
+        // `"4294967295"` parses fine as a `u32` (it IS `u32::MAX`), so the
+        // old code's `+ Duration::days(..)` (a panicking `Add` impl) would
+        // crash the whole poll cycle computing a days-offset far outside
+        // what any `NaiveDate` can represent. This must instead skip just
+        // the malformed journey and keep the well-formed one.
+        let json = r#"{
+          "lineId": "dlr",
+          "lineName": "DLR",
+          "direction": "outbound",
+          "timetable": {
+            "departureStopId": "940GZZDLPOP",
+            "routes": [
+              {
+                "schedules": [
+                  {
+                    "name": "Monday - Friday",
+                    "knownJourneys": [
+                      { "hour": "4294967295", "minute": "00", "intervalId": 0 },
+                      { "hour": "10", "minute": "02", "intervalId": 1 }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }"#;
+        let trips = parse_timetable(json, weekday_service_date())
+            .expect("a malformed journey must not fail the whole parse");
+        assert_eq!(
+            trips.len(),
+            1,
+            "only the well-formed journey should survive"
+        );
+        assert_eq!(trips[0].interval_id, Some(1));
+    }
+
+    #[test]
+    fn a_non_numeric_hour_or_minute_skips_only_that_journey() {
+        let json = r#"{
+          "lineId": "dlr",
+          "lineName": "DLR",
+          "direction": "outbound",
+          "timetable": {
+            "departureStopId": "940GZZDLPOP",
+            "routes": [
+              {
+                "schedules": [
+                  {
+                    "name": "Monday - Friday",
+                    "knownJourneys": [
+                      { "hour": "not-a-number", "minute": "02", "intervalId": 0 },
+                      { "hour": "10", "minute": "not-a-number", "intervalId": 1 },
+                      { "hour": "10", "minute": "04", "intervalId": 2 }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }"#;
+        let trips = parse_timetable(json, weekday_service_date())
+            .expect("a non-numeric hour/minute must not fail the whole parse -- previously this used `?` and errored the whole timetable");
+        assert_eq!(
+            trips.len(),
+            1,
+            "only the one well-formed journey should survive"
+        );
+        assert_eq!(trips[0].interval_id, Some(2));
+    }
+
+    #[test]
+    fn an_out_of_range_minute_is_skipped_not_erroring_the_whole_parse() {
+        let json = r#"{
+          "lineId": "dlr",
+          "lineName": "DLR",
+          "direction": "outbound",
+          "timetable": {
+            "departureStopId": "940GZZDLPOP",
+            "routes": [
+              {
+                "schedules": [
+                  {
+                    "name": "Monday - Friday",
+                    "knownJourneys": [
+                      { "hour": "10", "minute": "99", "intervalId": 0 },
+                      { "hour": "10", "minute": "02", "intervalId": 1 }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }"#;
+        let trips = parse_timetable(json, weekday_service_date()).expect("should parse");
+        assert_eq!(trips.len(), 1);
+        assert_eq!(trips[0].interval_id, Some(1));
     }
 
     #[test]

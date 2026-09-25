@@ -68,7 +68,25 @@ pub struct Config {
     /// hatch if polling all ~171 stations every cycle turns out to be too
     /// aggressive against this unconfirmed-capacity upstream. Empty (the
     /// default) means "poll everything `getAllStationsXML` returns."
-    #[arg(long, env, value_delimiter = ',', default_value = "")]
+    ///
+    /// Deliberately has NO `default_value`. `#[arg(value_delimiter = ',')]`
+    /// only splits on the delimiter when a value is actually supplied --
+    /// `default_value = ""` (the previous code here) parses into a
+    /// one-element `[""]`, not `[]`, because clap applies the default value
+    /// as a single already-final token rather than re-running it through
+    /// the delimiter split. That made `main.rs`'s
+    /// `station_codes_override.is_empty()` check ALWAYS false in
+    /// production (the Helm chart only sets `STATION_CODES_OVERRIDE` when
+    /// non-empty -- see
+    /// `charts/distant-signal/templates/poller-irish-rail-live-deployment.yaml`),
+    /// so the `getAllStationsXML` discovery fallback below never ran and
+    /// every cycle queried exactly one station with an empty code. Leaving
+    /// this field with no `default_value` lets clap fall back to `Vec`'s
+    /// own real `Default` (an empty vec) when the flag/env var is absent
+    /// entirely, which is what "poll everything" actually needs. See
+    /// `tests::station_codes_override_defaults_to_an_empty_vec_not_one_empty_string`
+    /// for the regression test that would have caught this.
+    #[arg(long, env, value_delimiter = ',')]
     pub station_codes_override: Vec<String>,
 
     /// Port for this poller's Prometheus `/metrics` endpoint. Stays a
@@ -79,4 +97,65 @@ pub struct Config {
 
     #[command(flatten)]
     pub metrics: common::service_args::MetricsArgs,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Config;
+
+    /// The only args every real deployment supplies -- `internal_oauth`'s 4
+    /// required (no-default) fields. Everything else, including
+    /// `station_codes_override`, is left unset so this exercises exactly
+    /// the "STATION_CODES_OVERRIDE absent" shape the Helm chart's
+    /// conditional `{{- if .Values.pollerIrishRailLive.stationCodesOverride }}`
+    /// produces in production.
+    fn required_oauth_args() -> Vec<&'static str> {
+        vec![
+            "poller-irish-rail-live",
+            "--internal-oauth-token-url",
+            "http://authentik.example/token",
+            "--internal-oauth-client-id",
+            "client-id",
+            "--internal-oauth-username",
+            "svc-account",
+            "--internal-oauth-password",
+            "secret",
+        ]
+    }
+
+    #[test]
+    fn station_codes_override_defaults_to_an_empty_vec_not_one_empty_string() {
+        // Reproduces the real production bug: with no
+        // `--station-codes-override`/`STATION_CODES_OVERRIDE` supplied at
+        // all (exactly what happens when the Helm chart's conditional env
+        // block is skipped), the parsed vec must be genuinely empty so
+        // `main.rs`'s `station_codes_override.is_empty()` check takes the
+        // `getAllStationsXML` discovery branch. Before this fix,
+        // `default_value = ""` made this assert fail: the vec came back as
+        // `[""]` (len 1), never empty.
+        let config = Config::try_parse_from(required_oauth_args())
+            .expect("only the required OAuth args should be needed to parse");
+        assert_eq!(
+            config.station_codes_override,
+            Vec::<String>::new(),
+            "an absent STATION_CODES_OVERRIDE must parse to an empty Vec, not [\"\"] -- \
+             a non-empty vec here permanently defeats station discovery in production"
+        );
+        assert!(config.station_codes_override.is_empty());
+    }
+
+    #[test]
+    fn station_codes_override_still_splits_a_supplied_comma_separated_value() {
+        let mut args = required_oauth_args();
+        args.push("--station-codes-override");
+        args.push("BFSTC,CNLLY");
+        let config = Config::try_parse_from(args)
+            .expect("required OAuth args plus the override should parse");
+        assert_eq!(
+            config.station_codes_override,
+            vec!["BFSTC".to_string(), "CNLLY".to_string()]
+        );
+    }
 }

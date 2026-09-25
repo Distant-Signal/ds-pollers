@@ -85,19 +85,44 @@ impl From<&RdmStation> for StationReference {
 
 #[derive(Debug, Deserialize)]
 struct StationsResponse {
-    stations: Vec<RdmStation>,
+    stations: Vec<serde_json::Value>,
 }
 
 /// Parse a full RDM `/stations` JSON response body into `StationReference`s.
 ///
 /// Expects `{"stations": [...]}` (see module docs — the live API wraps the
 /// array in an envelope despite the spec doc saying otherwise).
+///
+/// `stations` is deliberately typed `Vec<serde_json::Value>` above, not
+/// `Vec<RdmStation>` directly: deserializing the whole envelope as one
+/// strongly-typed `Vec<RdmStation>` in a single `serde_json::from_str` call
+/// would mean one malformed station entry anywhere in the array (a missing
+/// required `crsCode`/`name`, ...) fails that whole call, silently stopping
+/// every OTHER station in the response from updating too. Instead each
+/// element is deserialized into `RdmStation` independently here, skipping
+/// (and logging) just the malformed ones -- mirroring the per-station
+/// isolation `poller-ldbws` already does for its own batch of stations. A
+/// genuinely invalid JSON document (not just one bad element) still fails
+/// outright at the outer `StationsResponse` parse -- that failure is not
+/// recoverable per-element.
 pub fn parse_stations(json: &str) -> Result<Vec<StationReference>> {
     let response: StationsResponse = serde_json::from_str(json)?;
     Ok(response
         .stations
-        .iter()
-        .map(StationReference::from)
+        .into_iter()
+        .filter_map(
+            |value| match serde_json::from_value::<RdmStation>(value.clone()) {
+                Ok(station) => Some(StationReference::from(&station)),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        station = ?value,
+                        "skipping malformed station entry rather than failing the whole batch"
+                    );
+                    None
+                }
+            },
+        )
         .collect())
 }
 
@@ -177,5 +202,38 @@ mod tests {
             second.accessibility.get("slug").and_then(|v| v.as_str()),
             Some("a-test-station")
         );
+    }
+
+    #[test]
+    fn one_malformed_station_is_skipped_not_the_whole_batch() {
+        // The real bug: deserializing the whole envelope as one
+        // `Vec<RdmStation>` in a single call meant one malformed station
+        // entry (here, missing the required `crsCode`) failed the ENTIRE
+        // batch, silently stopping every OTHER station in the response
+        // from updating too.
+        let json = r#"
+            {
+                "stations": [
+                    { "crsCode": "EUS", "name": "London Euston" },
+                    { "name": "Missing CRS Code Station" },
+                    { "crsCode": "ABC", "name": "A Test Station" }
+                ]
+            }
+        "#;
+
+        let stations = parse_stations(json)
+            .expect("one malformed station must not fail the whole batch parse");
+        assert_eq!(
+            stations.len(),
+            2,
+            "both well-formed stations must survive; only the malformed one is skipped"
+        );
+        let codes: Vec<&str> = stations.iter().map(|s| s.crs.as_str()).collect();
+        assert_eq!(codes, vec!["EUS", "ABC"]);
+    }
+
+    #[test]
+    fn genuinely_invalid_json_still_fails_the_whole_parse() {
+        assert!(parse_stations("not json at all").is_err());
     }
 }
