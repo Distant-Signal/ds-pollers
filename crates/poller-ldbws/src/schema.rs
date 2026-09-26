@@ -20,6 +20,21 @@ struct RdmStationBoard {
 
 #[derive(Debug, Deserialize)]
 struct RdmServiceItem {
+    /// RDM/LDBWS's `serviceID`: an opaque, board-relative token for
+    /// chaining into `GetServiceDetails`, NOT a durable train identity --
+    /// Darwin documents no stability guarantee for it across calls or
+    /// boards. It is the ONLY per-service identifier this poller decodes.
+    /// The public `GetDepBoardWithDetails` item this schema mirrors carries
+    /// no Darwin `rid`, no CIF `uid` and no service-start date (`sdd`) at
+    /// all -- those appear only on the staff (`LDBSVWS`) API or the Darwin
+    /// Push Port, neither of which this app consumes. The payload does
+    /// carry `rsid` (the retail service id, e.g. `"GW123400"`, see this
+    /// file's own test fixture), but it is deliberately not decoded: it is
+    /// not unique per day on its own, and nothing on the CIF side of this
+    /// app (`schedule-query`'s `BX` decode) stores the matching RSID to
+    /// join it against. See `routes::departures::get_station_departures`
+    /// (`crates/api`) for the documented `serviceId -> (trainUid, date)`
+    /// resolution path this leaves a caller with.
     #[serde(rename = "serviceID")]
     service_id: String,
     #[serde(rename = "operatorCode")]
