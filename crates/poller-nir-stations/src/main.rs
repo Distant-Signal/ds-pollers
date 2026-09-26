@@ -21,6 +21,34 @@ use reqwest::Client;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Builds the poll-cycle `tokio::time::Interval`, first ticking at `start`
+/// and thereafter every `poll_interval` -- with `MissedTickBehavior::Delay`
+/// rather than the default `Burst`.
+///
+/// `Burst` fires every missed tick back-to-back with zero gap once a cycle
+/// overruns `poll_interval` (a slow OpenDataNI CSV download, a stuck
+/// ingest POST) -- exactly when the upstream is already slow, it would
+/// pile up a burst of immediate follow-up cycles instead of settling back
+/// into its normal cadence. `Delay` instead waits a fresh `poll_interval`
+/// from whenever the overrun tick actually completes, so a slow cycle
+/// degrades to a slower cadence, never a thundering-herd burst. Same fix,
+/// same rationale, as `common::poller_loop`'s own
+/// `poll_interval_with_delay_on_overrun` (this crate doesn't share that
+/// scaffolding -- see its own doc comment -- so it needs the identical fix
+/// applied locally). Split into its own function so the configuration is
+/// directly assertable in a unit test via `Interval::missed_tick_behavior()`,
+/// since the missed-tick BEHAVIOR itself (skipping ticks under a real
+/// overrun) isn't practically observable without a slow, flaky, real-time
+/// test.
+fn poll_interval_with_delay_on_overrun(
+    start: tokio::time::Instant,
+    poll_interval: Duration,
+) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(start, poll_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
@@ -63,7 +91,8 @@ async fn main() -> anyhow::Result<()> {
             "data still fresh from a prior run; delaying first poll"
         );
     }
-    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + delay, poll_interval);
+    let mut interval =
+        poll_interval_with_delay_on_overrun(tokio::time::Instant::now() + delay, poll_interval);
 
     loop {
         interval.tick().await;
@@ -176,5 +205,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
+    }
+}
+
+#[cfg(test)]
+mod poll_interval_tests {
+    use super::*;
+
+    /// Regression for the "L1 -- MissedTickBehavior::Burst still default"
+    /// finding: this poller's own interval must opt into `Delay`, not
+    /// leave `Burst` as the default, so an overrun cycle doesn't fire a
+    /// burst of back-to-back catch-up ticks against OpenDataNI.
+    #[tokio::test]
+    async fn poll_interval_defaults_to_delay_not_burst_on_a_missed_tick() {
+        let interval = poll_interval_with_delay_on_overrun(
+            tokio::time::Instant::now(),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Delay
+        );
     }
 }
