@@ -8,6 +8,7 @@
 mod config;
 mod mapping;
 
+use std::io::Read;
 use std::time::Duration;
 
 use clap::Parser;
@@ -34,6 +35,96 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// enough to absorb years of feed growth, but bounded enough that an
 /// unbounded/hostile response can't exhaust this process's memory.
 const MAX_GTFS_ZIP_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Cumulative decompressed-bytes budget for [`reject_gtfs_zip_bomb`]'s
+/// bounded pre-scan of the downloaded GTFS zip -- see that function's own
+/// doc comment for how this is actually enforced. Comfortably above the
+/// real feed's actual decompressed size (the ~9 MB compressed feed as of
+/// this writing decompresses to, at most, a few tens of MB of CSV) while
+/// still bounding a hostile upstream's blast radius to a fixed, moderate
+/// amount of real memory and CPU time -- nowhere near the potentially
+/// unbounded ratio a crafted zip bomb could otherwise claim.
+const MAX_GTFS_INFLATED_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// **L15 (2026-09-26 review): `Gtfs::from_reader` inflates every zip entry
+/// with no bound of its own.** [`MAX_GTFS_ZIP_BYTES`]/[`download_capped`]
+/// above only bound the COMPRESSED download size, not what a hostile
+/// upstream's crafted zip could decompress to -- confirmed directly against
+/// `gtfs-structures` 0.50.0's `GtfsReader::read_from_reader`, which opens
+/// its own `zip::ZipArchive` and hands each entry's `Read` impl straight to
+/// a `csv::Reader` with no size cap anywhere in between, and against the
+/// `zip` crate (8.6.0) itself, which exposes no per-entry or total-inflated
+/// size limit option (its `read::Config` only covers locating the archive's
+/// start offset). This is a hostile-upstream-only risk: Transport for
+/// Ireland's real feed is trusted in the ordinary case, and
+/// `MAX_GTFS_ZIP_BYTES` already covers that legitimate case fully -- see
+/// this function's own callers.
+///
+/// An entry's declared "uncompressed size" field in its local/central
+/// directory header is attacker-controlled metadata written into the zip
+/// itself, not a fact -- a hand-crafted entry can declare a small
+/// uncompressed size while actually inflating to far more, exactly the same
+/// reasoning `ticket_extraction::reject_pdf_compression_bombs` already
+/// documents for why a PDF stream's own declared `/Length` can't be trusted
+/// either (`crates/api/src/data/ticket_extraction.rs`). So instead of
+/// trusting any declared size, this function borrows that exact mitigation
+/// shape: it opens its OWN `zip::ZipArchive` over the already-downloaded
+/// bytes, and for every entry, streams its decompressed content through a
+/// small, FIXED-SIZE, REUSED buffer -- never a growing `Vec` -- so this
+/// function's own memory use stays tiny regardless of how large an entry
+/// claims (or turns out) to decompress to. It aborts a single entry's
+/// decompression, and immediately rejects the whole archive, the instant
+/// the RUNNING TOTAL across every entry seen so far exceeds
+/// `MAX_GTFS_INFLATED_BYTES` -- without ever letting any entry fully
+/// materialize.
+///
+/// This duplicates the decompression work `Gtfs::from_reader` goes on to do
+/// if this check passes: `Gtfs::from_reader` offers no injectable read
+/// wrapper or size-bound option of its own to avoid that (its `ZipArchive`
+/// is entirely internal to `read_from_reader`, never exposed to the
+/// caller), so there is no way to check as-you-go during the real parse
+/// itself. Paying for the decompression twice is a non-issue here: the real
+/// feed is small, and this whole poller runs once per poll cycle (minutes
+/// apart), not once per inbound request.
+///
+/// Thin wrapper around [`reject_gtfs_zip_bomb_with_budget`], mirroring
+/// [`download_gtfs_zip`]/[`download_capped`]'s own split just below: real
+/// callers always use [`MAX_GTFS_INFLATED_BYTES`], while tests exercise the
+/// identical logic against a tiny budget (actually decompressing 2 GiB just
+/// to prove the cap trips would make the test suite slow and memory-hungry
+/// for no extra coverage).
+fn reject_gtfs_zip_bomb(bytes: &[u8]) -> anyhow::Result<()> {
+    reject_gtfs_zip_bomb_with_budget(bytes, MAX_GTFS_INFLATED_BYTES)
+}
+
+fn reject_gtfs_zip_bomb_with_budget(bytes: &[u8], max_inflated_bytes: u64) -> anyhow::Result<()> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|err| anyhow::anyhow!("failed to open GTFS zip for its size pre-check: {err}"))?;
+
+    let mut total_inflated: u64 = 0;
+    let mut buf = [0u8; 64 * 1024];
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|err| anyhow::anyhow!("failed to open GTFS zip entry {i}: {err}"))?;
+        loop {
+            let n = entry
+                .read(&mut buf)
+                .map_err(|err| anyhow::anyhow!("failed to inflate GTFS zip entry {i}: {err}"))?;
+            if n == 0 {
+                break;
+            }
+            total_inflated += n as u64;
+            anyhow::ensure!(
+                total_inflated <= max_inflated_bytes,
+                "GTFS zip contains an entry that decompresses to an implausible size \
+                 (cumulative total exceeds the {max_inflated_bytes}-byte budget); \
+                 refusing to parse it"
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Downloads `url`'s body with `MAX_GTFS_ZIP_BYTES` enforced. Thin wrapper
 /// around `download_capped` so production code always uses the real cap
@@ -180,8 +271,24 @@ async fn poll_once(
 ) -> anyhow::Result<()> {
     let bytes = download_gtfs_zip(client, &config.gtfs_url).await?;
 
-    let gtfs = Gtfs::from_reader(std::io::Cursor::new(bytes))
-        .map_err(|err| anyhow::anyhow!("failed to parse GTFS feed: {err}"))?;
+    // Both steps are synchronous, CPU-bound work over a potentially large
+    // amount of decompressed data -- `reject_gtfs_zip_bomb` by design (see
+    // its own doc comment), and `Gtfs::from_reader` in the ordinary case --
+    // so both are moved onto the blocking pool together. Without this, a
+    // pathological feed would stall this whole process's tokio runtime for
+    // however long the (bounded, but still real) decompression work takes,
+    // including this poller's own `/metrics` endpoint
+    // (`common::metrics::install` runs its HTTP listener on this same
+    // runtime).
+    let gtfs = tokio::task::spawn_blocking(move || {
+        reject_gtfs_zip_bomb(&bytes)?;
+        Gtfs::from_reader(std::io::Cursor::new(bytes))
+            .map_err(|err| anyhow::anyhow!("failed to parse GTFS feed: {err}"))
+    })
+    .await
+    .map_err(|join_err| {
+        anyhow::anyhow!("GTFS parse task panicked or was cancelled: {join_err}")
+    })??;
 
     let stations = mapping::map_stations(&gtfs);
     let lines = mapping::map_lines(&gtfs);
@@ -301,5 +408,94 @@ mod poll_interval_tests {
             interval.missed_tick_behavior(),
             tokio::time::MissedTickBehavior::Delay
         );
+    }
+}
+
+#[cfg(test)]
+mod reject_gtfs_zip_bomb_tests {
+    use std::io::Write;
+
+    use super::*;
+
+    /// Builds a single-entry zip, `name` -> `contents`, via a real
+    /// `zip::ZipWriter` -- the exact code path `reject_gtfs_zip_bomb` (and
+    /// `Gtfs::from_reader`) reads back, not a hand-rolled byte layout.
+    fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            for (name, contents) in entries {
+                zip.start_file(*name, options).unwrap();
+                zip.write_all(contents).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn an_ordinary_small_feed_is_accepted() {
+        let zip_bytes = build_zip(&[
+            ("agency.txt", b"agency_id,agency_name\nIR,Iarnrod Eireann\n"),
+            ("stops.txt", b"stop_id,stop_name\nSTOP_A,Zesttown\n"),
+        ]);
+        assert!(reject_gtfs_zip_bomb(&zip_bytes).is_ok());
+    }
+
+    #[test]
+    fn a_non_zip_input_is_rejected_before_any_inflate_is_attempted() {
+        let err = reject_gtfs_zip_bomb(b"this is not a zip file at all")
+            .expect_err("a non-zip input must be rejected");
+        assert!(
+            err.to_string().contains("open GTFS zip"),
+            "error should explain the archive-open failure: {err}"
+        );
+    }
+
+    /// The real failure shape L15 exists to prevent: a small,
+    /// highly-compressed entry that decompresses to far more than a
+    /// deliberately tiny test budget -- proving the pre-check catches an
+    /// entry whose declared/actual decompressed size exceeds what's
+    /// plausible, without this test needing to build anything close to the
+    /// real (2 GiB) production budget.
+    #[test]
+    fn a_highly_compressed_bomb_entry_is_rejected() {
+        let bomb_plaintext = vec![0u8; 64 * 1024];
+        let zip_bytes = build_zip(&[("stop_times.txt", &bomb_plaintext)]);
+
+        let err = reject_gtfs_zip_bomb_with_budget(&zip_bytes, 1024)
+            .expect_err("an entry that decompresses past the budget must be rejected");
+        assert!(
+            err.to_string().contains("implausible size"),
+            "error should explain the size-budget rejection: {err}"
+        );
+    }
+
+    /// The budget is cumulative across every entry in the archive, not
+    /// reset per-entry -- a GTFS zip legitimately has several files, and a
+    /// bound that only ever looked at one entry at a time would miss a
+    /// bomb spread across several individually-small-looking entries.
+    #[test]
+    fn the_budget_is_cumulative_across_multiple_entries_not_reset_per_entry() {
+        let each = vec![0u8; 4096];
+        let zip_bytes = build_zip(&[("a.txt", &each), ("b.txt", &each)]);
+
+        // Each entry alone (4096 bytes) is under a 6000-byte budget, but
+        // their combined total (8192) is not.
+        let err = reject_gtfs_zip_bomb_with_budget(&zip_bytes, 6000)
+            .expect_err("two entries whose combined total exceeds the budget must be rejected");
+        assert!(
+            err.to_string().contains("implausible size"),
+            "error should explain the size-budget rejection: {err}"
+        );
+    }
+
+    #[test]
+    fn two_entries_individually_and_cumulatively_within_budget_are_accepted() {
+        let each = vec![0u8; 4096];
+        let zip_bytes = build_zip(&[("a.txt", &each), ("b.txt", &each)]);
+
+        assert!(reject_gtfs_zip_bomb_with_budget(&zip_bytes, 16 * 1024).is_ok());
     }
 }

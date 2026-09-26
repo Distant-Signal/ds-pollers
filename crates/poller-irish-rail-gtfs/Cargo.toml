@@ -15,7 +15,14 @@ serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# `default-features = false` + `deflate` only, matching `gtfs-structures`
+# 0.50's own `zip` dependency spec exactly (see its Cargo.toml) -- this
+# crate's own `reject_gtfs_zip_bomb` pre-check (L15, 2026-09-26 review) must
+# support exactly the same compression methods `Gtfs::from_reader` goes on
+# to parse with, no more and no less, or the pre-check could reject a feed
+# the real parse would have accepted (or worse, silently pass an entry
+# using a codec it can't actually decode).
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 wiremock = "0.6"
-zip = "8"
