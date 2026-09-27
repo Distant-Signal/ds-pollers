@@ -6,16 +6,23 @@
 //! for the full design and `docs/superpowers/plans/2026-07-06-ldbws-sampler-poller.md`
 //! for the RDM facts this is built against (a documentation-discovery pass
 //! against a fetched Swagger spec for RDM's Live Departure Board REST
-//! product, `GetDepBoardWithDetails`). Two documented gaps carried into
-//! `config.rs`: the exact RDM product-slug segment of the base URL, and
-//! this feed's real rate limit — both are env-configurable rather than
-//! guessed.
+//! product, `GetDepBoardWithDetails`). The exact RDM product-slug segment
+//! of the base URL is a documented gap carried into `config.rs`, where it
+//! is env-configurable rather than guessed.
+//!
+//! Request volume (LEG-18): the current cadence and station set were
+//! accepted by the repo owner under the Rail Data Marketplace terms on
+//! 2026-09-27, so the defaults are unchanged. `config.rs` has three
+//! operator knobs, all off by default, for cutting the volume without a
+//! code change: an hourly request budget (`budget.rs`), a pinned-lines-only
+//! filter and a station cap (both applied by `api`).
 //!
 //! Unlike the other three pollers, this one calls a second `api` endpoint
 //! first (`GET /private/sample-stations`) to learn which CRS codes to
 //! sample, then makes one LDBWS call *per station* each cycle — there is
 //! no bulk/multi-station LDBWS operation.
 
+mod budget;
 mod config;
 mod platform_history;
 mod rotation;
@@ -25,6 +32,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
+use budget::{BudgetLimit, RequestBudget};
 use chrono::Utc;
 use clap::Parser;
 use common::ingest::{self, RDM_AUTH_HEADER_NAME};
@@ -104,6 +112,28 @@ async fn main() -> anyhow::Result<()> {
     let platform_history = Rc::new(RefCell::new(PlatformHistory::new()));
     // Same shape, for the station rotation (SVC-04).
     let rotation = Rc::new(RefCell::new(Rotation::new(std::time::Instant::now())));
+    // And for the optional hourly request budget (LEG-18), whose rolling
+    // window has to outlive a single cycle.
+    let budget = Rc::new(RefCell::new(RequestBudget::new(
+        config.hourly_request_budget,
+        config.poll_interval_secs,
+    )));
+    // Registered at 0 so the counter exists (and `rate()` works) before
+    // the first skip; stays 0 forever with no budget set.
+    for limit in [BudgetLimit::Cycle, BudgetLimit::Hour] {
+        metrics::counter!(
+            common::metrics::metric_name("ldbws_budget_skipped_polls_total"),
+            "limit" => limit.as_str()
+        )
+        .increment(0);
+    }
+    if let Some(per_cycle) = budget.borrow().per_cycle_limit() {
+        tracing::info!(
+            hourly_request_budget = config.hourly_request_budget,
+            per_cycle,
+            "LDBWS hourly request budget enabled"
+        );
+    }
 
     common::poller_loop::run_poll_loop(
         "ldbws",
@@ -117,22 +147,31 @@ async fn main() -> anyhow::Result<()> {
         || {
             let platform_history = Rc::clone(&platform_history);
             let rotation = Rc::clone(&rotation);
+            let budget = Rc::clone(&budget);
             let client = &client;
             let config = &config;
             let internal_oauth = &internal_oauth;
             async move {
                 let mut history = std::mem::take(&mut *platform_history.borrow_mut());
                 let mut rotation_state = rotation.replace(Rotation::new(std::time::Instant::now()));
+                // The placeholder carries the same limits, so even a cycle
+                // that never put its state back could not lift the budget.
+                let mut budget_state = budget.replace(RequestBudget::new(
+                    config.hourly_request_budget,
+                    config.poll_interval_secs,
+                ));
                 let result = poll_once(
                     client,
                     config,
                     &mut history,
                     &mut rotation_state,
+                    &mut budget_state,
                     internal_oauth,
                 )
                 .await;
                 *platform_history.borrow_mut() = history;
                 *rotation.borrow_mut() = rotation_state;
+                *budget.borrow_mut() = budget_state;
                 result
             }
         },
@@ -145,6 +184,7 @@ async fn poll_once(
     config: &Config,
     platform_history: &mut PlatformHistory,
     rotation: &mut Rotation,
+    request_budget: &mut RequestBudget,
     internal_oauth: &common::oauth_client::OAuthTokenCache,
 ) -> anyhow::Result<()> {
     let stations = fetch_sample_stations(client, config, internal_oauth).await?;
@@ -155,14 +195,23 @@ async fn poll_once(
     // requests per cycle -- see `rotation`'s module docs.
     let unix_secs = u64::try_from(Utc::now().timestamp()).unwrap_or_default();
     let ordered = rotation.order(&stations, unix_secs, config.poll_interval_secs);
-    let CycleSampling { samples, completed } = sample_stations_within_budget(
+    request_budget.start_cycle();
+    let CycleSampling {
+        samples,
+        completed,
+        skipped_for_budget,
+    } = sample_stations_within_budget(
         client,
         config,
         platform_history,
+        request_budget,
         &ordered,
         CYCLE_TIME_BUDGET,
     )
     .await;
+    if let Some((skipped, limit)) = skipped_for_budget {
+        record_budget_skip(config, ordered.len(), skipped, limit);
+    }
     let now = std::time::Instant::now();
     rotation.finish_cycle(
         &ordered,
@@ -213,6 +262,25 @@ fn record_cycle_metrics(total: usize, completed: usize, sampled: usize, stalest:
     .set(stalest.as_secs_f64());
 }
 
+/// LEG-18: counts the station polls the hourly request budget skipped this
+/// cycle (`ldbws_budget_skipped_polls_total`, labelled by which limit) and
+/// logs one warning. Never called with no budget set.
+fn record_budget_skip(config: &Config, total: usize, skipped: usize, limit: BudgetLimit) {
+    metrics::counter!(
+        common::metrics::metric_name("ldbws_budget_skipped_polls_total"),
+        "limit" => limit.as_str()
+    )
+    .increment(skipped as u64);
+    tracing::warn!(
+        stations_total = total,
+        stations_skipped = skipped,
+        limit = limit.as_str(),
+        hourly_request_budget = config.hourly_request_budget,
+        "LDBWS hourly request budget reached; skipping the rest of this cycle's \
+         stations (the next cycle starts with them)"
+    );
+}
+
 /// What one budgeted sampling pass produced.
 #[derive(Debug)]
 struct CycleSampling {
@@ -220,6 +288,10 @@ struct CycleSampling {
     /// Stations attempted to completion, successfully or not, before the
     /// budget ran out -- the first `completed` of the list passed in.
     completed: usize,
+    /// Stations not polled this cycle because the hourly request budget
+    /// (LEG-18, off by default) refused them, and which limit did. Always
+    /// `None` with no budget set.
+    skipped_for_budget: Option<(usize, BudgetLimit)>,
 }
 
 /// Samples every station in `stations`, but never for longer than
@@ -229,24 +301,32 @@ struct CycleSampling {
 /// logged. `budget` is a parameter (rather than reading `CYCLE_TIME_BUDGET`
 /// directly) purely so tests can exercise the timeout path with a budget
 /// measured in milliseconds instead of `CYCLE_TIME_BUDGET`'s real 45s.
+///
+/// `request_budget` is the separate, optional hourly request budget: when
+/// it refuses a station, the rest of the list is skipped for this cycle
+/// and reported in `skipped_for_budget` (see `record_budget_skip`).
 async fn sample_stations_within_budget(
     client: &Client,
     config: &Config,
     platform_history: &mut PlatformHistory,
+    request_budget: &mut RequestBudget,
     stations: &[String],
     budget: Duration,
 ) -> CycleSampling {
     let mut samples = Vec::with_capacity(stations.len());
     let mut completed = 0;
+    let mut skipped_for_budget = None;
     let outcome = tokio::time::timeout(
         budget,
         sample_all_stations(
             client,
             config,
             platform_history,
+            request_budget,
             stations,
             &mut samples,
             &mut completed,
+            &mut skipped_for_budget,
         ),
     )
     .await;
@@ -262,7 +342,11 @@ async fn sample_stations_within_budget(
         );
     }
 
-    CycleSampling { samples, completed }
+    CycleSampling {
+        samples,
+        completed,
+        skipped_for_budget,
+    }
 }
 
 /// The per-station loop itself, extracted so `sample_stations_within_budget`
@@ -270,17 +354,25 @@ async fn sample_stations_within_budget(
 /// future (and its local state) is dropped mid-iteration, but every sample
 /// already pushed into the caller-owned `samples` accumulator before that
 /// point survives, since it's a `&mut` borrow of state the caller owns,
-/// not state local to this future.
+/// not state local to this future. The same goes for `skipped_for_budget`,
+/// set just before the loop stops early for the request budget.
+#[allow(clippy::too_many_arguments)]
 async fn sample_all_stations(
     client: &Client,
     config: &Config,
     platform_history: &mut PlatformHistory,
+    request_budget: &mut RequestBudget,
     stations: &[String],
     samples: &mut Vec<StationSample>,
     completed: &mut usize,
+    skipped_for_budget: &mut Option<(usize, BudgetLimit)>,
 ) {
-    for crs in stations {
-        match fetch_departures(client, config, crs).await {
+    for (index, crs) in stations.iter().enumerate() {
+        if let Err(limit) = request_budget.check(std::time::Instant::now()) {
+            *skipped_for_budget = Some((stations.len() - index, limit));
+            return;
+        }
+        match fetch_departures(client, config, request_budget, crs).await {
             Ok(mut departures) => {
                 platform_history.apply(crs, &mut departures);
                 samples.push(StationSample {
@@ -306,7 +398,28 @@ async fn fetch_sample_stations(
     config: &Config,
     tokens: &common::oauth_client::OAuthTokenCache,
 ) -> anyhow::Result<Vec<String>> {
-    common::ingest::get_json(client, &config.api_sample_stations_url, tokens).await
+    let url = sample_stations_url(config)?;
+    common::ingest::get_json(client, &url, tokens).await
+}
+
+/// `api_sample_stations_url` plus the LEG-18 station-set knobs as query
+/// parameters. With neither knob set it is returned unchanged, so `api`
+/// sees exactly the request it always has.
+fn sample_stations_url(config: &Config) -> anyhow::Result<String> {
+    if !config.sample_pinned_lines_only && config.sample_max_stations == 0 {
+        return Ok(config.api_sample_stations_url.clone());
+    }
+    let mut url = reqwest::Url::parse(&config.api_sample_stations_url)?;
+    {
+        let mut query = url.query_pairs_mut();
+        if config.sample_pinned_lines_only {
+            query.append_pair("pinned_lines_only", "true");
+        }
+        if config.sample_max_stations > 0 {
+            query.append_pair("max_stations", &config.sample_max_stations.to_string());
+        }
+    }
+    Ok(url.into())
 }
 
 /// The two ways a single `GetDepBoardWithDetails` attempt can fail:
@@ -397,9 +510,14 @@ async fn fetch_departures_once(
 /// non-5xx failure (bad key, bad CRS, a network error) is never retried,
 /// so a genuinely different failure class can't be masked or hammered by
 /// this loop. See `docs/superpowers/specs/2026-07-06-ldbws-sampler-poller-design.md`.
+///
+/// Every attempt, fallback retries included, uses up one request from
+/// `request_budget`; a retry the budget refuses ends the station's attempts
+/// for this cycle with an error instead.
 async fn fetch_departures(
     client: &Client,
     config: &Config,
+    request_budget: &mut RequestBudget,
     crs: &str,
 ) -> anyhow::Result<Vec<StationDeparture>> {
     let mut num_rows = config.num_rows;
@@ -407,6 +525,13 @@ async fn fetch_departures(
     let mut fell_back = false;
 
     loop {
+        if let Err(limit) = request_budget.try_acquire(std::time::Instant::now()) {
+            anyhow::bail!(
+                "LDBWS fetch for {crs} stopped before attempt {attempt} (numRows={num_rows}): \
+                 the hourly request budget's {} limit was reached",
+                limit.as_str()
+            );
+        }
         match fetch_departures_once(client, config, crs, num_rows).await {
             Ok(body) => {
                 if fell_back {
@@ -532,6 +657,9 @@ mod tests {
                 internal_oauth_password: "app-password".to_string(),
             },
             poll_interval_secs: 60,
+            hourly_request_budget: 0,
+            sample_pinned_lines_only: false,
+            sample_max_stations: 0,
             metrics_port: 9091,
             metrics: common::service_args::MetricsArgs {
                 metrics_enabled: false,
@@ -559,7 +687,7 @@ mod tests {
         let client = Client::new();
 
         let start = std::time::Instant::now();
-        let departures = fetch_departures(&client, &config, "PAD")
+        let departures = fetch_departures(&client, &config, &mut RequestBudget::unlimited(), "PAD")
             .await
             .expect("a 200 on the first try must succeed");
         let elapsed = start.elapsed();
@@ -595,7 +723,7 @@ mod tests {
         let config = test_config(server.uri(), 10);
         let client = Client::new();
 
-        let departures = fetch_departures(&client, &config, "PAD")
+        let departures = fetch_departures(&client, &config, &mut RequestBudget::unlimited(), "PAD")
             .await
             .expect("falling back to numRows=5 must recover");
 
@@ -630,7 +758,8 @@ mod tests {
         let config = test_config(server.uri(), 3);
         let client = Client::new();
 
-        let result = fetch_departures(&client, &config, "PAD").await;
+        let result =
+            fetch_departures(&client, &config, &mut RequestBudget::unlimited(), "PAD").await;
 
         assert!(
             result.is_err(),
@@ -657,7 +786,8 @@ mod tests {
         let config = test_config(server.uri(), 10);
         let client = Client::new();
 
-        let result = fetch_departures(&client, &config, "PAD").await;
+        let result =
+            fetch_departures(&client, &config, &mut RequestBudget::unlimited(), "PAD").await;
 
         assert!(result.is_err());
         let requests = server
@@ -700,6 +830,7 @@ mod tests {
             &client,
             &config,
             &mut history,
+            &mut RequestBudget::unlimited(),
             &stations,
             Duration::from_millis(200),
         )
@@ -736,6 +867,7 @@ mod tests {
             &client,
             &config,
             &mut history,
+            &mut RequestBudget::unlimited(),
             &stations,
             CYCLE_TIME_BUDGET,
         )
@@ -777,10 +909,13 @@ mod tests {
         let mut per_cycle = Vec::new();
         for cycle in 0..3u64 {
             let ordered = rotation.order(&stations, cycle * 60, 60);
-            let CycleSampling { samples, completed } = sample_stations_within_budget(
+            let CycleSampling {
+                samples, completed, ..
+            } = sample_stations_within_budget(
                 &client,
                 &config,
                 &mut history,
+                &mut RequestBudget::unlimited(),
                 &ordered,
                 Duration::from_millis(500),
             )
@@ -800,6 +935,154 @@ mod tests {
             seen.len(),
             5,
             "every station sampled within 3 cycles: {seen:?}"
+        );
+    }
+
+    async fn server_answering(names: &[&str]) -> MockServer {
+        let server = MockServer::start().await;
+        for crs in names {
+            Mock::given(method("GET"))
+                .and(path(format!("/GetDepBoardWithDetails/{crs}")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(ONE_SERVICE_BODY))
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    /// LEG-18: with the knob at its default (0), the budget built from the
+    /// config never skips anything, however long the list.
+    #[tokio::test]
+    async fn the_default_request_budget_skips_nothing() {
+        let names: Vec<String> = (0..200).map(|i| format!("S{i:02}")).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let server = server_answering(&name_refs).await;
+        let config = test_config(server.uri(), 10);
+        let mut budget =
+            RequestBudget::new(config.hourly_request_budget, config.poll_interval_secs);
+        budget.start_cycle();
+
+        let sampling = sample_stations_within_budget(
+            &Client::new(),
+            &config,
+            &mut PlatformHistory::new(),
+            &mut budget,
+            &names,
+            CYCLE_TIME_BUDGET,
+        )
+        .await;
+
+        assert_eq!(sampling.samples.len(), names.len());
+        assert_eq!(sampling.completed, names.len());
+        assert_eq!(sampling.skipped_for_budget, None);
+        assert_eq!(
+            server.received_requests().await.expect("recording").len(),
+            names.len()
+        );
+    }
+
+    /// A budget of 180 an hour at 60 s cycles allows 3 requests a cycle:
+    /// the rest of a 5-station list is skipped (not failed), no request is
+    /// made for them, and the rotation starts the next cycle with them.
+    #[tokio::test]
+    async fn a_request_budget_skips_the_rest_of_the_cycle_and_the_rotation_resumes_there() {
+        let names = ["AAA", "BBB", "CCC", "DDD", "EEE"];
+        let server = server_answering(&names).await;
+        let mut config = test_config(server.uri(), 10);
+        config.hourly_request_budget = 180;
+        let client = Client::new();
+        let stations: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let mut history = PlatformHistory::new();
+        let mut rotation = Rotation::new(std::time::Instant::now());
+        let mut budget =
+            RequestBudget::new(config.hourly_request_budget, config.poll_interval_secs);
+
+        budget.start_cycle();
+        let ordered = rotation.order(&stations, 0, 60);
+        assert_eq!(ordered[0], "AAA", "clock offset 0 starts at the top");
+        let first = sample_stations_within_budget(
+            &client,
+            &config,
+            &mut history,
+            &mut budget,
+            &ordered,
+            CYCLE_TIME_BUDGET,
+        )
+        .await;
+        assert_eq!(first.completed, 3);
+        assert_eq!(first.samples.len(), 3);
+        assert_eq!(first.skipped_for_budget, Some((2, BudgetLimit::Cycle)));
+        assert_eq!(
+            server.received_requests().await.expect("recording").len(),
+            3
+        );
+        rotation.finish_cycle(
+            &ordered,
+            first.completed,
+            first.samples.iter().map(|s| s.crs.as_str()),
+            std::time::Instant::now(),
+        );
+
+        budget.start_cycle();
+        let ordered = rotation.order(&stations, 60, 60);
+        assert_eq!(&ordered[..2], ["DDD", "EEE"], "skipped stations go first");
+        let second = sample_stations_within_budget(
+            &client,
+            &config,
+            &mut history,
+            &mut budget,
+            &ordered,
+            CYCLE_TIME_BUDGET,
+        )
+        .await;
+        assert_eq!(second.completed, 3);
+        assert_eq!(second.skipped_for_budget, Some((2, BudgetLimit::Cycle)));
+    }
+
+    /// A numRows fallback retry is a request too: with one request left,
+    /// a 500 is not retried and the station fails for the cycle.
+    #[tokio::test]
+    async fn a_request_budget_also_bounds_numrows_fallback_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/GetDepBoardWithDetails/PAD"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .mount(&server)
+            .await;
+        let config = test_config(server.uri(), 10);
+        let mut budget = RequestBudget::new(60, 60); // 1 per cycle
+        budget.start_cycle();
+
+        let result = fetch_departures(&Client::new(), &config, &mut budget, "PAD").await;
+
+        let message = result
+            .expect_err("the only allowed attempt 500s")
+            .to_string();
+        assert!(message.contains("budget"), "{message}");
+        assert_eq!(
+            server.received_requests().await.expect("recording").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_sample_stations_url_is_unchanged_unless_a_knob_is_set() {
+        let mut config = test_config("http://ldbws.invalid".to_string(), 10);
+        assert_eq!(
+            sample_stations_url(&config).expect("valid url"),
+            "http://api:8080/private/sample-stations"
+        );
+
+        config.sample_max_stations = 150;
+        assert_eq!(
+            sample_stations_url(&config).expect("valid url"),
+            "http://api:8080/private/sample-stations?max_stations=150"
+        );
+
+        config.sample_pinned_lines_only = true;
+        assert_eq!(
+            sample_stations_url(&config).expect("valid url"),
+            "http://api:8080/private/sample-stations?pinned_lines_only=true&max_stations=150"
         );
     }
 }

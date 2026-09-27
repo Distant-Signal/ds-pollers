@@ -68,10 +68,36 @@ pub struct Config {
     pub internal_oauth: common::oauth_client::InternalOAuthArgs,
 
     /// DESIGN.md §4's aggregator polling cadence target is "30-60s"; 60 is
-    /// the conservative end, given this feed's real rate limit is
-    /// unconfirmed (see module docs in `main.rs`).
+    /// the conservative end. The resulting request volume (one request per
+    /// sample station, about 560 of them, as many as fit `main.rs`'s 45 s
+    /// `CYCLE_TIME_BUDGET` each cycle) was accepted by the repo owner under
+    /// the Rail Data Marketplace terms on 2026-09-27 (LEG-18); the three
+    /// knobs below exist so an operator can cut it without a code change.
     #[arg(long, env, default_value_t = 60)]
     pub poll_interval_secs: u64,
+
+    /// LEG-18 operator knob: at most this many `GetDepBoardWithDetails`
+    /// requests in any rolling hour, spread evenly across the hour's
+    /// cycles (see `budget.rs`). Stations a cycle cannot afford are
+    /// skipped (counted in `ldbws_budget_skipped_polls_total`) and the
+    /// rotation picks them up first next cycle. 0, the default, means no
+    /// budget.
+    #[arg(long, env, default_value_t = 0)]
+    pub hourly_request_budget: u32,
+
+    /// LEG-18 operator knob: only sample stations on lines at least one
+    /// user has pinned. Sent to `api` as `pinned_lines_only=true` on the
+    /// sample-stations request (see `crates/api/src/routes/samples.rs`).
+    /// Off by default. With nothing pinned, nothing is sampled.
+    #[arg(long, env, default_value_t = false)]
+    pub sample_pinned_lines_only: bool,
+
+    /// LEG-18 operator knob: at most this many sample stations, chosen by
+    /// `api` line-fairly with the most-pinned lines first (see
+    /// `crates/api/src/data/samples.rs::select_sample_stations`). Sent as
+    /// `max_stations=N`. 0, the default, means no cap.
+    #[arg(long, env, default_value_t = 0)]
+    pub sample_max_stations: u32,
 
     /// Port for this poller's Prometheus `/metrics` endpoint. Stays a
     /// plain field, not part of `MetricsArgs` -- its default differs per
@@ -97,6 +123,9 @@ impl std::fmt::Debug for Config {
             .field("api_ingest_url", &self.api_ingest_url)
             .field("internal_oauth", &self.internal_oauth)
             .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("hourly_request_budget", &self.hourly_request_budget)
+            .field("sample_pinned_lines_only", &self.sample_pinned_lines_only)
+            .field("sample_max_stations", &self.sample_max_stations)
             .field("metrics_port", &self.metrics_port)
             .field("metrics", &self.metrics)
             .field("health", &self.health)
@@ -142,5 +171,70 @@ mod config_debug_tests {
             !debug_output.contains("svc-password"),
             "the real internal_oauth password must never appear in Debug output: {debug_output}"
         );
+    }
+
+    /// LEG-18: the three volume knobs are off unless set.
+    #[test]
+    fn the_volume_knobs_default_to_off() {
+        let config = Config::try_parse_from([
+            "poller-ldbws",
+            "--ldbws-base-url",
+            "https://example.invalid",
+            "--rdm-api-key",
+            "key",
+            "--internal-oauth-token-url",
+            "http://authentik.example/token",
+            "--internal-oauth-client-id",
+            "client-id",
+            "--internal-oauth-username",
+            "svc-account",
+            "--internal-oauth-password",
+            "svc-password",
+        ])
+        .expect("required args should parse");
+        assert_eq!(config.poll_interval_secs, 60);
+        assert_eq!(config.hourly_request_budget, 0);
+        assert!(!config.sample_pinned_lines_only);
+        assert_eq!(config.sample_max_stations, 0);
+    }
+}
+
+/// The LEG-18 knobs are only useful if an operator can set them under
+/// Helm. `poller-deployments.yaml` renders every poller from one loop, so
+/// check the template names each env var this crate declares for them.
+#[cfg(test)]
+mod chart_env_wiring_tests {
+    use clap::CommandFactory;
+
+    use super::Config;
+
+    const KNOB_ENV_VARS: &[&str] = &[
+        "HOURLY_REQUEST_BUDGET",
+        "SAMPLE_PINNED_LINES_ONLY",
+        "SAMPLE_MAX_STATIONS",
+    ];
+
+    #[test]
+    fn every_volume_knob_is_wired_into_the_poller_template() {
+        let template = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/distant-signal/templates/poller-deployments.yaml");
+        let rendered = std::fs::read_to_string(&template)
+            .unwrap_or_else(|err| panic!("read {}: {err}", template.display()));
+        let declared: Vec<String> = Config::command()
+            .get_arguments()
+            .filter_map(|arg| arg.get_env().and_then(|env| env.to_str()))
+            .map(str::to_string)
+            .collect();
+        for env in KNOB_ENV_VARS {
+            assert!(
+                declared.iter().any(|d| d == env),
+                "sanity check: crates/poller-ldbws/src/config.rs must still declare {env}"
+            );
+            assert!(
+                rendered.contains(&format!("- name: {env}")),
+                "{env} is declared by crates/poller-ldbws/src/config.rs but never set in \
+                 charts/distant-signal/templates/poller-deployments.yaml"
+            );
+        }
     }
 }

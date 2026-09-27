@@ -8,7 +8,7 @@
 //! Now each cycle starts where the previous one stopped (the first station
 //! it did not get to), wrapping round the end of the list. The number of
 //! requests per cycle is unchanged -- still whatever fits the budget -- so
-//! this adds no LDBWS volume (the licence question in LEG-18). A station is
+//! this adds no LDBWS request volume (LEG-18). A station is
 //! sampled at least once every `ceil(stations / per-cycle capacity)` cycles.
 //!
 //! The position survives list changes (it is kept as a CRS, not an index)

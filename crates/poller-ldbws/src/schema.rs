@@ -5,8 +5,8 @@
 //! fetched and parsed directly during planning (see the implementation
 //! plan's "Current relevant code" section for the source and exact
 //! `definitions` block). High confidence on field names/types; the base
-//! URL's exact product-slug segment and this feed's rate limit are the
-//! genuinely unconfirmed facts, both handled in `config.rs`, not here.
+//! URL's exact product-slug segment is the genuinely unconfirmed fact,
+//! handled in `config.rs` (as are the request-volume knobs), not here.
 
 use anyhow::Result;
 use common::StationDeparture;
