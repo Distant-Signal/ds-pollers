@@ -51,6 +51,21 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// long sampling every station should take.
 const CYCLE_TIME_BUDGET: Duration = Duration::from_secs(240);
 
+/// The `User-Agent` every request to Irish Rail carries (LEG-21): honest and
+/// identifying (crate name, version, project URL) rather than reqwest's
+/// default of sending none at all. See `common::user_agent`.
+const USER_AGENT: &str = common::user_agent!();
+
+/// Builds the HTTP client used for every upstream fetch and ingest POST.
+/// Split out of `main` so the test below can assert, over real HTTP, that
+/// the client actually sends [`USER_AGENT`].
+fn build_client() -> reqwest::Result<Client> {
+    Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .build()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
@@ -61,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::parse();
     let progress = health_http::spawn_liveness(&config.health);
-    let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
+    let client = build_client()?;
     let internal_oauth = config.internal_oauth.token_cache();
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
 
@@ -220,6 +235,29 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    /// LEG-21: the production client must identify itself. wiremock's
+    /// exact-value `header` matcher plus `.expect(1)` fails this test if
+    /// `build_client` ever stops sending [`USER_AGENT`].
+    #[tokio::test]
+    async fn client_sends_an_identifying_user_agent() {
+        assert!(USER_AGENT.starts_with(concat!("distant-signal-", env!("CARGO_PKG_NAME"), "/")));
+        assert!(USER_AGENT.contains(common::user_agent::PROJECT_URL));
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::header("user-agent", USER_AGENT))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response = build_client()
+            .unwrap()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
 
     /// Fills every `Config` field `fetch_station_departures` doesn't touch
     /// with inert placeholders -- only `irish_rail_base_url` matters to the
