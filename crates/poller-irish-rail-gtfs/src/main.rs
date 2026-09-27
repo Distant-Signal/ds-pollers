@@ -38,13 +38,22 @@ const MAX_GTFS_ZIP_BYTES: u64 = 200 * 1024 * 1024;
 
 /// Cumulative decompressed-bytes budget for [`reject_gtfs_zip_bomb`]'s
 /// bounded pre-scan of the downloaded GTFS zip -- see that function's own
-/// doc comment for how this is actually enforced. Comfortably above the
-/// real feed's actual decompressed size (the ~9 MB compressed feed as of
-/// this writing decompresses to, at most, a few tens of MB of CSV) while
-/// still bounding a hostile upstream's blast radius to a fixed, moderate
-/// amount of real memory and CPU time -- nowhere near the potentially
-/// unbounded ratio a crafted zip bomb could otherwise claim.
-const MAX_GTFS_INFLATED_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+/// doc comment for how this is actually enforced.
+///
+/// **Sized against the pod, not just against the feed (L15 follow-up,
+/// 2026-09-27).** This was 2 GiB, which bounded nothing useful: the
+/// pre-scan itself streams (constant memory), but anything that PASSES it
+/// is then parsed wholesale into memory by `Gtfs::from_reader`, inside a
+/// container whose chart memory limit is 768Mi
+/// (`pollerIrishRailGtfs.resources.limits.memory`). A crafted zip inflating
+/// to ~1.5 GiB of CSV sailed through the old budget and OOMKilled the pod
+/// on the parse instead. The real feed measured 2026-09-27 is 9.0 MB
+/// compressed / 27.2 MB inflated (`shapes.txt` alone is 24.8 MB), so 256
+/// MiB is still ~9x headroom for feed growth while keeping inflated CSV
+/// plus its parsed form plus the (<= [`MAX_GTFS_ZIP_BYTES`]) zip bytes
+/// themselves inside that limit. Raise the pod limit first if this ever
+/// needs to grow.
+const MAX_GTFS_INFLATED_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
 /// **L15 (2026-09-26 review): `Gtfs::from_reader` inflates every zip entry
 /// with no bound of its own.** [`MAX_GTFS_ZIP_BYTES`]/[`download_capped`]
@@ -90,7 +99,7 @@ const MAX_GTFS_INFLATED_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 /// Thin wrapper around [`reject_gtfs_zip_bomb_with_budget`], mirroring
 /// [`download_gtfs_zip`]/[`download_capped`]'s own split just below: real
 /// callers always use [`MAX_GTFS_INFLATED_BYTES`], while tests exercise the
-/// identical logic against a tiny budget (actually decompressing 2 GiB just
+/// identical logic against a tiny budget (actually decompressing 256 MiB just
 /// to prove the cap trips would make the test suite slow and memory-hungry
 /// for no extra coverage).
 fn reject_gtfs_zip_bomb(bytes: &[u8]) -> anyhow::Result<()> {
@@ -458,7 +467,7 @@ mod reject_gtfs_zip_bomb_tests {
     /// deliberately tiny test budget -- proving the pre-check catches an
     /// entry whose declared/actual decompressed size exceeds what's
     /// plausible, without this test needing to build anything close to the
-    /// real (2 GiB) production budget.
+    /// real (256 MiB) production budget.
     #[test]
     fn a_highly_compressed_bomb_entry_is_rejected() {
         let bomb_plaintext = vec![0u8; 64 * 1024];
@@ -489,6 +498,26 @@ mod reject_gtfs_zip_bomb_tests {
             err.to_string().contains("implausible size"),
             "error should explain the size-budget rejection: {err}"
         );
+    }
+
+    /// L15 follow-up pin: the production budget must stay small enough
+    /// that a zip which passes the pre-scan can still be parsed inside the
+    /// pod's 768Mi chart memory limit (see [`MAX_GTFS_INFLATED_BYTES`]'s
+    /// doc comment) -- the original 2 GiB value could not -- while staying
+    /// comfortably above the real feed's measured 27.2 MB inflated size.
+    #[test]
+    fn the_production_inflated_budget_fits_the_pod_and_the_real_feed() {
+        const POD_MEMORY_LIMIT_BYTES: u64 = 768 * 1024 * 1024;
+        const REAL_FEED_INFLATED_BYTES: u64 = 27_193_634;
+        // Compile-time checks (a plain `assert!` on constants trips
+        // `clippy::assertions_on_constants`).
+        const {
+            assert!(
+                MAX_GTFS_INFLATED_BYTES <= POD_MEMORY_LIMIT_BYTES / 3,
+                "inflated budget leaves no room to parse it in the pod"
+            );
+            assert!(MAX_GTFS_INFLATED_BYTES >= 4 * REAL_FEED_INFLATED_BYTES);
+        }
     }
 
     #[test]
