@@ -1,0 +1,72 @@
+//! Test-only global allocator that tracks, per thread, how many bytes are
+//! live and the high-water mark above a baseline -- so a test can assert
+//! how much memory a code path needs without other tests' allocations
+//! (running concurrently on other threads) skewing the number.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
+struct Meter;
+
+thread_local! {
+    static LIVE: Cell<isize> = const { Cell::new(0) };
+    static PEAK: Cell<isize> = const { Cell::new(0) };
+}
+
+fn record(delta: isize) {
+    // `try_with`: the thread-locals may already be gone during thread
+    // teardown, when allocations must still succeed.
+    let _ = LIVE.try_with(|live| {
+        let now = live.get() + delta;
+        live.set(now);
+        let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+    });
+}
+
+// SAFETY: delegates every operation to `System` unchanged; the bookkeeping
+// only touches const-initialized thread-locals, which never allocate.
+unsafe impl GlobalAlloc for Meter {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            record(layout.size() as isize);
+        }
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            record(layout.size() as isize);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+        record(-(layout.size() as isize));
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new.is_null() {
+            // Counted as the worst case, a copy: both blocks live at once.
+            record(new_size as isize);
+            record(-(layout.size() as isize));
+        }
+        new
+    }
+}
+
+#[global_allocator]
+static METER: Meter = Meter;
+
+/// Runs `f` and returns its result together with the most bytes this
+/// thread had allocated at once during `f`, above what was live before it.
+pub fn peak_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let baseline = LIVE.with(Cell::get);
+    PEAK.with(|peak| peak.set(baseline));
+    let result = f();
+    let peak = PEAK.with(Cell::get);
+    (result, (peak - baseline).max(0) as usize)
+}

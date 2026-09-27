@@ -11,7 +11,10 @@ dotenv = "0.15.0"
 metrics = "0.24"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls", "gzip"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+# `raw_value`: `schema::parse_stations` keeps each station's passthrough
+# fields as `&RawValue` slices of the fetched body instead of building a
+# `serde_json::Value` tree per station -- see its doc comment.
+serde_json = { version = "1.0.149", features = ["raw_value"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

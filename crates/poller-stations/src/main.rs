@@ -8,6 +8,8 @@
 //! poll frequency are both confirmed. The one open gap is the exact JSON
 //! field casing (see `schema.rs` module docs for how that's handled).
 
+#[cfg(test)]
+mod alloc_meter;
 mod config;
 mod schema;
 
@@ -56,6 +58,8 @@ async fn poll_once(
     config: &Config,
     internal_oauth: &common::oauth_client::OAuthTokenCache,
 ) -> anyhow::Result<()> {
+    // `stations` borrows its passthrough JSON from `body` (see
+    // `schema::parse_stations` on memory), so `body` stays alive for the POST.
     let body = fetch_stations_json(client, config).await?;
     let stations = schema::parse_stations(&body)?;
 
@@ -71,7 +75,13 @@ async fn poll_once(
     .await
 }
 
-async fn fetch_stations_json(client: &Client, config: &Config) -> anyhow::Result<String> {
+/// Returns the raw body as bytes, not `.text()`: `.text()` copies the whole
+/// ~37MB body a second time while validating it as UTF-8, and
+/// `serde_json::from_slice` validates it anyway.
+async fn fetch_stations_json(
+    client: &Client,
+    config: &Config,
+) -> anyhow::Result<impl std::ops::Deref<Target = [u8]>> {
     // Header not stated specifically for the Stations product in
     // RSPS5050 P-03-00 Rev A §6 ("An API Key will be required to access
     // the JSON feed via RDM" — no header name given); this is the same
@@ -83,7 +93,7 @@ async fn fetch_stations_json(client: &Client, config: &Config) -> anyhow::Result
         .await?
         .error_for_status()?;
 
-    let body = response.text().await?;
+    let body = response.bytes().await?;
 
     // GAP: the JSON field casing for this feed is unconfirmed (see
     // `schema.rs` module docs). Logging the raw body here, before parsing,
@@ -91,7 +101,7 @@ async fn fetch_stations_json(client: &Client, config: &Config) -> anyhow::Result
     // `RUST_LOG=poller_stations=debug`, inspect the logged body against a
     // known station (e.g. `EUS`), and adjust `schema::RdmStation`'s
     // `rename_all`/per-field `rename` attributes if reality differs.
-    tracing::debug!(body = %body, "raw stations response body");
+    tracing::debug!(body = %String::from_utf8_lossy(&body), "raw stations response body");
 
     Ok(body)
 }
