@@ -18,6 +18,7 @@
 
 mod config;
 mod platform_history;
+mod rotation;
 mod schema;
 
 use std::cell::RefCell;
@@ -31,6 +32,7 @@ use common::{StationDeparture, StationSample};
 use config::Config;
 use platform_history::PlatformHistory;
 use reqwest::{Client, StatusCode};
+use rotation::Rotation;
 
 /// Per-request timeout — see the other three pollers' identical rationale.
 /// 30s is comfortably short relative to the 60s default poll interval.
@@ -99,6 +101,8 @@ async fn main() -> anyhow::Result<()> {
     // clones the `Rc` into its own `async move` block instead of capturing
     // `platform_history` by reference.
     let platform_history = Rc::new(RefCell::new(PlatformHistory::new()));
+    // Same shape, for the station rotation (SVC-04).
+    let rotation = Rc::new(RefCell::new(Rotation::new(std::time::Instant::now())));
 
     common::poller_loop::run_poll_loop(
         "ldbws",
@@ -110,13 +114,23 @@ async fn main() -> anyhow::Result<()> {
         config.metrics_port,
         || {
             let platform_history = Rc::clone(&platform_history);
+            let rotation = Rc::clone(&rotation);
             let client = &client;
             let config = &config;
             let internal_oauth = &internal_oauth;
             async move {
                 let mut history = std::mem::take(&mut *platform_history.borrow_mut());
-                let result = poll_once(client, config, &mut history, internal_oauth).await;
+                let mut rotation_state = rotation.replace(Rotation::new(std::time::Instant::now()));
+                let result = poll_once(
+                    client,
+                    config,
+                    &mut history,
+                    &mut rotation_state,
+                    internal_oauth,
+                )
+                .await;
                 *platform_history.borrow_mut() = history;
+                *rotation.borrow_mut() = rotation_state;
                 result
             }
         },
@@ -128,19 +142,38 @@ async fn poll_once(
     client: &Client,
     config: &Config,
     platform_history: &mut PlatformHistory,
+    rotation: &mut Rotation,
     internal_oauth: &common::oauth_client::OAuthTokenCache,
 ) -> anyhow::Result<()> {
     let stations = fetch_sample_stations(client, config, internal_oauth).await?;
     tracing::info!(count = stations.len(), "fetched station list to sample");
 
-    let samples = sample_stations_within_budget(
+    // SVC-04: start where the previous cycle stopped, so the budget no
+    // longer always truncates the same (late-alphabet) tail. Same number of
+    // requests per cycle -- see `rotation`'s module docs.
+    let unix_secs = u64::try_from(Utc::now().timestamp()).unwrap_or_default();
+    let ordered = rotation.order(&stations, unix_secs, config.poll_interval_secs);
+    let CycleSampling { samples, completed } = sample_stations_within_budget(
         client,
         config,
         platform_history,
-        &stations,
+        &ordered,
         CYCLE_TIME_BUDGET,
     )
     .await;
+    let now = std::time::Instant::now();
+    rotation.finish_cycle(
+        &ordered,
+        completed,
+        samples.iter().map(|sample| sample.crs.as_str()),
+        now,
+    );
+    record_cycle_metrics(
+        ordered.len(),
+        completed,
+        samples.len(),
+        rotation.stalest_age(&ordered, now),
+    );
 
     if samples.is_empty() {
         tracing::warn!("no station samples collected this cycle; nothing to post");
@@ -157,6 +190,35 @@ async fn poll_once(
     .await
 }
 
+/// SVC-04's per-cycle gauges: how many stations there are, how many the
+/// cycle got through (attempted to completion) and sampled successfully,
+/// and how long ago the least recently sampled station was sampled -- the
+/// number to alert on if the rotation ever stops reaching part of the list.
+fn record_cycle_metrics(total: usize, completed: usize, sampled: usize, stalest: Duration) {
+    metrics::gauge!(common::metrics::metric_name("ldbws_stations_total")).set(total as f64);
+    metrics::gauge!(common::metrics::metric_name(
+        "ldbws_stations_attempted_per_cycle"
+    ))
+    .set(completed as f64);
+    metrics::gauge!(common::metrics::metric_name(
+        "ldbws_stations_sampled_per_cycle"
+    ))
+    .set(sampled as f64);
+    metrics::gauge!(common::metrics::metric_name(
+        "ldbws_stalest_station_age_seconds"
+    ))
+    .set(stalest.as_secs_f64());
+}
+
+/// What one budgeted sampling pass produced.
+#[derive(Debug)]
+struct CycleSampling {
+    samples: Vec<StationSample>,
+    /// Stations attempted to completion, successfully or not, before the
+    /// budget ran out -- the first `completed` of the list passed in.
+    completed: usize,
+}
+
 /// Samples every station in `stations`, but never for longer than
 /// `budget` in total: if the per-station loop (see `sample_all_stations`)
 /// hasn't finished within `budget`, it's aborted in place and whatever
@@ -170,11 +232,19 @@ async fn sample_stations_within_budget(
     platform_history: &mut PlatformHistory,
     stations: &[String],
     budget: Duration,
-) -> Vec<StationSample> {
+) -> CycleSampling {
     let mut samples = Vec::with_capacity(stations.len());
+    let mut completed = 0;
     let outcome = tokio::time::timeout(
         budget,
-        sample_all_stations(client, config, platform_history, stations, &mut samples),
+        sample_all_stations(
+            client,
+            config,
+            platform_history,
+            stations,
+            &mut samples,
+            &mut completed,
+        ),
     )
     .await;
 
@@ -184,11 +254,12 @@ async fn sample_stations_within_budget(
             stations_sampled = samples.len(),
             budget_secs = budget.as_secs_f64(),
             "per-cycle station-sampling time budget exceeded; moving on with what was \
-             collected so far rather than blocking this and every subsequent cycle"
+             collected so far rather than blocking this and every subsequent cycle \
+             (the next cycle starts where this one stopped)"
         );
     }
 
-    samples
+    CycleSampling { samples, completed }
 }
 
 /// The per-station loop itself, extracted so `sample_stations_within_budget`
@@ -203,6 +274,7 @@ async fn sample_all_stations(
     platform_history: &mut PlatformHistory,
     stations: &[String],
     samples: &mut Vec<StationSample>,
+    completed: &mut usize,
 ) {
     for crs in stations {
         match fetch_departures(client, config, crs).await {
@@ -218,6 +290,7 @@ async fn sample_all_stations(
                 tracing::error!(crs = %crs, error = ?err, "failed to sample station; skipping");
             }
         }
+        *completed += 1;
     }
 }
 
@@ -616,7 +689,7 @@ mod tests {
         let mut history = PlatformHistory::new();
 
         let start = std::time::Instant::now();
-        let samples = sample_stations_within_budget(
+        let CycleSampling { samples, .. } = sample_stations_within_budget(
             &client,
             &config,
             &mut history,
@@ -652,7 +725,7 @@ mod tests {
         let stations = vec!["AAA".to_string(), "BBB".to_string()];
         let mut history = PlatformHistory::new();
 
-        let samples = sample_stations_within_budget(
+        let CycleSampling { samples, .. } = sample_stations_within_budget(
             &client,
             &config,
             &mut history,
@@ -665,6 +738,61 @@ mod tests {
             samples.len(),
             2,
             "a fast cycle well within budget must sample every station"
+        );
+    }
+
+    /// SVC-04 end to end through the real budgeted loop: a budget that fits
+    /// about two of five slow stations per cycle still reaches all five
+    /// within ceil(5 / 2) = 3 cycles, each cycle attempting the same number
+    /// of stations it did before rotation.
+    #[tokio::test]
+    async fn rotation_reaches_every_station_across_budget_cut_cycles() {
+        let server = MockServer::start().await;
+        let names = ["AAA", "BBB", "CCC", "DDD", "EEE"];
+        for crs in names {
+            Mock::given(method("GET"))
+                .and(path(format!("/GetDepBoardWithDetails/{crs}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(ONE_SERVICE_BODY)
+                        .set_delay(Duration::from_millis(200)),
+                )
+                .mount(&server)
+                .await;
+        }
+        let config = test_config(server.uri(), 10);
+        let client = Client::new();
+        let stations: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let mut history = PlatformHistory::new();
+        let mut rotation = Rotation::new(std::time::Instant::now());
+
+        let mut seen = std::collections::HashSet::new();
+        let mut per_cycle = Vec::new();
+        for cycle in 0..3u64 {
+            let ordered = rotation.order(&stations, cycle * 60, 60);
+            let CycleSampling { samples, completed } = sample_stations_within_budget(
+                &client,
+                &config,
+                &mut history,
+                &ordered,
+                Duration::from_millis(500),
+            )
+            .await;
+            rotation.finish_cycle(
+                &ordered,
+                completed,
+                samples.iter().map(|s| s.crs.as_str()),
+                std::time::Instant::now(),
+            );
+            per_cycle.push(completed);
+            seen.extend(samples.into_iter().map(|s| s.crs));
+        }
+
+        assert_eq!(per_cycle, vec![2, 2, 2], "same per-cycle count every cycle");
+        assert_eq!(
+            seen.len(),
+            5,
+            "every station sampled within 3 cycles: {seen:?}"
         );
     }
 }
