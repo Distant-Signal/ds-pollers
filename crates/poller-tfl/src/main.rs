@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
+    let progress = health_http::spawn_liveness(&config.health);
     // `clap` treats a present-but-empty env var as a supplied value, so an
     // orchestrator (e.g. `docker-compose.yml`'s `TFL_APP_KEY: ${TFL_APP_KEY}`)
     // that leaves the shell variable unset still gets `Config::parse()` to
@@ -117,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         poll_interval,
         config.metrics.metrics_enabled,
         config.metrics_port,
+        &progress,
         || {
             // Reborrow each of `client`/`config`/`internal_oauth` as a
             // plain (Copy) reference right before the `async move` block:
@@ -181,12 +183,13 @@ async fn poll_once(
 
     tracing::info!(count = reports.len(), "parsed line statuses from TfL");
 
-    ingest::post_batch(
+    ingest::post_batch_retrying(
         client,
         &config.api_ingest_url,
         internal_oauth,
         &reports,
         "TfL line statuses",
+        common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
     )
     .await
 }

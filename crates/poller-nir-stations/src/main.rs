@@ -21,34 +21,6 @@ use reqwest::Client;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Builds the poll-cycle `tokio::time::Interval`, first ticking at `start`
-/// and thereafter every `poll_interval` -- with `MissedTickBehavior::Delay`
-/// rather than the default `Burst`.
-///
-/// `Burst` fires every missed tick back-to-back with zero gap once a cycle
-/// overruns `poll_interval` (a slow OpenDataNI CSV download, a stuck
-/// ingest POST) -- exactly when the upstream is already slow, it would
-/// pile up a burst of immediate follow-up cycles instead of settling back
-/// into its normal cadence. `Delay` instead waits a fresh `poll_interval`
-/// from whenever the overrun tick actually completes, so a slow cycle
-/// degrades to a slower cadence, never a thundering-herd burst. Same fix,
-/// same rationale, as `common::poller_loop`'s own
-/// `poll_interval_with_delay_on_overrun` (this crate doesn't share that
-/// scaffolding -- see its own doc comment -- so it needs the identical fix
-/// applied locally). Split into its own function so the configuration is
-/// directly assertable in a unit test via `Interval::missed_tick_behavior()`,
-/// since the missed-tick BEHAVIOR itself (skipping ticks under a real
-/// overrun) isn't practically observable without a slow, flaky, real-time
-/// test.
-fn poll_interval_with_delay_on_overrun(
-    start: tokio::time::Instant,
-    poll_interval: Duration,
-) -> tokio::time::Interval {
-    let mut interval = tokio::time::interval_at(start, poll_interval);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    interval
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
@@ -58,9 +30,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
-    if config.metrics_enabled {
-        common::metrics::install(config.metrics_port)?;
-    }
+    let progress = health_http::spawn_liveness(&config.health);
     // `.user_agent(...)` is NOT optional -- see config::USER_AGENT's own
     // doc comment and this plan's Global Constraints. Every request this
     // client makes to admin.opendatani.gov.uk 403s without it.
@@ -78,43 +48,20 @@ async fn main() -> anyhow::Result<()> {
         });
 
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
-    let delay = ingest::time_until_next_poll(
+    // Freshness is checked against the stations endpoint only: both
+    // endpoints are posted together every cycle (see poll_once).
+    common::poller_loop::run_poll_loop(
+        "nir-stations",
         &client,
         &config.api_stations_ingest_url,
         &internal_oauth,
         poll_interval,
+        config.metrics_enabled,
+        config.metrics_port,
+        &progress,
+        || poll_once(&client, &config, &internal_oauth),
     )
-    .await;
-    if !delay.is_zero() {
-        tracing::info!(
-            delay_secs = delay.as_secs(),
-            "data still fresh from a prior run; delaying first poll"
-        );
-    }
-    let mut interval =
-        poll_interval_with_delay_on_overrun(tokio::time::Instant::now() + delay, poll_interval);
-
-    loop {
-        interval.tick().await;
-
-        let cycle_start = std::time::Instant::now();
-        let result = poll_once(&client, &config, &internal_oauth).await;
-        metrics::histogram!(
-            common::metrics::metric_name("poller_cycle_duration_seconds"),
-            "poller" => "nir-stations"
-        )
-        .record(cycle_start.elapsed().as_secs_f64());
-        metrics::counter!(
-            common::metrics::metric_name("poller_cycle_total"),
-            "poller" => "nir-stations",
-            "result" => if result.is_ok() { "success" } else { "failure" }
-        )
-        .increment(1);
-
-        if let Err(err) = result {
-            tracing::error!(error = ?err, "poll cycle failed; will retry next interval");
-        }
-    }
+    .await
 }
 
 async fn poll_once(
@@ -145,20 +92,22 @@ async fn poll_once(
         "parsed NIR station/line catalogue"
     );
 
-    ingest::post_batch(
+    ingest::post_batch_retrying(
         client,
         &config.api_stations_ingest_url,
         internal_oauth,
         &stations,
         "island-of-ireland stations (NIR)",
+        common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
     )
     .await?;
-    ingest::post_batch(
+    ingest::post_batch_retrying(
         client,
         &config.api_lines_ingest_url,
         internal_oauth,
         &lines,
         "island-of-ireland lines (NIR)",
+        common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
     )
     .await?;
     Ok(())
@@ -205,26 +154,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
-    }
-}
-
-#[cfg(test)]
-mod poll_interval_tests {
-    use super::*;
-
-    /// Regression for the "L1 -- MissedTickBehavior::Burst still default"
-    /// finding: this poller's own interval must opt into `Delay`, not
-    /// leave `Burst` as the default, so an overrun cycle doesn't fire a
-    /// burst of back-to-back catch-up ticks against OpenDataNI.
-    #[tokio::test]
-    async fn poll_interval_defaults_to_delay_not_burst_on_a_missed_tick() {
-        let interval = poll_interval_with_delay_on_overrun(
-            tokio::time::Instant::now(),
-            Duration::from_secs(60),
-        );
-        assert_eq!(
-            interval.missed_tick_behavior(),
-            tokio::time::MissedTickBehavior::Delay
-        );
     }
 }

@@ -75,6 +75,10 @@ pub struct Config {
     pub metrics_port: u16,
     #[arg(long, env, default_value_t = true)]
     pub metrics_enabled: bool,
+
+    /// `/livez` listener and stall window (SVC-08).
+    #[command(flatten)]
+    pub health: common::service_args::HealthArgs,
 }
 
 impl std::fmt::Debug for Config {
@@ -91,6 +95,7 @@ impl std::fmt::Debug for Config {
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("metrics_port", &self.metrics_port)
             .field("metrics_enabled", &self.metrics_enabled)
+            .field("health", &self.health)
             .finish()
     }
 }

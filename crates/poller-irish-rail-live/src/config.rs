@@ -97,6 +97,10 @@ pub struct Config {
 
     #[command(flatten)]
     pub metrics: common::service_args::MetricsArgs,
+
+    /// `/livez` listener and stall window (SVC-08).
+    #[command(flatten)]
+    pub health: common::service_args::HealthArgs,
 }
 
 #[cfg(test)]
