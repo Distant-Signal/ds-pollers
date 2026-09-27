@@ -15,7 +15,14 @@ use clap::Parser;
 /// poll cycle 403s silently. See
 /// docs/superpowers/plans/2026-09-05-nir-tier-a-implementation-plan.md's
 /// Global Constraints.
-pub const USER_AGENT: &str = "distant-signal-poller-nir-stations/1.0 (+https://github.com/FasterSpeeding/network-rail-status)";
+///
+/// Built by the shared [`common::user_agent!`] macro (LEG-21/LEG-24), so it
+/// names this crate, its real version and the current project URL, e.g.
+/// `distant-signal-poller-nir-stations/0.1.0
+/// (+https://github.com/FasterSpeeding/Distant-Signal)`. Re-verified
+/// 2026-09-27 with one GET per default CSV URL below: both HTTP 200 with the
+/// expected CSV header.
+pub const USER_AGENT: &str = common::user_agent!();
 
 /// CLI/env configuration for the `poller-nir-stations` service.
 ///
@@ -154,5 +161,23 @@ mod config_debug_tests {
             !debug_output.contains("super-secret-password"),
             "the real internal_oauth_password must never appear in Debug output: {debug_output}"
         );
+    }
+}
+
+#[cfg(test)]
+mod user_agent_tests {
+    use super::USER_AGENT;
+
+    #[test]
+    fn user_agent_names_this_crate_and_the_current_project() {
+        assert_eq!(
+            USER_AGENT,
+            format!(
+                "distant-signal-poller-nir-stations/{} (+{})",
+                env!("CARGO_PKG_VERSION"),
+                common::user_agent::PROJECT_URL
+            )
+        );
+        assert!(!USER_AGENT.contains("network-rail-status"));
     }
 }
