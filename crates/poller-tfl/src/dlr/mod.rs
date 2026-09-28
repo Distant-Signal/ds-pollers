@@ -1,6 +1,7 @@
 //! DLR-specific arrivals-diffing pilot (see
 //! `docs/superpowers/specs/2026-08-22-tfl-service-metrics-v2-design.md`,
-//! Area 3, and `docs/superpowers/plans/2026-08-22-dlr-arrivals-diffing-pilot.md`).
+//! Area 3, and `docs/superpowers/plans/2026-08-22-dlr-arrivals-diffing-pilot.md`,
+//! since pruned from the repository -- see history, commit `ec42cf95`).
 //!
 //! Unlike the rest of `poller-tfl`, which only relays status TfL has
 //! already computed, this module infers `common::SampleStats` itself, by

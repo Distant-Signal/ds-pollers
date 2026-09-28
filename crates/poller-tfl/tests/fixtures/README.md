@@ -1,7 +1,10 @@
 # poller-tfl test fixtures
 
 Live captures for the DLR arrivals-diffing pilot (see
-`.superpowers/sdd/2026-08-22-dlr-arrivals-diffing-pilot/`).
+`.superpowers/sdd/2026-08-22-dlr-arrivals-diffing-pilot/`, a local,
+git-ignored working directory, and
+`docs/superpowers/plans/2026-08-22-dlr-arrivals-diffing-pilot.md`, since
+pruned; see git history).
 
 - `dlr_arrivals.json` — `GET /Line/dlr/Arrivals`, captured 2026-08-22.
 - `dlr_timetable_poplar.json` — `GET /Line/dlr/Timetable/940GZZDLPOP?direction=outbound`,
@@ -61,6 +64,7 @@ that isn't a schema mismatch but matters for parsing:
    plan's assumed `KnownJourney` struct (`interval_id: Option<String>`)
    will fail to deserialize against this real data. Task 4 needs to change
    that field's type to a numeric type (e.g. `Option<u32>` or similar).
+   (Done: it is `Option<i64>` in `src/dlr/timetable.rs`.)
 
 4. **(Observation, not a mismatch — Task 4's problem, not fixed here.)**
    Each route's `schedules[]` array has one entry per day-type, not one

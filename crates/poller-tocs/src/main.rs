@@ -2,7 +2,8 @@
 //! interval and forwards parsed `TocReference`s to the `api` crate's
 //! `/private/tocs` ingestion endpoint.
 //!
-//! See `.superpowers/sdd/task-5-brief.md` for the RDM facts this is built
+//! See `.superpowers/sdd/task-5-brief.md` (a local-only, gitignored
+//! working note -- not in the repository) for the RDM facts this is built
 //! against (RSPS5050 P-03-00 Rev A, §3) and the documented gaps: no
 //! confirmed endpoint path for this product, and an auth header name
 //! corroborated only via a different product's example.

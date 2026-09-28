@@ -2,7 +2,8 @@
 //! forwards parsed `StationReference`s to the `api` crate's
 //! `/private/stations` ingestion endpoint.
 //!
-//! See `.superpowers/sdd/task-4-brief.md` for the RDM facts this is built
+//! See `.superpowers/sdd/task-4-brief.md` (a local-only, gitignored
+//! working note -- not in the repository) for the RDM facts this is built
 //! against (RSPS5050 P-03-00 Rev A, §6) — this is the best-documented of
 //! the three RDM products: the `/stations` endpoint path and the 24-hour
 //! poll frequency are both confirmed. The one open gap is the exact JSON
