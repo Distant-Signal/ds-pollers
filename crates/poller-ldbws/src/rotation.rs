@@ -17,6 +17,16 @@
 //! alphabet: `(unix_time / poll_interval) * TYPICAL_CYCLE_CAPACITY`, modulo
 //! the station count -- the offset the rotation would roughly have reached
 //! had it run since the epoch.
+//!
+//! Stations LDBWS rejects as an invalid CRS (a catalogue typo such as
+//! "ANV" for Andover's "ADV", 2026-09-28) are a permanent error, not a
+//! staleness one: they can never produce a sample, so counting them in
+//! [`Rotation::stalest_age`] made `ldbws_stalest_station_age_seconds` equal
+//! the pod's uptime and fired `DistantSignalLdbwsStationStale` a couple of
+//! hours after every restart. They are tracked separately
+//! ([`Rotation::mark_invalid`]), excluded from the staleness age, and only
+//! re-probed once every [`INVALID_CRS_REPROBE`] (so a fixed catalogue, or a
+//! one-off upstream misfire, heals on its own) instead of every cycle.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -25,6 +35,11 @@ use std::time::{Duration, Instant};
 /// 2026-09-27: 355-382). Only used to spread restart offsets; nothing
 /// depends on it being exact.
 const TYPICAL_CYCLE_CAPACITY: u64 = 367;
+
+/// How long a station LDBWS rejected as an invalid CRS is left out of the
+/// cycle before it is tried again: one request an hour per such station,
+/// instead of one a cycle.
+pub const INVALID_CRS_REPROBE: Duration = Duration::from_secs(3600);
 
 /// The rotation's state for the life of the process.
 #[derive(Debug)]
@@ -36,6 +51,10 @@ pub struct Rotation {
     last_sampled: HashMap<String, Instant>,
     /// Stations never sampled by this process count as stale since this.
     started: Instant,
+    /// Stations LDBWS answered "Invalid crs code supplied" for, and when it
+    /// last did. Excluded from [`Rotation::stalest_age`], and from the cycle
+    /// until [`INVALID_CRS_REPROBE`] has passed.
+    invalid: HashMap<String, Instant>,
 }
 
 impl Rotation {
@@ -44,6 +63,7 @@ impl Rotation {
             next_start: None,
             last_sampled: HashMap::new(),
             started: now,
+            invalid: HashMap::new(),
         }
     }
 
@@ -71,32 +91,87 @@ impl Rotation {
         sorted
     }
 
-    /// Records one cycle: `ordered` is what [`Rotation::order`] returned,
-    /// `completed` how many of them were attempted to completion (success
-    /// or failure) before the budget ran out, and `sampled` the stations
-    /// that produced a sample. The next cycle starts at the first station
-    /// not completed.
+    /// `ordered` minus the stations known to be invalid whose re-probe is
+    /// not yet due, keeping the rotation order. This is the list a cycle
+    /// actually polls.
+    pub fn pollable(&self, ordered: &[String], now: Instant) -> Vec<String> {
+        ordered
+            .iter()
+            .filter(|crs| match self.invalid.get(*crs) {
+                Some(rejected) => now.saturating_duration_since(*rejected) >= INVALID_CRS_REPROBE,
+                None => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Records that LDBWS rejected `crs` as an invalid CRS code. Returns
+    /// `true` only the first time (until it recovers or leaves the list),
+    /// so the caller logs and flags it once rather than every re-probe.
+    pub fn mark_invalid(&mut self, crs: &str, now: Instant) -> bool {
+        self.invalid.insert(crs.to_string(), now).is_none()
+    }
+
+    /// Forgets invalid stations no longer in `stations` (the catalogue was
+    /// fixed and api dropped them), returning them so their metric can be
+    /// cleared.
+    pub fn prune_invalid(&mut self, stations: &[String]) -> Vec<String> {
+        let mut gone: Vec<String> = self
+            .invalid
+            .keys()
+            .filter(|crs| !stations.contains(crs))
+            .cloned()
+            .collect();
+        gone.sort();
+        for crs in &gone {
+            self.invalid.remove(crs);
+        }
+        gone
+    }
+
+    /// The stations currently known to be invalid, sorted.
+    #[cfg(test)]
+    pub fn invalid_stations(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self.invalid.keys().map(String::as_str).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Records one cycle: `ordered` is the list the cycle polled (what
+    /// [`Rotation::pollable`] returned), `completed` how many of them were
+    /// attempted to completion (success or failure) before the budget ran
+    /// out, and `sampled` the stations that produced a sample. The next
+    /// cycle starts at the first station not completed. Returns the
+    /// sampled stations that had been marked invalid (they recovered).
     pub fn finish_cycle<'a>(
         &mut self,
         ordered: &[String],
         completed: usize,
         sampled: impl IntoIterator<Item = &'a str>,
         now: Instant,
-    ) {
+    ) -> Vec<String> {
         if !ordered.is_empty() {
             self.next_start = Some(ordered[completed % ordered.len()].clone());
         }
+        let mut recovered = Vec::new();
         for crs in sampled {
             self.last_sampled.insert(crs.to_string(), now);
+            if self.invalid.remove(crs).is_some() {
+                recovered.push(crs.to_string());
+            }
         }
+        recovered
     }
 
     /// How long ago the least recently sampled station in `stations` was
     /// sampled; a station never sampled by this process counts from
-    /// process start. `Duration::ZERO` for an empty list.
+    /// process start. Stations known to be invalid are left out: they are
+    /// a catalogue error with their own metric and alert, not staleness.
+    /// `Duration::ZERO` for an empty list.
     pub fn stalest_age(&self, stations: &[String], now: Instant) -> Duration {
         stations
             .iter()
+            .filter(|crs| !self.invalid.contains_key(*crs))
             .map(|crs| {
                 let since = self.last_sampled.get(crs).copied().unwrap_or(self.started);
                 now.saturating_duration_since(since)
@@ -256,5 +331,73 @@ mod tests {
         );
         assert_eq!(rotation.stalest_age(&all, now), Duration::from_secs(50));
         assert_eq!(rotation.stalest_age(&[], now), Duration::ZERO);
+    }
+
+    /// The prod incident (2026-09-28): one station LDBWS always rejects
+    /// used to hold the stalest age at the process's uptime forever. Once
+    /// marked invalid it no longer counts, and the rest of the list's real
+    /// staleness shows through.
+    #[test]
+    fn a_permanently_invalid_station_does_not_count_as_stale() {
+        let started = Instant::now();
+        let mut rotation = Rotation::new(started);
+        let all = stations(4);
+        let bad = all[1].clone();
+        let mut now = started;
+        for _ in 0..200 {
+            now += Duration::from_secs(60);
+            let polled = rotation.pollable(&all, now);
+            let sampled: Vec<&str> = polled
+                .iter()
+                .filter(|crs| **crs != bad)
+                .map(String::as_str)
+                .collect();
+            if polled.contains(&bad) {
+                rotation.mark_invalid(&bad, now);
+            }
+            rotation.finish_cycle(&polled, polled.len(), sampled, now);
+        }
+        // 200 minutes after start (well past the 7200s alert threshold),
+        // every valid station was sampled this cycle.
+        assert_eq!(rotation.stalest_age(&all, now), Duration::ZERO);
+        assert_eq!(rotation.invalid_stations(), vec![bad.as_str()]);
+    }
+
+    /// Only the first rejection is "new"; re-probes are hourly, not every
+    /// cycle; and a successful re-probe clears it.
+    #[test]
+    fn an_invalid_station_is_reprobed_hourly_and_recovers() {
+        let started = Instant::now();
+        let mut rotation = Rotation::new(started);
+        let all = stations(3);
+        let bad = all[2].clone();
+
+        assert!(rotation.mark_invalid(&bad, started));
+        assert!(!rotation.mark_invalid(&bad, started), "logged once only");
+
+        let soon = started + Duration::from_secs(60);
+        assert_eq!(rotation.pollable(&all, soon), all[..2].to_vec());
+        let due = started + INVALID_CRS_REPROBE;
+        assert_eq!(rotation.pollable(&all, due), all);
+
+        let recovered = rotation.finish_cycle(&all, 3, all.iter().map(String::as_str), due);
+        assert_eq!(recovered, vec![bad.clone()]);
+        assert!(rotation.invalid_stations().is_empty());
+        assert_eq!(rotation.pollable(&all, due), all);
+    }
+
+    /// Fixing the catalogue drops the station from api's list; the invalid
+    /// entry goes with it (and is reported so its gauge can be zeroed).
+    #[test]
+    fn an_invalid_station_removed_from_the_list_is_forgotten() {
+        let started = Instant::now();
+        let mut rotation = Rotation::new(started);
+        let mut all = stations(3);
+        let bad = all[0].clone();
+        rotation.mark_invalid(&bad, started);
+        assert!(rotation.prune_invalid(&all).is_empty());
+        all.remove(0);
+        assert_eq!(rotation.prune_invalid(&all), vec![bad]);
+        assert!(rotation.invalid_stations().is_empty());
     }
 }

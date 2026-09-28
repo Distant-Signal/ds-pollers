@@ -195,30 +195,44 @@ async fn poll_once(
     // requests per cycle -- see `rotation`'s module docs.
     let unix_secs = u64::try_from(Utc::now().timestamp()).unwrap_or_default();
     let ordered = rotation.order(&stations, unix_secs, config.poll_interval_secs);
+    for crs in rotation.prune_invalid(&ordered) {
+        tracing::info!(crs = %crs, "station LDBWS rejected as an invalid CRS is no longer in the sample list");
+        set_invalid_crs_gauge(&crs, false);
+    }
+    // Stations LDBWS rejected as invalid are left out until their hourly
+    // re-probe is due -- see `rotation`'s module docs.
+    let polled = rotation.pollable(&ordered, std::time::Instant::now());
     request_budget.start_cycle();
     let CycleSampling {
         samples,
         completed,
         skipped_for_budget,
+        invalid_crs,
     } = sample_stations_within_budget(
         client,
         config,
         platform_history,
         request_budget,
-        &ordered,
+        &polled,
         CYCLE_TIME_BUDGET,
     )
     .await;
     if let Some((skipped, limit)) = skipped_for_budget {
-        record_budget_skip(config, ordered.len(), skipped, limit);
+        record_budget_skip(config, polled.len(), skipped, limit);
     }
     let now = std::time::Instant::now();
-    rotation.finish_cycle(
-        &ordered,
+    for crs in rotation.finish_cycle(
+        &polled,
         completed,
         samples.iter().map(|sample| sample.crs.as_str()),
         now,
-    );
+    ) {
+        tracing::info!(crs = %crs, "station LDBWS had rejected as an invalid CRS sampled successfully again");
+        set_invalid_crs_gauge(&crs, false);
+    }
+    for (crs, body) in &invalid_crs {
+        record_invalid_crs(rotation, crs, body, now);
+    }
     record_cycle_metrics(
         ordered.len(),
         completed,
@@ -262,6 +276,41 @@ fn record_cycle_metrics(total: usize, completed: usize, sampled: usize, stalest:
     .set(stalest.as_secs_f64());
 }
 
+/// `ldbws_invalid_crs_station{crs}`: 1 while LDBWS rejects `crs` as an
+/// invalid CRS code, 0 once it recovers or leaves the list. The `crs` label
+/// is the one exception to this crate's no-per-station-labels rule (see
+/// `fetch_departures`): only codes LDBWS has actually rejected ever get a
+/// series, i.e. catalogue typos, a handful at most, not the ~560 sampled
+/// stations.
+fn set_invalid_crs_gauge(crs: &str, invalid: bool) {
+    metrics::gauge!(
+        common::metrics::metric_name("ldbws_invalid_crs_station"),
+        "crs" => crs.to_string()
+    )
+    .set(if invalid { 1.0 } else { 0.0 });
+}
+
+/// Records a station LDBWS rejected as an invalid CRS: logged (at error)
+/// and flagged in `ldbws_invalid_crs_station` the first time only, so a
+/// permanent catalogue typo is one log line, not one per cycle. The
+/// rotation then leaves it out of the stalest-age gauge and out of the
+/// cycle until its hourly re-probe.
+fn record_invalid_crs(rotation: &mut Rotation, crs: &str, body: &str, now: std::time::Instant) {
+    if rotation.mark_invalid(crs, now) {
+        tracing::error!(
+            crs = %crs,
+            response = %body,
+            reprobe_secs = rotation::INVALID_CRS_REPROBE.as_secs(),
+            "LDBWS rejects this station as an invalid CRS code; excluding it from sampling and \
+             from ldbws_stalest_station_age_seconds (re-probed hourly). Fix the lines/*.toml \
+             file that lists it (cargo run -p line-catalogue-validator)"
+        );
+        set_invalid_crs_gauge(crs, true);
+    } else {
+        tracing::debug!(crs = %crs, "re-probed station is still an invalid CRS code");
+    }
+}
+
 /// LEG-18: counts the station polls the hourly request budget skipped this
 /// cycle (`ldbws_budget_skipped_polls_total`, labelled by which limit) and
 /// logs one warning. Never called with no budget set.
@@ -292,6 +341,10 @@ struct CycleSampling {
     /// (LEG-18, off by default) refused them, and which limit did. Always
     /// `None` with no budget set.
     skipped_for_budget: Option<(usize, BudgetLimit)>,
+    /// Stations LDBWS answered "Invalid crs code supplied" for, with the
+    /// response body -- a permanent error, handled apart from the
+    /// transient failures that are just logged and retried next time.
+    invalid_crs: Vec<(String, String)>,
 }
 
 /// Samples every station in `stations`, but never for longer than
@@ -313,9 +366,12 @@ async fn sample_stations_within_budget(
     stations: &[String],
     budget: Duration,
 ) -> CycleSampling {
-    let mut samples = Vec::with_capacity(stations.len());
-    let mut completed = 0;
-    let mut skipped_for_budget = None;
+    let mut sampling = CycleSampling {
+        samples: Vec::with_capacity(stations.len()),
+        completed: 0,
+        skipped_for_budget: None,
+        invalid_crs: Vec::new(),
+    };
     let outcome = tokio::time::timeout(
         budget,
         sample_all_stations(
@@ -324,9 +380,7 @@ async fn sample_stations_within_budget(
             platform_history,
             request_budget,
             stations,
-            &mut samples,
-            &mut completed,
-            &mut skipped_for_budget,
+            &mut sampling,
         ),
     )
     .await;
@@ -334,7 +388,7 @@ async fn sample_stations_within_budget(
     if outcome.is_err() {
         tracing::warn!(
             stations_total = stations.len(),
-            stations_sampled = samples.len(),
+            stations_sampled = sampling.samples.len(),
             budget_secs = budget.as_secs_f64(),
             "per-cycle station-sampling time budget exceeded; moving on with what was \
              collected so far rather than blocking this and every subsequent cycle \
@@ -342,11 +396,7 @@ async fn sample_stations_within_budget(
         );
     }
 
-    CycleSampling {
-        samples,
-        completed,
-        skipped_for_budget,
-    }
+    sampling
 }
 
 /// The per-station loop itself, extracted so `sample_stations_within_budget`
@@ -355,37 +405,40 @@ async fn sample_stations_within_budget(
 /// already pushed into the caller-owned `samples` accumulator before that
 /// point survives, since it's a `&mut` borrow of state the caller owns,
 /// not state local to this future. The same goes for `skipped_for_budget`,
-/// set just before the loop stops early for the request budget.
-#[allow(clippy::too_many_arguments)]
+/// set just before the loop stops early for the request budget, and for
+/// `invalid_crs`.
 async fn sample_all_stations(
     client: &Client,
     config: &Config,
     platform_history: &mut PlatformHistory,
     request_budget: &mut RequestBudget,
     stations: &[String],
-    samples: &mut Vec<StationSample>,
-    completed: &mut usize,
-    skipped_for_budget: &mut Option<(usize, BudgetLimit)>,
+    out: &mut CycleSampling,
 ) {
     for (index, crs) in stations.iter().enumerate() {
         if let Err(limit) = request_budget.check(std::time::Instant::now()) {
-            *skipped_for_budget = Some((stations.len() - index, limit));
+            out.skipped_for_budget = Some((stations.len() - index, limit));
             return;
         }
         match fetch_departures(client, config, request_budget, crs).await {
             Ok(mut departures) => {
                 platform_history.apply(crs, &mut departures);
-                samples.push(StationSample {
+                out.samples.push(StationSample {
                     crs: crs.clone(),
                     polled_at: Utc::now(),
                     departures,
                 })
             }
-            Err(err) => {
-                tracing::error!(crs = %crs, error = ?err, "failed to sample station; skipping");
-            }
+            Err(err) => match err.downcast::<InvalidCrs>() {
+                // Logged once per station by `record_invalid_crs`, not
+                // here every cycle.
+                Ok(invalid) => out.invalid_crs.push((crs.clone(), invalid.body)),
+                Err(err) => {
+                    tracing::error!(crs = %crs, error = ?err, "failed to sample station; skipping");
+                }
+            },
         }
-        *completed += 1;
+        out.completed += 1;
     }
 }
 
@@ -437,6 +490,37 @@ impl From<reqwest::Error> for FetchError {
     fn from(err: reqwest::Error) -> Self {
         FetchError::Other(err.into())
     }
+}
+
+/// LDBWS's answer for a CRS code it does not know, e.g. a catalogue typo.
+/// Seen in production (2026-09-28, "ANV") as
+/// `400 Bad Request {"Message":"Invalid crs code supplied"}`, returned on
+/// every request, so it is a permanent per-station error rather than a
+/// failure worth retrying.
+#[derive(Debug)]
+struct InvalidCrs {
+    crs: String,
+    body: String,
+}
+
+impl std::fmt::Display for InvalidCrs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "LDBWS rejected {} as an invalid CRS code: {}",
+            self.crs, self.body
+        )
+    }
+}
+
+impl std::error::Error for InvalidCrs {}
+
+/// Whether a failed response is LDBWS's invalid-CRS answer. Matches the
+/// status and the message text (case-insensitively, anywhere in the body,
+/// so a change of JSON wrapping does not break it); any other 400 stays an
+/// ordinary failure.
+fn is_invalid_crs_response(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::BAD_REQUEST && body.to_ascii_lowercase().contains("invalid crs code")
 }
 
 /// Steps a `numRows` value down for a retry after a 500 from RDM, per the
@@ -561,6 +645,13 @@ async fn fetch_departures(
                 return schema::parse_departures(&body);
             }
             Err(FetchError::Other(err)) => return Err(err),
+            Err(FetchError::Status(status, body)) if is_invalid_crs_response(status, &body) => {
+                return Err(InvalidCrs {
+                    crs: crs.to_string(),
+                    body,
+                }
+                .into());
+            }
             Err(FetchError::Status(status, body)) => {
                 let next_num_rows =
                     if attempt < MAX_NUMROWS_ATTEMPTS && should_retry_with_smaller_rows(status) {
@@ -1062,6 +1153,168 @@ mod tests {
         assert_eq!(
             server.received_requests().await.expect("recording").len(),
             1
+        );
+    }
+
+    /// LDBWS's real answer for an unknown code (prod logs, 2026-09-28).
+    const INVALID_CRS_BODY: &str = r#"{"Message":"Invalid crs code supplied"}"#;
+
+    #[test]
+    fn only_a_400_saying_invalid_crs_is_an_invalid_crs() {
+        assert!(is_invalid_crs_response(
+            StatusCode::BAD_REQUEST,
+            INVALID_CRS_BODY
+        ));
+        assert!(is_invalid_crs_response(
+            StatusCode::BAD_REQUEST,
+            "invalid CRS code supplied"
+        ));
+        assert!(!is_invalid_crs_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"Message":"numRows out of range"}"#
+        ));
+        // A 5xx is transient whatever its body says (LBG's intermittent
+        // 500s stay on the numRows-fallback / staleness path).
+        assert!(!is_invalid_crs_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            INVALID_CRS_BODY
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_invalid_crs_400_is_a_typed_error_and_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/GetDepBoardWithDetails/ANV"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(INVALID_CRS_BODY))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = test_config(server.uri(), 10);
+
+        let err = fetch_departures(
+            &Client::new(),
+            &config,
+            &mut RequestBudget::unlimited(),
+            "ANV",
+        )
+        .await
+        .expect_err("a 400 is a failure");
+
+        let invalid = err
+            .downcast_ref::<InvalidCrs>()
+            .expect("an invalid-CRS 400 must surface as InvalidCrs");
+        assert_eq!(invalid.crs, "ANV");
+        assert_eq!(invalid.body, INVALID_CRS_BODY);
+    }
+
+    #[tokio::test]
+    async fn a_transient_500_is_not_an_invalid_crs() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/GetDepBoardWithDetails/LBG"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .mount(&server)
+            .await;
+        let config = test_config(server.uri(), 2);
+
+        let sampling = sample_stations_within_budget(
+            &Client::new(),
+            &config,
+            &mut PlatformHistory::new(),
+            &mut RequestBudget::unlimited(),
+            &["LBG".to_string()],
+            CYCLE_TIME_BUDGET,
+        )
+        .await;
+
+        assert!(sampling.samples.is_empty());
+        assert!(sampling.invalid_crs.is_empty());
+        assert_eq!(sampling.completed, 1);
+    }
+
+    /// The prod incident end to end through the real sampling loop: a
+    /// station LDBWS always rejects is requested once (not every cycle),
+    /// flagged once in `ldbws_invalid_crs_station{crs}`, and left out of
+    /// the stalest age, which therefore tracks the valid stations only --
+    /// no longer the process's uptime.
+    #[tokio::test]
+    async fn a_permanently_invalid_station_is_flagged_once_and_not_stale() {
+        let server = server_answering(&["AAA", "BBB"]).await;
+        Mock::given(method("GET"))
+            .and(path("/GetDepBoardWithDetails/ANV"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(INVALID_CRS_BODY))
+            .mount(&server)
+            .await;
+        let config = test_config(server.uri(), 10);
+        let client = Client::new();
+        let stations: Vec<String> = ["AAA", "ANV", "BBB"].map(String::from).to_vec();
+        let mut history = PlatformHistory::new();
+        let started = std::time::Instant::now();
+        let mut rotation = Rotation::new(started);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        let mut last_now = started;
+        for cycle in 0..3u64 {
+            let ordered = rotation.order(&stations, cycle * 60, 60);
+            // Pretend each cycle is a poll interval later than the last.
+            let now = started + Duration::from_secs(60 * (cycle + 1));
+            let polled = rotation.pollable(&ordered, now);
+            let sampling = sample_stations_within_budget(
+                &client,
+                &config,
+                &mut history,
+                &mut RequestBudget::unlimited(),
+                &polled,
+                CYCLE_TIME_BUDGET,
+            )
+            .await;
+            rotation.finish_cycle(
+                &polled,
+                sampling.completed,
+                sampling.samples.iter().map(|s| s.crs.as_str()),
+                now,
+            );
+            metrics::with_local_recorder(&recorder, || {
+                for (crs, body) in &sampling.invalid_crs {
+                    record_invalid_crs(&mut rotation, crs, body, now);
+                }
+            });
+            last_now = now;
+        }
+
+        let anv_requests = server
+            .received_requests()
+            .await
+            .expect("recording")
+            .iter()
+            .filter(|r| r.url.path().ends_with("/ANV"))
+            .count();
+        assert_eq!(anv_requests, 1, "not re-requested within the re-probe hour");
+        assert_eq!(
+            rotation.stalest_age(&stations, last_now),
+            Duration::ZERO,
+            "AAA and BBB were sampled this cycle; ANV no longer counts"
+        );
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"distant_signal_ldbws_invalid_crs_station{crs="ANV"} 1"#),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(r#"crs="AAA""#), "{rendered}");
+
+        // Fixing the catalogue drops ANV from the list; its gauge goes to 0.
+        let fixed: Vec<String> = ["AAA", "BBB"].map(String::from).to_vec();
+        metrics::with_local_recorder(&recorder, || {
+            for crs in rotation.prune_invalid(&fixed) {
+                set_invalid_crs_gauge(&crs, false);
+            }
+        });
+        assert!(
+            handle
+                .render()
+                .contains(r#"distant_signal_ldbws_invalid_crs_station{crs="ANV"} 0"#)
         );
     }
 
