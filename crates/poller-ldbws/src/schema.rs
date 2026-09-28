@@ -20,21 +20,15 @@ struct RdmStationBoard {
 
 #[derive(Debug, Deserialize)]
 struct RdmServiceItem {
-    /// RDM/LDBWS's `serviceID`: an opaque, board-relative token for
-    /// chaining into `GetServiceDetails`, NOT a durable train identity --
-    /// Darwin documents no stability guarantee for it across calls or
-    /// boards. It is the ONLY per-service identifier this poller decodes.
+    /// RDM/LDBWS's `serviceID`: a board-relative token for chaining into
+    /// `GetServiceDetails`. Darwin documents no stability guarantee for it,
+    /// but in practice it embeds the Darwin RID serial and this station's
+    /// own TIPLOC (see `common::service_id_tiploc`, used only as a hint).
     /// The public `GetDepBoardWithDetails` item this schema mirrors carries
-    /// no Darwin `rid`, no CIF `uid` and no service-start date (`sdd`) at
-    /// all -- those appear only on the staff (`LDBSVWS`) API or the Darwin
-    /// Push Port, neither of which this app consumes. The payload does
-    /// carry `rsid` (the retail service id, e.g. `"GW123400"`, see this
-    /// file's own test fixture), but it is deliberately not decoded: it is
-    /// not unique per day on its own, and nothing on the CIF side of this
-    /// app (`schedule-query`'s `BX` decode) stores the matching RSID to
-    /// join it against. See `routes::departures::get_station_departures`
-    /// (`crates/api`) for the documented `serviceId -> (trainUid, date)`
-    /// resolution path this leaves a caller with.
+    /// no Darwin `rid`, no CIF `uid` and no service-start date (`sdd`) --
+    /// those appear only on the staff (`LDBSVWS`) API or the Darwin Push
+    /// Port, neither of which this app consumes. `rsid` (below) is the one
+    /// identifier it shares with the CIF timetable.
     #[serde(rename = "serviceID")]
     service_id: String,
     #[serde(rename = "operatorCode")]
@@ -63,6 +57,13 @@ struct RdmServiceItem {
     /// such distinction of its own to parse.
     #[serde(default)]
     platform: Option<String>,
+    /// The Retail Service ID (e.g. `"GW123400"`), the same value the CIF
+    /// `BX` record carries (`schedule_destination_departures.rsid`). Not
+    /// unique per day on its own; `api::data::train_resolve` and
+    /// `api::data::stop_board` pair it with station and time. `None` when
+    /// absent or `null`.
+    #[serde(default)]
+    rsid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +75,14 @@ struct RdmCallingPointList {
 #[derive(Debug, Deserialize)]
 struct RdmCallingPoint {
     crs: String,
+    #[serde(default, rename = "locationName")]
+    location_name: Option<String>,
+    #[serde(default)]
+    st: Option<String>,
+    #[serde(default)]
+    et: Option<String>,
+    #[serde(default)]
+    at: Option<String>,
     #[serde(default, rename = "isCancelled")]
     is_cancelled: bool,
 }
@@ -143,6 +152,43 @@ fn extract_skipped_stations(service: &RdmServiceItem) -> Vec<String> {
         .collect()
 }
 
+/// Flattens a service's `subsequentCallingPoints` lists (one per portion
+/// of a split/joining service) into one compact list in board order. A
+/// stop reported by more than one list (the shared part of a split) is
+/// kept once, keyed on `(crs, st)`. Blank strings are stored as absent.
+fn extract_calling_points(service: &RdmServiceItem) -> Vec<common::BoardCallingPoint> {
+    fn non_blank(value: &Option<String>) -> Option<String> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    }
+    let mut out: Vec<common::BoardCallingPoint> = Vec::new();
+    for cp in service
+        .subsequent_calling_points
+        .iter()
+        .flat_map(|list| list.calling_point.iter())
+    {
+        let st = non_blank(&cp.st);
+        if out
+            .iter()
+            .any(|seen| seen.crs.eq_ignore_ascii_case(&cp.crs) && seen.st == st)
+        {
+            continue;
+        }
+        out.push(common::BoardCallingPoint {
+            crs: cp.crs.trim().to_uppercase(),
+            location_name: non_blank(&cp.location_name),
+            st,
+            et: non_blank(&cp.et),
+            at: non_blank(&cp.at),
+            is_cancelled: cp.is_cancelled,
+        });
+    }
+    out
+}
+
 /// Maps one RDM `GetDepBoardWithDetails` JSON response body into the
 /// `StationDeparture`s for that station. Only `trainServices` are sampled
 /// (see the implementation plan's Global Constraints). A service missing a
@@ -180,6 +226,13 @@ pub fn parse_departures(json: &str) -> Result<Vec<StationDeparture>> {
                 // fills this in afterwards, once per polled station, from
                 // this process's own memory of earlier polls.
                 planned_platform: None,
+                rsid: service
+                    .rsid
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .map(str::to_string),
+                calling_points: extract_calling_points(service),
             })
         })
         .collect())
@@ -332,6 +385,8 @@ mod tests {
         // `platform_history.rs`), never by this parsing step -- a single
         // JSON body carries no cross-poll history of its own.
         assert_eq!(first.planned_platform, None);
+        assert_eq!(first.rsid.as_deref(), Some("GW123400"));
+        assert!(first.calling_points.is_empty());
 
         let second = &departures[1];
         assert_eq!(second.estimated, "On time");
@@ -339,6 +394,28 @@ mod tests {
         assert!(!second.is_cancelled);
         assert_eq!(second.skipped_stations, vec!["DID".to_string()]);
         assert_eq!(second.platform, Some("9".to_string()));
+        assert_eq!(second.rsid.as_deref(), Some("GW123500"));
+        assert_eq!(
+            second.calling_points,
+            vec![
+                common::BoardCallingPoint {
+                    crs: "DID".to_string(),
+                    location_name: Some("Didcot Parkway".to_string()),
+                    st: Some("10:22".to_string()),
+                    et: None,
+                    at: None,
+                    is_cancelled: true,
+                },
+                common::BoardCallingPoint {
+                    crs: "OXF".to_string(),
+                    location_name: Some("Oxford".to_string()),
+                    st: Some("10:40".to_string()),
+                    et: None,
+                    at: None,
+                    is_cancelled: false,
+                },
+            ]
+        );
 
         let third = &departures[2];
         assert!(third.is_cancelled);
@@ -376,10 +453,18 @@ mod tests {
                     calling_point: vec![
                         RdmCallingPoint {
                             crs: "DID".to_string(),
+                            location_name: None,
+                            st: None,
+                            et: None,
+                            at: None,
                             is_cancelled: true,
                         },
                         RdmCallingPoint {
                             crs: "SWI".to_string(),
+                            location_name: None,
+                            st: None,
+                            et: None,
+                            at: None,
                             is_cancelled: false,
                         },
                     ],
@@ -387,11 +472,16 @@ mod tests {
                 RdmCallingPointList {
                     calling_point: vec![RdmCallingPoint {
                         crs: "BRI".to_string(),
+                        location_name: None,
+                        st: None,
+                        et: None,
+                        at: None,
                         is_cancelled: true,
                     }],
                 },
             ],
             platform: None,
+            rsid: None,
         };
         let mut skipped = extract_skipped_stations(&service);
         skipped.sort();
@@ -413,6 +503,7 @@ mod tests {
             delay_reason: None,
             subsequent_calling_points: vec![],
             platform: None,
+            rsid: None,
         };
         assert_eq!(extract_skipped_stations(&service), Vec::<String>::new());
     }
@@ -436,5 +527,73 @@ mod tests {
         "#;
         let departures = parse_departures(json).expect("should parse despite empty destination");
         assert_eq!(departures.len(), 0);
+    }
+
+    #[test]
+    fn a_missing_null_or_blank_rsid_decodes_as_none() {
+        let json = r#"
+            {
+                "trainServices": [
+                    {"serviceID": "a", "operatorCode": "SW", "destination": [{"crs": "WAT"}],
+                     "std": "10:00", "etd": "On time", "isCancelled": false},
+                    {"serviceID": "b", "operatorCode": "SW", "destination": [{"crs": "WAT"}],
+                     "std": "10:05", "etd": "On time", "isCancelled": false, "rsid": null},
+                    {"serviceID": "c", "operatorCode": "SW", "destination": [{"crs": "WAT"}],
+                     "std": "10:10", "etd": "On time", "isCancelled": false, "rsid": " "}
+                ]
+            }
+        "#;
+        let departures = parse_departures(json).expect("should parse");
+        assert_eq!(departures.len(), 3);
+        assert!(departures.iter().all(|d| d.rsid.is_none()));
+    }
+
+    #[test]
+    fn calling_points_keep_et_and_at_and_collapse_a_split_services_shared_stops() {
+        let json = r#"
+            {
+                "trainServices": [
+                    {"serviceID": "a", "operatorCode": "SN", "destination": [{"crs": "LIT"}, {"crs": "BOG"}],
+                     "std": "10:00", "etd": "10:04", "isCancelled": false, "rsid": "SN123400",
+                     "subsequentCallingPoints": [
+                        {"callingPoint": [
+                            {"locationName": "Clapham Junction", "crs": "CLJ", "st": "10:07", "et": "10:11"},
+                            {"locationName": "Horsham", "crs": "HRH", "st": "10:50", "et": "Delayed"},
+                            {"locationName": "Littlehampton", "crs": "LIT", "st": "11:40", "et": "Cancelled", "isCancelled": true}
+                        ]},
+                        {"callingPoint": [
+                            {"locationName": "Clapham Junction", "crs": "CLJ", "st": "10:07", "et": "10:11"},
+                            {"locationName": "Horsham", "crs": "HRH", "st": "10:50", "et": "Delayed"},
+                            {"locationName": "Bognor Regis", "crs": "BOG", "st": "11:45", "at": "", "et": "On time"}
+                        ]}
+                     ]}
+                ]
+            }
+        "#;
+        let departures = parse_departures(json).expect("should parse");
+        let cps = &departures[0].calling_points;
+        let crs: Vec<&str> = cps.iter().map(|cp| cp.crs.as_str()).collect();
+        assert_eq!(crs, vec!["CLJ", "HRH", "LIT", "BOG"]);
+        assert_eq!(cps[1].et.as_deref(), Some("Delayed"));
+        assert!(cps[2].is_cancelled);
+        // A blank `at` is stored as absent, not as an empty string.
+        assert_eq!(cps[3].at, None);
+        assert_eq!(departures[0].skipped_stations, vec!["LIT".to_string()]);
+    }
+
+    #[test]
+    fn stored_calling_points_are_compact_and_round_trip() {
+        let departures = parse_departures(SAMPLE_JSON).expect("sample JSON should parse");
+        let stored = serde_json::to_value(&departures[1]).unwrap();
+        assert_eq!(
+            stored["calling_points"],
+            serde_json::json!([
+                {"crs": "DID", "n": "Didcot Parkway", "st": "10:22", "x": true},
+                {"crs": "OXF", "n": "Oxford", "st": "10:40"},
+            ])
+        );
+        assert_eq!(stored["rsid"], "GW123500");
+        let back: StationDeparture = serde_json::from_value(stored).unwrap();
+        assert_eq!(back.calling_points, departures[1].calling_points);
     }
 }
