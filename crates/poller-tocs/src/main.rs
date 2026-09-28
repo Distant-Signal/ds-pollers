@@ -2,11 +2,10 @@
 //! interval and forwards parsed `TocReference`s to the `api` crate's
 //! `/private/tocs` ingestion endpoint.
 //!
-//! See `.superpowers/sdd/task-5-brief.md` (a local-only, gitignored
-//! working note -- not in the repository) for the RDM facts this is built
-//! against (RSPS5050 P-03-00 Rev A, §3) and the documented gaps: no
-//! confirmed endpoint path for this product, and an auth header name
-//! corroborated only via a different product's example.
+//! Built against RSPS5050 P-03-00 Rev A, §3. That spec publishes no
+//! endpoint path, so `RDM_TOCS_BASE_URL` is the full feed URL from the
+//! operator's RDM subscription; requests authenticate with the `x-apikey`
+//! header. Production runs this poller against the live feed.
 
 mod config;
 mod schema;

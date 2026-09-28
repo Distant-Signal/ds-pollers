@@ -2,9 +2,8 @@
 //! per RSPS5050 P-03-00 Rev A, §10, and its mapping to
 //! `common::IncidentMessage`.
 //!
-//! Field names below are transcribed verbatim from the spec (see
-//! `.superpowers/sdd/task-3-brief.md`, a local-only, gitignored working
-//! note that is not in the repository), not invented. Two spec facts drive
+//! Field names below are transcribed verbatim from that spec section, not
+//! invented. Two spec facts drive
 //! the shape here:
 //! - `ValidityPeriod` is mandatory *and* repeatable (can occur more than
 //!   once), so it's a `Vec`, not a single from/to pair.

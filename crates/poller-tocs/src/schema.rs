@@ -2,9 +2,8 @@
 //! (`TrainOperatingCompanyList` -> `TrainOperatingCompany[]`), per RSPS5050
 //! P-03-00 Rev A, §3, and its mapping to `common::TocReference`.
 //!
-//! Field names below are transcribed verbatim from the spec (see
-//! `.superpowers/sdd/task-5-brief.md`, a local-only, gitignored working
-//! note that is not in the repository), not invented. Only the fields
+//! Field names below are transcribed verbatim from that spec section, not
+//! invented. Only the fields
 //! `common::TocReference` actually consumes are modeled here —
 //! `ManagingDirector`, `Logo`, `NetworkMap`, `CompanyWebsite`, and any
 //! contact-detail structures are present in the real schema but

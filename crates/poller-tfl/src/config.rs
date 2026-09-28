@@ -54,8 +54,9 @@ pub struct Config {
     #[arg(long, env, default_value_t = 300)]
     pub poll_interval_secs: u64,
 
-    /// Enables the DLR arrivals-diffing pilot (see
-    /// `docs/superpowers/plans/2026-08-22-dlr-arrivals-diffing-pilot.md`).
+    /// Enables the DLR arrivals-diffing pilot (see `crate::dlr` and
+    /// `docs/superpowers/specs/2026-08-22-tfl-service-metrics-v2-design.md`,
+    /// Area 3).
     ///
     /// Defaults **off**: the pilot was built without a real deployment to
     /// run it against (no Docker or Postgres in the sandbox), so it has
