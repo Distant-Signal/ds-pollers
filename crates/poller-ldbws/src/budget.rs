@@ -27,7 +27,7 @@ const HOUR: Duration = Duration::from_secs(3600);
 
 /// Which limit refused a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BudgetLimit {
+pub(crate) enum BudgetLimit {
     /// This cycle's even share of the hourly budget is used up.
     Cycle,
     /// The rolling-hour total has reached the budget.
@@ -36,7 +36,7 @@ pub enum BudgetLimit {
 
 impl BudgetLimit {
     /// Metric label and log value.
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             BudgetLimit::Cycle => "cycle",
             BudgetLimit::Hour => "hour",
@@ -45,7 +45,7 @@ impl BudgetLimit {
 }
 
 #[derive(Debug)]
-pub struct RequestBudget {
+pub(crate) struct RequestBudget {
     /// Requests allowed in any rolling hour. 0 means unlimited.
     hourly_limit: usize,
     /// Requests allowed per cycle (see the module docs). Unused when
@@ -57,7 +57,7 @@ pub struct RequestBudget {
 }
 
 impl RequestBudget {
-    pub fn new(hourly_limit: u32, poll_interval_secs: u64) -> Self {
+    pub(crate) fn new(hourly_limit: u32, poll_interval_secs: u64) -> Self {
         let hourly_limit = hourly_limit as usize;
         let per_cycle_limit = if hourly_limit == 0 {
             0
@@ -77,26 +77,26 @@ impl RequestBudget {
 
     /// No budget: every request is allowed and nothing is recorded.
     #[cfg(test)]
-    pub fn unlimited() -> Self {
+    pub(crate) fn unlimited() -> Self {
         Self::new(0, 0)
     }
 
-    pub fn is_unlimited(&self) -> bool {
+    pub(crate) fn is_unlimited(&self) -> bool {
         self.hourly_limit == 0
     }
 
-    pub fn per_cycle_limit(&self) -> Option<usize> {
+    pub(crate) fn per_cycle_limit(&self) -> Option<usize> {
         (!self.is_unlimited()).then_some(self.per_cycle_limit)
     }
 
     /// Resets the per-cycle count. Called once at the start of each cycle.
-    pub fn start_cycle(&mut self) {
+    pub(crate) fn start_cycle(&mut self) {
         self.used_this_cycle = 0;
     }
 
     /// Whether one more request would be allowed at `now`, without using
     /// it up.
-    pub fn check(&mut self, now: Instant) -> Result<(), BudgetLimit> {
+    pub(crate) fn check(&mut self, now: Instant) -> Result<(), BudgetLimit> {
         if self.is_unlimited() {
             return Ok(());
         }
@@ -117,7 +117,7 @@ impl RequestBudget {
     }
 
     /// Uses up one request at `now` if [`RequestBudget::check`] allows it.
-    pub fn try_acquire(&mut self, now: Instant) -> Result<(), BudgetLimit> {
+    pub(crate) fn try_acquire(&mut self, now: Instant) -> Result<(), BudgetLimit> {
         self.check(now)?;
         if !self.is_unlimited() {
             self.window.push_back(now);

@@ -16,7 +16,7 @@ use clap::Parser;
 /// and `common::service_args::KafkaConnectionArgs`. The hand-written impl
 /// below redacts it.
 #[derive(Parser)]
-pub struct Config {
+pub(crate) struct Config {
     /// RDM Live Departure Board base URL, up to and including the
     /// `/LDBWS/api/20220120` segment. The poller appends
     /// `/GetDepBoardWithDetails/{crs}` itself (see `main.rs`).
@@ -62,7 +62,7 @@ pub struct Config {
     #[arg(long, env, default_value = "http://api:8080/private/station-samples")]
     pub api_ingest_url: String,
 
-    /// Shared, non-secret OAuth2 client-credentials config (same value
+    /// Shared, non-secret `OAuth2` client-credentials config (same value
     /// across all 9 real callers).
     #[command(flatten)]
     pub internal_oauth: common::oauth_client::InternalOAuthArgs,

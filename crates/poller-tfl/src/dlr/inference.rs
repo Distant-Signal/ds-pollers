@@ -27,7 +27,7 @@ const DLR_DELAY_THRESHOLD_MINUTES: i64 = 5;
 const MATCH_WINDOW_MINUTES: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum MatchedTrip {
+pub(crate) enum MatchedTrip {
     /// Found a prediction within `MATCH_WINDOW_MINUTES` of this trip's
     /// scheduled time. `delay_minutes` can be negative (early) but callers
     /// treat negative as zero — see `Task 6`'s `SampleStats` computation.
@@ -50,7 +50,7 @@ pub enum MatchedTrip {
 /// when the question is asked. It stays in the signature because
 /// `DlrMatchState::resolve`, which owns the wall-clock-dependent half
 /// (cancellation grace, retention), threads its own `now` through here.
-pub fn match_trips(
+pub(crate) fn match_trips(
     trips: Vec<ScheduledTrip>,
     predictions: &[Prediction],
     _now: DateTime<Utc>,
@@ -116,7 +116,7 @@ struct ResolvedTrip {
 /// matching prediction ever found, is treated as cancelled. DLR's typical
 /// headway is 3-10 minutes; this is roughly two headways' grace so a
 /// train that's simply running very late doesn't get misread as
-/// cancelled — a pilot-tuned value, not derived from any published TfL
+/// cancelled — a pilot-tuned value, not derived from any published `TfL`
 /// number, and worth revisiting once real data is observed.
 const CANCELLATION_GRACE_MINUTES: i64 = 15;
 
@@ -183,7 +183,7 @@ const _: () = assert!(
      or it can be picked up and counted a second time"
 );
 
-pub struct DlrMatchState {
+pub(crate) struct DlrMatchState {
     pending: Vec<PendingTrip>,
     resolved: Vec<ResolvedTrip>,
     /// This cycle's and the last `RECENT_PREDICTION_HISTORY - 1` cycles'
@@ -195,7 +195,7 @@ pub struct DlrMatchState {
 }
 
 impl DlrMatchState {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         DlrMatchState {
             pending: Vec::new(),
             resolved: Vec::new(),
@@ -238,7 +238,13 @@ impl DlrMatchState {
     /// a warning logged, rather than trusting the silence. This never
     /// blocks a *matched* trip from resolving -- only the "nothing showed
     /// up, so it must be cancelled" inference is withheld.
-    pub fn resolve(
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::needless_pass_by_value,
+        clippy::too_many_lines,
+        reason = "counts stay far below 2^52, so the f64 ratio is exact; callers hand over values they no longer need; long but linear; splitting it would scatter its shared state across helpers"
+    )]
+    pub(crate) fn resolve(
         &mut self,
         trips: Vec<ScheduledTrip>,
         predictions: &[Prediction],
@@ -367,13 +373,18 @@ impl Default for DlrMatchState {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_wrap,
+    clippy::similar_names,
+    reason = "test code: casts of small known test values; paired test values share names"
+)]
 mod tests {
     use super::*;
 
     fn trip(minute: u32) -> ScheduledTrip {
         ScheduledTrip {
             scheduled_departure: "2026-08-22T10:00:00Z".parse::<DateTime<Utc>>().unwrap()
-                + chrono::Duration::minutes(minute as i64),
+                + chrono::Duration::minutes(i64::from(minute)),
             interval_id: None,
         }
     }

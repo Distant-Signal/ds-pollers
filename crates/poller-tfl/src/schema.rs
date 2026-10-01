@@ -1,4 +1,4 @@
-//! TfL Unified API `GET /Line/Mode/{modes}/Status` JSON, and its mapping to
+//! `TfL` Unified API `GET /Line/Mode/{modes}/Status` JSON, and its mapping to
 //! this app's `common::LineStatusReport`.
 //!
 //! Field names are transcribed from a live response captured on 2026-08-22
@@ -13,13 +13,13 @@
 //!   timezone — which `chrono`'s serde impl will not parse into a
 //!   `DateTime<Utc>`. It is deliberately not modelled. The line-level
 //!   `created`/`modified` are proper RFC 3339 with a `Z`.
-//! - TfL's `statusSeverity` is its own 0–20 scale, which diverges from this
-//!   app's `Severity` above 14 (TfL 20 is "Service Closed"; ours is the NR
+//! - `TfL`'s `statusSeverity` is its own 0–20 scale, which diverges from this
+//!   app's `Severity` above 14 (`TfL` 20 is "Service Closed"; ours is the NR
 //!   extension "Recovering"). Every code goes through
 //!   `common::severity_from_tfl_code`; nothing is passed through raw.
 //!
 //! Everything stop-level (`affectedStops`, `affectedRoutes`) is dropped:
-//! TfL identifies stops by Naptan id (`940GZZLUABC`) and this app's station
+//! `TfL` identifies stops by Naptan id (`940GZZLUABC`) and this app's station
 //! columns are `CHAR(3)` CRS codes. That is v1's scope line, not an
 //! oversight.
 
@@ -33,11 +33,11 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TflLine {
+pub(crate) struct TflLine {
     pub id: String,
     pub name: String,
     pub mode_name: String,
-    /// When TfL last touched this line's record. Used as the `from_date`
+    /// When `TfL` last touched this line's record. Used as the `from_date`
     /// for a status that carries no validity period of its own — a stable
     /// timestamp, unlike `Utc::now()`, so an unchanged line does not
     /// produce a fresh `line_status_history` row every 300s.
@@ -49,11 +49,11 @@ pub struct TflLine {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TflLineStatus {
+pub(crate) struct TflLineStatus {
     pub status_severity: u8,
     #[serde(default)]
     pub status_severity_description: String,
-    /// Absent on a healthy line — TfL sends no prose for Good Service.
+    /// Absent on a healthy line — `TfL` sends no prose for Good Service.
     #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]
@@ -64,7 +64,7 @@ pub struct TflLineStatus {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TflValidityPeriod {
+pub(crate) struct TflValidityPeriod {
     pub from_date: DateTime<Utc>,
     #[serde(default)]
     pub to_date: Option<DateTime<Utc>>,
@@ -74,7 +74,7 @@ pub struct TflValidityPeriod {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TflDisruption {
+pub(crate) struct TflDisruption {
     /// `"RealTime"` | `"PlannedWork"` | `"Information"` in every observed
     /// response; `Option` only so a missing one cannot fail the whole poll.
     #[serde(default)]
@@ -102,7 +102,7 @@ pub struct TflDisruption {
 /// genuinely invalid JSON document (not just one bad element) still fails
 /// outright at the outer `Vec<serde_json::Value>` parse -- that failure is
 /// not recoverable per-element.
-pub fn parse_line_status(json: &str, now: DateTime<Utc>) -> Result<Vec<LineStatusReport>> {
+pub(crate) fn parse_line_status(json: &str, now: DateTime<Utc>) -> Result<Vec<LineStatusReport>> {
     let raw_lines: Vec<serde_json::Value> = serde_json::from_str(json)?;
     let lines: Vec<TflLine> = raw_lines
         .into_iter()
@@ -187,7 +187,7 @@ fn map_status(
     }
 }
 
-/// TfL omits `reason` entirely on a healthy line, and for a severity code
+/// `TfL` omits `reason` entirely on a healthy line, and for a severity code
 /// this app has never seen the description is the only human-readable
 /// signal there is — so the description is the fallback, and the result is
 /// never an empty string.
@@ -202,9 +202,9 @@ fn period_covers_now(period: &TflValidityPeriod, now: DateTime<Utc>) -> bool {
     period.from_date <= now && period.to_date.is_none_or(|to| to >= now)
 }
 
-/// Collapses TfL's `validityPeriods[]` to the single `ValidityPeriod` that
+/// Collapses `TfL`'s `validityPeriods[]` to the single `ValidityPeriod` that
 /// `common::LineStatus` stores, preferring the period that is actually in
-/// force: TfL's own `isNow`, else one whose window contains `now`, else the
+/// force: `TfL`'s own `isNow`, else one whose window contains `now`, else the
 /// earliest on record. With no periods at all it synthesises one starting
 /// at `fallback` (the line's `modified` timestamp) and open-ended.
 ///
@@ -212,7 +212,7 @@ fn period_covers_now(period: &TflValidityPeriod, now: DateTime<Utc>) -> bool {
 /// say otherwise, so a status that is in force cannot arrive at the
 /// frontend flagged `isNow: false` — the exact bug that made the National
 /// Rail issue list bucket in-progress works as neither Active nor Upcoming.
-pub fn select_validity(
+pub(crate) fn select_validity(
     periods: &[TflValidityPeriod],
     now: DateTime<Utc>,
     fallback: DateTime<Utc>,
@@ -246,8 +246,8 @@ mod tests {
     ///
     /// Note `"created": "0001-01-01T00:00:00"` on the status object: no
     /// timezone, so it is not modelled — a `DateTime<Utc>` field there
-    /// would fail the parse of every response TfL sends. The `$type`
-    /// members are TfL's .NET type tags and are ignored the same way.
+    /// would fail the parse of every response `TfL` sends. The `$type`
+    /// members are `TfL`'s .NET type tags and are ignored the same way.
     const TRAM_STATUS_JSON: &str = r#"[
       {
         "$type": "Tfl.Api.Presentation.Entities.Line, Tfl.Api.Presentation.Entities",

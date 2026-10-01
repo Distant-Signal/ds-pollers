@@ -22,12 +22,12 @@ use clap::Parser;
 /// (+https://github.com/FasterSpeeding/Distant-Signal)`. Re-verified
 /// 2026-09-27 with one GET per default CSV URL below: both HTTP 200 with the
 /// expected CSV header.
-pub const USER_AGENT: &str = common::user_agent!();
+pub(crate) const USER_AGENT: &str = common::user_agent!();
 
 /// CLI/env configuration for the `poller-nir-stations` service.
 ///
 /// Both CSV URLs DO have working defaults, unlike every RDM poller's own
-/// `baseUrl`: OpenDataNI's own CKAN download URLs are real, public,
+/// `baseUrl`: `OpenDataNI`'s own CKAN download URLs are real, public,
 /// key-free, anonymous-GET URLs, fetched and verified directly this
 /// session (`curl -sL -A "<User-Agent above>" <url>` -> HTTP 200, full CSV
 /// body) -- same "genuinely public endpoint gets a working default"
@@ -45,8 +45,8 @@ pub const USER_AGENT: &str = common::user_agent!();
 /// own precedent, and therefore needs its own redacting impl). The
 /// hand-written impl below redacts it.
 #[derive(Parser)]
-pub struct Config {
-    /// OpenDataNI's "Northern Ireland Railways Stations" CSV.
+pub(crate) struct Config {
+    /// `OpenDataNI`'s "Northern Ireland Railways Stations" CSV.
     #[arg(
         long,
         env,
@@ -54,7 +54,7 @@ pub struct Config {
     )]
     pub stations_csv_url: String,
 
-    /// OpenDataNI's "Northern Ireland Railways Halts" CSV.
+    /// `OpenDataNI`'s "Northern Ireland Railways Halts" CSV.
     #[arg(
         long,
         env,
@@ -92,7 +92,7 @@ pub struct Config {
     #[arg(long, env)]
     pub internal_oauth_password: String,
 
-    /// OpenDataNI's own CKAN metadata confirms `frequency: "irregular"`
+    /// `OpenDataNI`'s own CKAN metadata confirms `frequency: "irregular"`
     /// for both CSVs (design spec §2.1/§2.2) -- no committed update
     /// cadence, at least as stale-tolerant as GTFS's unconfirmed one.
     /// Defaults to the same 24h convention `poller-irish-rail-gtfs`,

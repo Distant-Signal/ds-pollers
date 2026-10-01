@@ -3,6 +3,13 @@
 //! how much memory a code path needs without other tests' allocations
 //! (running concurrently on other threads) skewing the number.
 
+#![expect(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "test code: casts of small known test values"
+)]
+#![expect(unsafe_code, reason = "a GlobalAlloc impl is unsafe by definition")]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -27,6 +34,7 @@ fn record(delta: isize) {
 // only touches const-initialized thread-locals, which never allocate.
 unsafe impl GlobalAlloc for Meter {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwards the caller's `alloc` contract to `System` unchanged.
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
             record(layout.size() as isize);
@@ -35,6 +43,7 @@ unsafe impl GlobalAlloc for Meter {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwards the caller's `alloc_zeroed` contract to `System`.
         let ptr = unsafe { System.alloc_zeroed(layout) };
         if !ptr.is_null() {
             record(layout.size() as isize);
@@ -43,11 +52,13 @@ unsafe impl GlobalAlloc for Meter {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` came from `System` via this allocator with `layout`.
         unsafe { System.dealloc(ptr, layout) };
         record(-(layout.size() as isize));
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: `ptr` came from `System` via this allocator with `layout`.
         let new = unsafe { System.realloc(ptr, layout, new_size) };
         if !new.is_null() {
             // Counted as the worst case, a copy: both blocks live at once.
@@ -63,7 +74,7 @@ static METER: Meter = Meter;
 
 /// Runs `f` and returns its result together with the most bytes this
 /// thread had allocated at once during `f`, above what was live before it.
-pub fn peak_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+pub(crate) fn peak_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let baseline = LIVE.with(Cell::get);
     PEAK.with(|peak| peak.set(baseline));
     let result = f();

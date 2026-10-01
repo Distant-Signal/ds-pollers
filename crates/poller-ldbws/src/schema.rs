@@ -121,7 +121,11 @@ fn parse_hhmm(s: &str) -> Option<chrono::NaiveTime> {
 /// 0 delay.
 const WRAPAROUND_THRESHOLD_MINUTES: i64 = -720;
 
-pub fn compute_delay_minutes(std: &str, etd: &str) -> i32 {
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a difference of two times of day, within +-1440 minutes"
+)]
+pub(crate) fn compute_delay_minutes(std: &str, etd: &str) -> i32 {
     let (Some(scheduled), Some(estimated)) = (parse_hhmm(std), parse_hhmm(etd)) else {
         return 0;
     };
@@ -157,6 +161,10 @@ fn extract_skipped_stations(service: &RdmServiceItem) -> Vec<String> {
 /// stop reported by more than one list (the shared part of a split) is
 /// kept once, keyed on `(crs, st)`. Blank strings are stored as absent.
 fn extract_calling_points(service: &RdmServiceItem) -> Vec<common::BoardCallingPoint> {
+    #[expect(
+        clippy::ref_option,
+        reason = "callers hold the Option by reference in a struct field"
+    )]
     fn non_blank(value: &Option<String>) -> Option<String> {
         value
             .as_deref()
@@ -195,7 +203,7 @@ fn extract_calling_points(service: &RdmServiceItem) -> Vec<common::BoardCallingP
 /// destination is skipped (logged, not fabricated) rather than guessing a
 /// CRS. `headcode` is always `None`: confirmed absent from this API's
 /// schema entirely.
-pub fn parse_departures(json: &str) -> Result<Vec<StationDeparture>> {
+pub(crate) fn parse_departures(json: &str) -> Result<Vec<StationDeparture>> {
     let board: RdmStationBoard = serde_json::from_str(json)?;
 
     Ok(board
@@ -549,6 +557,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::similar_names,
+        reason = "only rustc 1.88's clippy flags these names, so #[expect] can't be used"
+    )]
     fn calling_points_keep_et_and_at_and_collapse_a_split_services_shared_stops() {
         let json = r#"
             {

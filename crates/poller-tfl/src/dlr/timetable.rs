@@ -1,14 +1,14 @@
-//! Parses TfL's `GET /Line/dlr/Timetable/{stopPointId}` response for one
+//! Parses `TfL`'s `GET /Line/dlr/Timetable/{stopPointId}` response for one
 //! fixed pilot station (Poplar — see the plan's Global Constraints for why
 //! this pilot doesn't cover the whole network). `knownJourneys[]` gives
 //! each scheduled departure as an `hour`/`minute` pair with no date; this
 //! module combines each with the `service_date` the caller is asking
-//! about (the current *London* date — TfL's timetable service day is a
+//! about (the current *London* date — `TfL`'s timetable service day is a
 //! local one, not a UTC calendar day — threaded in the same way
 //! `poller-tfl/src/schema.rs::parse_line_status` threads `now` — never
 //! read directly, so parsing stays deterministic under test).
 //!
-//! Two properties of TfL's published times matter and are handled here:
+//! Two properties of `TfL`'s published times matter and are handled here:
 //! `hour` uses the after-midnight service-day convention (`"24"`, `"25"`
 //! mean 00:xx/01:xx the *following* morning), and every time is
 //! Europe/London wall-clock, so it needs a real timezone conversion to
@@ -65,9 +65,9 @@ struct KnownJourney {
 /// One scheduled DLR departure from the pilot station, resolved to a real
 /// timestamp for `service_date`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ScheduledTrip {
+pub(crate) struct ScheduledTrip {
     pub scheduled_departure: DateTime<Utc>,
-    /// TfL's Timetable response does not carry a destination per journey
+    /// `TfL`'s Timetable response does not carry a destination per journey
     /// the way Arrivals does — only a route-level `intervalId` grouping.
     /// Matching (Task 5) does not use this field yet; kept for a future
     /// iteration that resolves `intervalId` to a real destination via
@@ -125,7 +125,7 @@ fn london_to_utc(naive: NaiveDateTime) -> Option<DateTime<Utc>> {
     }
 }
 
-pub fn parse_timetable(json: &str, service_date: NaiveDate) -> Result<Vec<ScheduledTrip>> {
+pub(crate) fn parse_timetable(json: &str, service_date: NaiveDate) -> Result<Vec<ScheduledTrip>> {
     let response: TimetableResponse = serde_json::from_str(json)?;
     let expected_name = expected_schedule_name(service_date);
     let mut trips = Vec::new();

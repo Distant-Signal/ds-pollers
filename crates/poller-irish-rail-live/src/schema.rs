@@ -51,7 +51,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct ArrayOfObjStationData {
+pub(crate) struct ArrayOfObjStationData {
     #[serde(default, rename = "objStationData")]
     pub station_data: Vec<ObjStationData>,
 }
@@ -96,7 +96,7 @@ impl From<&ObjStationData> for IslandOfIrelandDeparture {
     }
 }
 
-pub fn parse_station_departures(xml: &str) -> Result<Vec<IslandOfIrelandDeparture>> {
+pub(crate) fn parse_station_departures(xml: &str) -> Result<Vec<IslandOfIrelandDeparture>> {
     let response: ArrayOfObjStationData = quick_xml::de::from_str(xml)?;
     Ok(response
         .station_data
@@ -107,25 +107,25 @@ pub fn parse_station_departures(xml: &str) -> Result<Vec<IslandOfIrelandDepartur
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct ArrayOfObjStation {
+pub(crate) struct ArrayOfObjStation {
     #[serde(default, rename = "objStation")]
     pub station: Vec<ObjStation>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct ObjStation {
+pub(crate) struct ObjStation {
     pub station_code: String,
     // Real, confirmed field (`getAllStationsXML`'s own `StationDesc`),
     // kept here for schema-completeness/documentation even though
     // `parse_all_stations` only extracts `station_code` today -- not
     // dead code by accident, just unused.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "kept for schema completeness; see above")]
     #[serde(default)]
     pub station_desc: Option<String>,
 }
 
-pub fn parse_all_stations(xml: &str) -> Result<Vec<String>> {
+pub(crate) fn parse_all_stations(xml: &str) -> Result<Vec<String>> {
     let response: ArrayOfObjStation = quick_xml::de::from_str(xml)?;
     Ok(response
         .station
@@ -134,7 +134,7 @@ pub fn parse_all_stations(xml: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-pub fn to_sample(
+pub(crate) fn to_sample(
     station_id: &str,
     departures: Vec<IslandOfIrelandDeparture>,
 ) -> IslandOfIrelandStationSample {

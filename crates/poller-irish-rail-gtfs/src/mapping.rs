@@ -25,7 +25,7 @@ use common::island_of_ireland::{
 };
 use gtfs_structures::Gtfs;
 
-pub fn map_stations(gtfs: &Gtfs) -> Vec<IslandOfIrelandStation> {
+pub(crate) fn map_stations(gtfs: &Gtfs) -> Vec<IslandOfIrelandStation> {
     gtfs.stops
         .values()
         .map(|stop| IslandOfIrelandStation {
@@ -53,7 +53,7 @@ pub fn map_stations(gtfs: &Gtfs) -> Vec<IslandOfIrelandStation> {
 /// model. A future pass wanting real trip-variant awareness needs a
 /// different `IslandOfIrelandLineDefinition.stations` shape entirely, not a
 /// tweak to this function.
-pub fn map_lines(gtfs: &Gtfs) -> Vec<IslandOfIrelandLineDefinition> {
+pub(crate) fn map_lines(gtfs: &Gtfs) -> Vec<IslandOfIrelandLineDefinition> {
     let mut trips_by_route: HashMap<&str, Vec<&gtfs_structures::Trip>> = HashMap::new();
     for trip in gtfs.trips.values() {
         trips_by_route
@@ -141,7 +141,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let options: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
             for (name, contents) in files {
                 zip.start_file(*name, options).unwrap();
                 zip.write_all(contents.as_bytes()).unwrap();

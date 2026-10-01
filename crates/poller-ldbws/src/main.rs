@@ -261,6 +261,10 @@ async fn poll_once(
 /// cycle got through (attempted to completion) and sampled successfully,
 /// and how long ago the least recently sampled station was sampled -- the
 /// number to alert on if the rotation ever stops reaching part of the list.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52"
+)]
 fn record_cycle_metrics(total: usize, completed: usize, sampled: usize, stalest: Duration) {
     metrics::gauge!(common::metrics::metric_name("ldbws_stations_total")).set(total as f64);
     metrics::gauge!(common::metrics::metric_name(
@@ -453,7 +457,7 @@ async fn sample_stations_until(
     platform_history: &mut PlatformHistory,
     request_budget: &mut RequestBudget,
     stations: &[String],
-    cutoff: impl std::future::Future<Output = ()>,
+    cutoff: impl Future<Output = ()>,
 ) -> CycleSampling {
     let mut sampling = CycleSampling {
         samples: Vec::with_capacity(stations.len()),
@@ -522,7 +526,7 @@ async fn sample_all_stations(
                     crs: crs.clone(),
                     polled_at: Utc::now(),
                     departures,
-                })
+                });
             }
             Err(err) => match err.downcast::<InvalidCrs>() {
                 // Logged once per station by `record_invalid_crs`, not
@@ -547,7 +551,7 @@ async fn fetch_sample_stations(
     tokens: &common::oauth_client::OAuthTokenCache,
 ) -> anyhow::Result<Vec<String>> {
     let url = sample_stations_url(config)?;
-    common::ingest::get_json(client, &url, tokens).await
+    ingest::get_json(client, &url, tokens).await
 }
 
 /// Keeps only stations that are exactly three ASCII letters (uppercased,
@@ -1156,7 +1160,7 @@ mod tests {
         let names = ["AAA", "BBB", "CCC", "DDD", "EEE"];
         let config = test_config(server.uri(), 10);
         let client = Client::new();
-        let stations: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let stations: Vec<String> = names.iter().map(ToString::to_string).collect();
         let mut history = PlatformHistory::new();
         let mut rotation = Rotation::new(std::time::Instant::now());
 
@@ -1250,7 +1254,7 @@ mod tests {
         let mut config = test_config(server.uri(), 10);
         config.hourly_request_budget = 180;
         let client = Client::new();
-        let stations: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let stations: Vec<String> = names.iter().map(ToString::to_string).collect();
         let mut history = PlatformHistory::new();
         let mut rotation = Rotation::new(std::time::Instant::now());
         let mut budget =

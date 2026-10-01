@@ -121,7 +121,7 @@ impl From<&PtIncident> for IncidentMessage {
 /// each `<PtIncident>` element and deserializes it independently, skipping
 /// (and logging) just the malformed ones -- mirroring the per-station
 /// isolation `poller-ldbws` already does for its own batch of stations.
-pub fn parse_incidents(xml: &str) -> Result<Vec<IncidentMessage>> {
+pub(crate) fn parse_incidents(xml: &str) -> Result<Vec<IncidentMessage>> {
     let incidents: Vec<PtIncident> = parse_repeated_elements(xml, "PtIncident")?;
     Ok(incidents.iter().map(IncidentMessage::from).collect())
 }
@@ -143,6 +143,10 @@ pub fn parse_incidents(xml: &str) -> Result<Vec<IncidentMessage>> {
 /// document isn't well-formed XML at all (a genuinely unrecoverable input,
 /// same as before); a single element that's well-formed XML but doesn't
 /// match `T`'s shape is skipped on its own.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "byte offsets into an in-memory document fit in usize"
+)]
 fn parse_repeated_elements<T: serde::de::DeserializeOwned>(
     xml: &str,
     tag_name: &str,
@@ -213,7 +217,7 @@ mod tests {
     /// Hand-written sample using the spec's own example
     /// `IncidentNumber` value, and the documented field names/nesting for
     /// `ValidityPeriod` (repeated) and `Affects.Operators.AffectedOperator[]`.
-    const SAMPLE_XML: &str = r#"
+    const SAMPLE_XML: &str = r"
         <Incidents>
             <PtIncident>
                 <IncidentNumber>8B68D83E08C1415A906022178722BDCB</IncidentNumber>
@@ -243,7 +247,7 @@ mod tests {
                 <IncidentPriority>2</IncidentPriority>
             </PtIncident>
         </Incidents>
-    "#;
+    ";
 
     #[test]
     fn parses_sample_incident_and_maps_every_field() {
@@ -295,7 +299,7 @@ mod tests {
 
     #[test]
     fn cleared_incident_absent_defaults_to_false() {
-        let xml = r#"
+        let xml = r"
             <Incidents>
                 <PtIncident>
                     <IncidentNumber>ABC123</IncidentNumber>
@@ -308,7 +312,7 @@ mod tests {
                     <IncidentPriority>5</IncidentPriority>
                 </PtIncident>
             </Incidents>
-        "#;
+        ";
 
         let messages = parse_incidents(xml).expect("sample XML should parse");
         assert_eq!(messages.len(), 1);
@@ -324,7 +328,7 @@ mod tests {
         // `<PtIncident>` (here, a required `<IncidentPriority>` that isn't
         // an integer) failed the ENTIRE batch, silently stopping every
         // OTHER incident in the response from updating too.
-        let xml = r#"
+        let xml = r"
             <Incidents>
                 <PtIncident>
                     <IncidentNumber>GOOD-1</IncidentNumber>
@@ -357,7 +361,7 @@ mod tests {
                     <IncidentPriority>3</IncidentPriority>
                 </PtIncident>
             </Incidents>
-        "#;
+        ";
 
         let messages = parse_incidents(xml)
             .expect("one malformed incident must not fail the whole batch parse");
@@ -377,12 +381,12 @@ mod tests {
         // matching close tag anywhere), there's no reliable fragment
         // boundary to isolate, so this must still surface as an error
         // rather than silently returning a partial/wrong result.
-        let xml = r#"
+        let xml = r"
             <Incidents>
                 <PtIncident>
                     <IncidentNumber>UNCLOSED</IncidentNumber>
             </Incidents>
-        "#;
+        ";
         assert!(parse_incidents(xml).is_err());
     }
 }

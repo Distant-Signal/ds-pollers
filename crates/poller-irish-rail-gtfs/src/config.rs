@@ -7,7 +7,7 @@ use clap::Parser;
 /// (docs/superpowers/specs/2026-09-05-ireland-vs-northern-ireland-friction-research.md
 /// §1) confirms this is a real, public, key-free, anonymous-GET URL,
 /// downloaded and verified directly in that research session -- matching
-/// `poller-tfl`'s own precedent (`TFL_BASE_URL` defaults to the real TfL
+/// `poller-tfl`'s own precedent (`TFL_BASE_URL` defaults to the real `TfL`
 /// API root) for "a genuinely public endpoint gets a working default,
 /// unlike an account-gated one."
 ///
@@ -22,7 +22,7 @@ use clap::Parser;
 /// `InternalOAuthArgs` in, and therefore needs its own redacting impl). The
 /// hand-written impl below redacts it.
 #[derive(Parser)]
-pub struct Config {
+pub(crate) struct Config {
     /// Transport for Ireland's public GTFS zip for Iarnród Éireann.
     #[arg(
         long,

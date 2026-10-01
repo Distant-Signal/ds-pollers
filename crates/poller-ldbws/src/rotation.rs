@@ -45,11 +45,11 @@ const TYPICAL_CYCLE_CAPACITY: u64 = 367;
 /// How long a station LDBWS rejected as an invalid CRS is left out of the
 /// cycle before it is tried again: one request an hour per such station,
 /// instead of one a cycle.
-pub const INVALID_CRS_REPROBE: Duration = Duration::from_secs(3600);
+pub(crate) const INVALID_CRS_REPROBE: Duration = Duration::from_secs(3600);
 
 /// The rotation's state for the life of the process.
 #[derive(Debug)]
-pub struct Rotation {
+pub(crate) struct Rotation {
     /// The first station the next cycle samples. `None` until the first
     /// cycle has run, when the clock-derived offset is used instead.
     next_start: Option<String>,
@@ -75,7 +75,7 @@ pub struct Rotation {
 /// One full pass over the station list, as reported by
 /// [`Rotation::record_progress`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FullRotation {
+pub(crate) struct FullRotation {
     /// Cycles the pass took (including the one that finished it).
     pub cycles: u32,
     /// From the end of the previous full pass (or process start) to the
@@ -85,7 +85,7 @@ pub struct FullRotation {
 }
 
 impl Rotation {
-    pub fn new(now: Instant) -> Self {
+    pub(crate) fn new(now: Instant) -> Self {
         Self {
             next_start: None,
             last_sampled: HashMap::new(),
@@ -100,7 +100,7 @@ impl Rotation {
 
     /// Records whether the stalest station is currently too old for the
     /// aggregator, returning the new state only when it changed.
-    pub fn note_stale(&mut self, stale: bool) -> Option<bool> {
+    pub(crate) fn note_stale(&mut self, stale: bool) -> Option<bool> {
         (std::mem::replace(&mut self.stale, stale) != stale).then_some(stale)
     }
 
@@ -108,7 +108,7 @@ impl Rotation {
     /// it was given. Returns the finished pass once the stations completed
     /// since the last one add up to the whole list; any overshoot counts
     /// towards the next pass.
-    pub fn record_progress(
+    pub(crate) fn record_progress(
         &mut self,
         total: usize,
         completed: usize,
@@ -135,7 +135,7 @@ impl Rotation {
 
     /// `stations` (sorted and deduplicated here, so the order does not
     /// depend on the caller) rotated to start at this cycle's offset.
-    pub fn order(
+    pub(crate) fn order(
         &self,
         stations: &[String],
         unix_secs: u64,
@@ -160,7 +160,7 @@ impl Rotation {
     /// `ordered` minus the stations known to be invalid whose re-probe is
     /// not yet due, keeping the rotation order. This is the list a cycle
     /// actually polls.
-    pub fn pollable(&self, ordered: &[String], now: Instant) -> Vec<String> {
+    pub(crate) fn pollable(&self, ordered: &[String], now: Instant) -> Vec<String> {
         ordered
             .iter()
             .filter(|crs| match self.invalid.get(*crs) {
@@ -174,14 +174,14 @@ impl Rotation {
     /// Records that LDBWS rejected `crs` as an invalid CRS code. Returns
     /// `true` only the first time (until it recovers or leaves the list),
     /// so the caller logs and flags it once rather than every re-probe.
-    pub fn mark_invalid(&mut self, crs: &str, now: Instant) -> bool {
+    pub(crate) fn mark_invalid(&mut self, crs: &str, now: Instant) -> bool {
         self.invalid.insert(crs.to_string(), now).is_none()
     }
 
     /// Forgets invalid stations no longer in `stations` (the catalogue was
     /// fixed and api dropped them), returning them so their metric can be
     /// cleared.
-    pub fn prune_invalid(&mut self, stations: &[String]) -> Vec<String> {
+    pub(crate) fn prune_invalid(&mut self, stations: &[String]) -> Vec<String> {
         let mut gone: Vec<String> = self
             .invalid
             .keys()
@@ -197,7 +197,7 @@ impl Rotation {
 
     /// The stations currently known to be invalid, sorted.
     #[cfg(test)]
-    pub fn invalid_stations(&self) -> Vec<&str> {
+    pub(crate) fn invalid_stations(&self) -> Vec<&str> {
         let mut v: Vec<&str> = self.invalid.keys().map(String::as_str).collect();
         v.sort_unstable();
         v
@@ -209,7 +209,7 @@ impl Rotation {
     /// out, and `sampled` the stations that produced a sample. The next
     /// cycle starts at the first station not completed. Returns the
     /// sampled stations that had been marked invalid (they recovered).
-    pub fn finish_cycle<'a>(
+    pub(crate) fn finish_cycle<'a>(
         &mut self,
         ordered: &[String],
         completed: usize,
@@ -234,7 +234,7 @@ impl Rotation {
     /// process start. Stations known to be invalid are left out: they are
     /// a catalogue error with their own metric and alert, not staleness.
     /// `Duration::ZERO` for an empty list.
-    pub fn stalest_age(&self, stations: &[String], now: Instant) -> Duration {
+    pub(crate) fn stalest_age(&self, stations: &[String], now: Instant) -> Duration {
         stations
             .iter()
             .filter(|crs| !self.invalid.contains_key(*crs))
@@ -248,12 +248,20 @@ impl Rotation {
 }
 
 /// The start offset for a process's first cycle -- see the module docs.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the result is reduced modulo len, so it fits in usize"
+)]
 fn clock_offset(unix_secs: u64, poll_interval_secs: u64, len: usize) -> usize {
     let cycle_number = unix_secs / poll_interval_secs.max(1);
     (cycle_number.wrapping_mul(TYPICAL_CYCLE_CAPACITY) % len as u64) as usize
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "test code: casts of small known test values"
+)]
 mod tests {
     use std::collections::HashSet;
 

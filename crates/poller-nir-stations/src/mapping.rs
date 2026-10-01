@@ -1,4 +1,4 @@
-//! Parses OpenDataNI's two Translink CSVs ("Northern Ireland Railways
+//! Parses `OpenDataNI`'s two Translink CSVs ("Northern Ireland Railways
 //! Stations" and "...Halts") into
 //! `common::island_of_ireland::{IslandOfIrelandStation, IslandOfIrelandLineDefinition}`,
 //! all tagged `NorthernIreland`. Tier A of
@@ -46,7 +46,7 @@ struct RawRow {
 /// Signal Box Audit, poll-area Low finding -- "one bad CSV row fails a
 /// whole reference-catalogue reload": this used to
 /// `.collect::<Result<Vec<_>, _>>()` the whole deserialized row iterator,
-/// so a single malformed row anywhere in either OpenDataNI CSV (a
+/// so a single malformed row anywhere in either `OpenDataNI` CSV (a
 /// mis-typed `Lat`/`Long`, a stray encoding hiccup, a genuinely corrupt
 /// line) failed the ENTIRE reload -- every other, perfectly good row in
 /// that file silently failing to update too, unlike the per-item batch
@@ -59,6 +59,10 @@ struct RawRow {
 /// fails and gets logged", not a silent empty result -- `map_stations`'
 /// caller already treats an empty catalogue as noteworthy via its own
 /// `stations.len()` logging in `main.rs`.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "keeps the fallible parser signature its siblings share"
+)]
 fn parse_rows(csv_bytes: &[u8]) -> anyhow::Result<Vec<RawRow>> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
@@ -78,11 +82,14 @@ fn parse_rows(csv_bytes: &[u8]) -> anyhow::Result<Vec<RawRow>> {
         .collect())
 }
 
+#[expect(
+    clippy::ref_option,
+    reason = "callers hold the Option by reference in a struct field"
+)]
 fn is_disused(comment: &Option<String>) -> bool {
     comment
         .as_deref()
-        .map(|c| c.to_ascii_lowercase().contains("disused"))
-        .unwrap_or(false)
+        .is_some_and(|c| c.to_ascii_lowercase().contains("disused"))
 }
 
 /// Border/Enterprise-corridor stations already sourced from Iarnród
@@ -138,13 +145,13 @@ fn slugify(name: &str) -> String {
     slug
 }
 
-/// Parses both real OpenDataNI CSVs (raw bytes, as fetched over HTTP) into
+/// Parses both real `OpenDataNI` CSVs (raw bytes, as fetched over HTTP) into
 /// the filtered, deduped, `NorthernIreland`-tagged station catalogue.
 /// Order of operations matters: Stations rows are processed (and their
 /// bare names recorded) BEFORE Halts rows, so the Poyntzpass dedup always
 /// keeps the Stations-dataset row, per the design spec's own §3.3 point 2
 /// rule.
-pub fn map_stations(
+pub(crate) fn map_stations(
     stations_csv: &[u8],
     halts_csv: &[u8],
 ) -> anyhow::Result<Vec<IslandOfIrelandStation>> {
@@ -187,7 +194,7 @@ pub fn map_stations(
 /// `parse_rows`'s per-row-resilience fix above): `api`'s
 /// `/private/island-of-ireland-stations` ingestion upserts by this exact
 /// `id`, so two DIFFERENT rows that happen to `slugify` to the same id
-/// (e.g. a future OpenDataNI CSV update introducing a name whose
+/// (e.g. a future `OpenDataNI` CSV update introducing a name whose
 /// punctuation collapses onto an already-used slug) would silently
 /// overwrite one station's coordinates with the other's on every single
 /// reload, with no error or log anywhere -- the `seen_bare_names` dedup
@@ -220,7 +227,7 @@ fn push_station_if_id_is_new(
     });
 }
 
-/// Hand-curated, NOT CSV-parsed -- OpenDataNI publishes no per-line
+/// Hand-curated, NOT CSV-parsed -- `OpenDataNI` publishes no per-line
 /// stopping-pattern dataset for NIR at all (design spec §2.3: the only
 /// "lines" data is track-engineering geometry with no rider-line tag).
 /// Same posture this app already takes for GB's `lines/*.toml` catalogue
@@ -233,21 +240,21 @@ fn push_station_if_id_is_new(
 /// Portadown/Newry Line, Bangor Line, Portrush Line, Larne Line -- Dublin
 /// Line is deliberately NOT reproduced here, it's Iarnród Éireann's own
 /// GTFS-sourced line, see the combined spec's §4), cross-referenced
-/// against the real, fetched OpenDataNI CSV `NAME` values so every id here
+/// against the real, fetched `OpenDataNI` CSV `NAME` values so every id here
 /// is `slugify`'d from a name that genuinely exists in `map_stations`'
 /// own output.
 ///
 /// **Two real, upstream data gaps, not bugs in this function**: the
 /// map shows "Cullybackey" and plain "Coleraine" (the mainline interchange
 /// station, not just its "Coleraine University" halt) on the
-/// Derry~Londonderry Line, but NEITHER appears in either OpenDataNI CSV at
+/// Derry~Londonderry Line, but NEITHER appears in either `OpenDataNI` CSV at
 /// all (confirmed by grepping both fetched files this session) --
 /// Cullybackey reopened in December 2024, after these 2023-vintage CSVs
 /// were captured; plain "Coleraine" appears to be a genuine omission from
 /// Translink's own 2023 survey. Both are skipped below rather than
 /// invented -- no real `island_of_ireland_stations.id` exists for either
 /// today.
-pub fn map_lines() -> Vec<IslandOfIrelandLineDefinition> {
+pub(crate) fn map_lines() -> Vec<IslandOfIrelandLineDefinition> {
     vec![
         IslandOfIrelandLineDefinition {
             id: "nir-bangor-line".to_string(),

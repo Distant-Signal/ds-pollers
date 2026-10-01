@@ -35,12 +35,12 @@ use common::StationDeparture;
 /// this codebase claims Darwin's `serviceId` tokens are globally unique
 /// across every station's own board, and scoping by station costs nothing.
 #[derive(Debug, Default)]
-pub struct PlatformHistory {
+pub(crate) struct PlatformHistory {
     seen: HashMap<(String, String), String>,
 }
 
 impl PlatformHistory {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -55,7 +55,7 @@ impl PlatformHistory {
     /// genuinely unknown) is left with `planned_platform: None` too and is
     /// NOT remembered yet -- there is nothing to plan against until a real
     /// platform value is first seen.
-    pub fn apply(&mut self, crs: &str, departures: &mut [StationDeparture]) {
+    pub(crate) fn apply(&mut self, crs: &str, departures: &mut [StationDeparture]) {
         let mut current_service_ids: HashSet<String> = HashSet::new();
 
         for departure in departures.iter_mut() {

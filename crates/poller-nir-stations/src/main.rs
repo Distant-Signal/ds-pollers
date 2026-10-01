@@ -1,4 +1,4 @@
-//! `poller-nir-stations`: downloads OpenDataNI's two Translink CSVs
+//! `poller-nir-stations`: downloads `OpenDataNI`'s two Translink CSVs
 //! ("Northern Ireland Railways Stations"/"...Halts") on an interval,
 //! parses/filters/dedups them, and forwards the derived
 //! `NorthernIreland`-tagged station catalogue -- plus a small hand-curated

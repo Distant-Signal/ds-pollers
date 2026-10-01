@@ -1,7 +1,9 @@
 [package]
 name = "poller-tocs"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 health-http = { path = "../health-http" }
@@ -15,3 +17,6 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "n
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1.44"
+
+[lints]
+workspace = true

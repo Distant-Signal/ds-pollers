@@ -46,7 +46,7 @@ const MAX_GTFS_ZIP_BYTES: u64 = 200 * 1024 * 1024;
 /// is then parsed wholesale into memory by `Gtfs::from_reader`, inside a
 /// container whose chart memory limit is 768Mi
 /// (`pollerIrishRailGtfs.resources.limits.memory`). A crafted zip inflating
-/// to ~1.5 GiB of CSV sailed through the old budget and OOMKilled the pod
+/// to ~1.5 GiB of CSV sailed through the old budget and `OOMKilled` the pod
 /// on the parse instead. The real feed measured 2026-09-27 is 9.0 MB
 /// compressed / 27.2 MB inflated (`shapes.txt` alone is 24.8 MB), so 256
 /// MiB is still ~9x headroom for feed growth while keeping inflated CSV
@@ -106,6 +106,10 @@ fn reject_gtfs_zip_bomb(bytes: &[u8]) -> anyhow::Result<()> {
     reject_gtfs_zip_bomb_with_budget(bytes, MAX_GTFS_INFLATED_BYTES)
 }
 
+#[expect(
+    clippy::large_stack_arrays,
+    reason = "a 64 KiB read buffer is fine on a thread stack"
+)]
 fn reject_gtfs_zip_bomb_with_budget(bytes: &[u8], max_inflated_bytes: u64) -> anyhow::Result<()> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|err| anyhow::anyhow!("failed to open GTFS zip for its size pre-check: {err}"))?;
@@ -394,7 +398,7 @@ mod reject_gtfs_zip_bomb_tests {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let options: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
             for (name, contents) in entries {
                 zip.start_file(*name, options).unwrap();
                 zip.write_all(contents).unwrap();

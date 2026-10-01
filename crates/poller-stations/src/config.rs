@@ -16,7 +16,7 @@ use clap::Parser;
 /// `common::service_args::KafkaConnectionArgs`. The hand-written impl
 /// below redacts it.
 #[derive(Parser)]
-pub struct Config {
+pub(crate) struct Config {
     /// RDM Stations feed base URL, e.g. `https://<host>/json/1.0`. The
     /// poller appends `/stations` itself (see `main.rs`).
     #[arg(long, env)]
@@ -31,7 +31,7 @@ pub struct Config {
     #[arg(long, env, default_value = "http://api:8080/private/stations")]
     pub api_ingest_url: String,
 
-    /// Shared, non-secret OAuth2 client-credentials config (same value
+    /// Shared, non-secret `OAuth2` client-credentials config (same value
     /// across all 9 real callers).
     #[command(flatten)]
     pub internal_oauth: common::oauth_client::InternalOAuthArgs,

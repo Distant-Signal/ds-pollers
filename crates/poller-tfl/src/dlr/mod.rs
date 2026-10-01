@@ -2,11 +2,11 @@
 //! `docs/superpowers/specs/2026-08-22-tfl-service-metrics-v2-design.md`,
 //! Area 3).
 //!
-//! Unlike the rest of `poller-tfl`, which only relays status TfL has
+//! Unlike the rest of `poller-tfl`, which only relays status `TfL` has
 //! already computed, this module infers `common::SampleStats` itself, by
 //! diffing live Arrivals predictions against DLR's published Timetable for
-//! one pilot station (Poplar). No other TfL line does this.
+//! one pilot station (Poplar). No other `TfL` line does this.
 
-pub mod arrivals;
-pub mod inference;
-pub mod timetable;
+pub(crate) mod arrivals;
+pub(crate) mod inference;
+pub(crate) mod timetable;

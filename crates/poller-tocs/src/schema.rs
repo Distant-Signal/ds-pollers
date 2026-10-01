@@ -50,7 +50,7 @@ impl From<&TrainOperatingCompany> for TocReference {
 /// skipping (and logging) just the malformed ones -- mirroring the
 /// per-station isolation `poller-ldbws` already does for its own batch of
 /// stations.
-pub fn parse_tocs(xml: &str) -> Result<Vec<TocReference>> {
+pub(crate) fn parse_tocs(xml: &str) -> Result<Vec<TocReference>> {
     let tocs: Vec<TrainOperatingCompany> = parse_repeated_elements(xml, "TrainOperatingCompany")?;
     Ok(tocs.iter().map(TocReference::from).collect())
 }
@@ -70,6 +70,10 @@ pub fn parse_tocs(xml: &str) -> Result<Vec<TocReference>> {
 /// the document isn't well-formed XML at all (a genuinely unrecoverable
 /// input, same as before); a single element that's well-formed XML but
 /// doesn't match `T`'s shape is skipped on its own.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "byte offsets into an in-memory document fit in usize"
+)]
 fn parse_repeated_elements<T: serde::de::DeserializeOwned>(
     xml: &str,
     tag_name: &str,
@@ -138,7 +142,7 @@ mod tests {
     use super::*;
 
     /// Hand-written sample using the spec's own example values.
-    const SAMPLE_XML: &str = r#"
+    const SAMPLE_XML: &str = r"
         <TrainOperatingCompanyList>
             <TrainOperatingCompany>
                 <AtocCode>LE</AtocCode>
@@ -148,7 +152,7 @@ mod tests {
                 <StationOperator>true</StationOperator>
             </TrainOperatingCompany>
         </TrainOperatingCompanyList>
-    "#;
+    ";
 
     #[test]
     fn parses_sample_toc_and_maps_every_field() {
@@ -165,7 +169,7 @@ mod tests {
 
     #[test]
     fn missing_boolean_fields_default_to_none() {
-        let xml = r#"
+        let xml = r"
             <TrainOperatingCompanyList>
                 <TrainOperatingCompany>
                     <AtocCode>GW</AtocCode>
@@ -173,7 +177,7 @@ mod tests {
                     <LegalName>Great Western Railway</LegalName>
                 </TrainOperatingCompany>
             </TrainOperatingCompanyList>
-        "#;
+        ";
 
         let tocs = parse_tocs(xml).expect("sample XML should parse");
         assert_eq!(tocs.len(), 1);
@@ -188,7 +192,7 @@ mod tests {
         // malformed `<TrainOperatingCompany>` (here, missing the required
         // `<LegalName>`) failed the ENTIRE batch, silently stopping every
         // OTHER operator in the response from updating too.
-        let xml = r#"
+        let xml = r"
             <TrainOperatingCompanyList>
                 <TrainOperatingCompany>
                     <AtocCode>LE</AtocCode>
@@ -205,7 +209,7 @@ mod tests {
                     <LegalName>Great Western Railway</LegalName>
                 </TrainOperatingCompany>
             </TrainOperatingCompanyList>
-        "#;
+        ";
 
         let tocs =
             parse_tocs(xml).expect("one malformed operator must not fail the whole batch parse");
@@ -220,12 +224,12 @@ mod tests {
 
     #[test]
     fn genuinely_malformed_xml_still_fails_the_whole_parse() {
-        let xml = r#"
+        let xml = r"
             <TrainOperatingCompanyList>
                 <TrainOperatingCompany>
                     <AtocCode>UNCLOSED</AtocCode>
             </TrainOperatingCompanyList>
-        "#;
+        ";
         assert!(parse_tocs(xml).is_err());
     }
 }

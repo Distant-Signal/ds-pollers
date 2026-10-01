@@ -1,7 +1,7 @@
-//! Parses TfL's `GET /Line/dlr/Arrivals` response — a flat list of live
+//! Parses `TfL`'s `GET /Line/dlr/Arrivals` response — a flat list of live
 //! per-train predictions, one entry per (vehicle, next stop) pair, covering
 //! the whole DLR network in a single call. Field names are transcribed
-//! from TfL's public `Prediction` entity docs; see
+//! from `TfL`'s public `Prediction` entity docs; see
 //! `crates/poller-tfl/tests/fixtures/README.md` for what the live capture
 //! actually confirmed.
 
@@ -20,8 +20,8 @@ use serde::Deserialize;
 // unused today but kept for API fidelity/future consumers.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
-pub struct Prediction {
+#[expect(dead_code, reason = "unused fields kept for API fidelity; see above")]
+pub(crate) struct Prediction {
     pub vehicle_id: String,
     pub naptan_id: String,
     pub station_name: String,
@@ -39,7 +39,7 @@ pub struct Prediction {
     pub time_to_station: i64,
 }
 
-pub fn parse_arrivals(json: &str) -> Result<Vec<Prediction>> {
+pub(crate) fn parse_arrivals(json: &str) -> Result<Vec<Prediction>> {
     Ok(serde_json::from_str(json)?)
 }
 

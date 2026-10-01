@@ -1,14 +1,14 @@
-//! `poller-tfl`: polls TfL's Unified API for line status across the modes
+//! `poller-tfl`: polls `TfL`'s Unified API for line status across the modes
 //! this app displays (tube, DLR, Overground, Elizabeth line, tram) and
 //! forwards it to the `api` crate's `/private/tfl-line-status` endpoint.
 //!
 //! Unlike the four RDM pollers, what this one carries is already finished
-//! line status — TfL publishes status directly, so nothing downstream has
+//! line status — `TfL` publishes status directly, so nothing downstream has
 //! to infer it from incidents or departure boards, and the aggregator is
 //! not involved. `schema.rs` does the whole TfL→domain mapping (severity
-//! codes above all) so the `api` crate never sees TfL's JSON.
+//! codes above all) so the `api` crate never sees `TfL`'s JSON.
 //!
-//! There is no historical endpoint on TfL's side. Everything this app can
+//! There is no historical endpoint on `TfL`'s side. Everything this app can
 //! ever show for "the Victoria line last Tuesday" is what this poller
 //! wrote into `line_status_history` at the time.
 
@@ -24,7 +24,7 @@ use common::ingest;
 use config::Config;
 use reqwest::{Client, StatusCode};
 
-/// TfL's subscription-key header. Not in `common::ingest` alongside
+/// `TfL`'s subscription-key header. Not in `common::ingest` alongside
 /// `RDM_AUTH_HEADER_NAME`: that constant is there because four pollers and
 /// the api crate all have to agree on it, whereas this one has exactly one
 /// consumer.
@@ -41,7 +41,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DLR_PILOT_DIRECTION: &str = "outbound";
 
 /// Attempts per poll cycle before giving up and waiting for the next tick.
-/// TfL's registered free tier is documented at roughly 500 requests per
+/// `TfL`'s registered free tier is documented at roughly 500 requests per
 /// minute, but community reports say the enforcement is inconsistent — so
 /// this poller does not assume a budget, it just backs off when told to.
 const MAX_ATTEMPTS: u32 = 3;
@@ -63,7 +63,7 @@ fn retry_delay(attempt: u32) -> Duration {
 /// against orchestrators that set `TFL_APP_KEY` to an empty string rather
 /// than leaving it unset — `clap`'s `env` attribute only enforces
 /// "present", not "non-empty", so that case would otherwise sail through
-/// `Config::parse()` and start polling TfL anonymously.
+/// `Config::parse()` and start polling `TfL` anonymously.
 fn require_non_empty_key(key: &str) -> anyhow::Result<()> {
     if key.trim().is_empty() {
         anyhow::bail!(
@@ -208,6 +208,10 @@ fn dlr_line_id() -> String {
 /// pattern (`crates/aggregator/src/aggregation.rs:96-106`), minus its
 /// severity escalation, which this pilot deliberately does not adopt (see
 /// the plan's Global Constraints).
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "callers hand over values they no longer need"
+)]
 fn merge_dlr_sample_stats(reports: &mut [common::LineStatusReport], stats: common::SampleStats) {
     let line_id = dlr_line_id();
     for report in reports.iter_mut().filter(|r| r.id == line_id) {
@@ -308,8 +312,8 @@ async fn fetch_status_json(client: &Client, config: &Config) -> anyhow::Result<S
     fetch_json(client, &url, config, "line-status").await
 }
 
-/// One authenticated GET against TfL, with this poller's shared status
-/// checking, in-cycle backoff, and outcome metric. Every TfL call goes
+/// One authenticated GET against `TfL`, with this poller's shared status
+/// checking, in-cycle backoff, and outcome metric. Every `TfL` call goes
 /// through here: a 429 or a 5xx has a body too, and handing that body to a
 /// parser produces a confusing serde error in place of the real cause.
 ///

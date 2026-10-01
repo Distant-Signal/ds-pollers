@@ -16,7 +16,7 @@ use clap::Parser;
 /// `common::service_args::KafkaConnectionArgs`. The hand-written impl
 /// below redacts it.
 #[derive(Parser)]
-pub struct Config {
+pub(crate) struct Config {
     /// RDM Train Operating Company List feed base URL. GAP: no endpoint
     /// path is published in the current spec for this product — this must
     /// be supplied out of band once known.
@@ -32,7 +32,7 @@ pub struct Config {
     #[arg(long, env, default_value = "http://api:8080/private/tocs")]
     pub api_ingest_url: String,
 
-    /// Shared, non-secret OAuth2 client-credentials config (same value
+    /// Shared, non-secret `OAuth2` client-credentials config (same value
     /// across all 9 real callers).
     #[command(flatten)]
     pub internal_oauth: common::oauth_client::InternalOAuthArgs,

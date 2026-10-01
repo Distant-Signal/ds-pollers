@@ -1,7 +1,7 @@
 //! RDM Stations JSON schema and its mapping to `common::StationReference`.
 //!
 //! Field names and structure below are taken from the National Rail Station
-//! API OpenAPI spec (v1.0.0, `paths./stations`, `components.schemas.Station`)
+//! API `OpenAPI` spec (v1.0.0, `paths./stations`, `components.schemas.Station`)
 //! — camelCase, confirmed directly from the JSON schema rather than
 //! transcribed from a sibling XML schema.
 //!
@@ -40,7 +40,7 @@ use serde_json::value::RawValue;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RdmLocation {
+pub(crate) struct RdmLocation {
     #[serde(default)]
     pub latitude: Option<f64>,
     #[serde(default)]
@@ -49,7 +49,7 @@ pub struct RdmLocation {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RdmStationOperator {
+pub(crate) struct RdmStationOperator {
     #[serde(default)]
     pub operator_code: Option<String>,
 }
@@ -72,13 +72,13 @@ struct RdmStation {
 /// station goes into [`StationRecord::accessibility`].
 const MODELED_KEYS: [&str; 4] = ["crsCode", "name", "location", "stationOperator"];
 
-/// One station as POSTed to `/private/stations`: the same wire shape as
+/// One station as `POSTed` to `/private/stations`: the same wire shape as
 /// `common::StationReference` (which `api` deserializes it as), but with
 /// the passthrough `accessibility` object held as `&RawValue` slices of
 /// the fetched response body rather than as a `serde_json::Value` tree.
 /// See [`parse_stations`] for why.
 #[derive(Debug, Serialize)]
-pub struct StationRecord<'a> {
+pub(crate) struct StationRecord<'a> {
     pub crs: String,
     pub name: String,
     pub latitude: Option<f64>,
@@ -106,7 +106,7 @@ struct StationsResponse<'a> {
 /// (which buffers the whole object again) and clone the flattened rest
 /// into a `StationReference` -- several full in-memory copies of the feed,
 /// each far larger than its JSON text. Peak RSS was ~320MB, and the pod
-/// was OOMKilled on every start once its limit was cut to 192Mi on
+/// was `OOMKilled` on every start once its limit was cut to 192Mi on
 /// 2026-09-26. Now nothing but the body itself and the serialized POST
 /// body is ever feed-sized: each station is kept as a `&RawValue` slice of
 /// `json`, the four modeled fields are parsed out of it, and the rest are
@@ -118,7 +118,7 @@ struct StationsResponse<'a> {
 /// per-station isolation `poller-ldbws` does for its own batch. A
 /// genuinely invalid JSON document still fails outright at the envelope
 /// parse, which is not recoverable per element.
-pub fn parse_stations(json: &[u8]) -> Result<Vec<StationRecord<'_>>> {
+pub(crate) fn parse_stations(json: &[u8]) -> Result<Vec<StationRecord<'_>>> {
     let response: StationsResponse<'_> = serde_json::from_slice(json)?;
     Ok(response
         .stations
@@ -201,8 +201,8 @@ mod tests {
         let euston = &stations[0];
         assert_eq!(euston.crs, "EUS");
         assert_eq!(euston.name, "London Euston");
-        assert_eq!(euston.latitude, Some(51.528308));
-        assert_eq!(euston.longitude, Some(-0.133541));
+        assert_eq!(euston.latitude, Some(51.528_308));
+        assert_eq!(euston.longitude, Some(-0.133_541));
         assert_eq!(euston.station_operator, Some("NR".to_string()));
 
         // Unmodeled `Station` fields must round-trip verbatim, not be
@@ -252,7 +252,7 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].crs, "EUS");
         assert_eq!(decoded[0].station_operator.as_deref(), Some("NR"));
-        assert_eq!(decoded[0].latitude, Some(51.528308));
+        assert_eq!(decoded[0].latitude, Some(51.528_308));
         assert_eq!(
             decoded[0].accessibility,
             serde_json::json!({
@@ -269,7 +269,7 @@ mod tests {
         );
     }
 
-    /// 2026-09-27 OOM: `poller-stations` was OOMKilled at its 192Mi limit
+    /// 2026-09-27 OOM: `poller-stations` was `OOMKilled` at its 192Mi limit
     /// on every start. Parsing the ~37MB live feed built several
     /// `serde_json::Value` copies of it (peak RSS ~320MB). Parsing plus
     /// serializing the POST body (what `reqwest`'s `.json()` does) must now

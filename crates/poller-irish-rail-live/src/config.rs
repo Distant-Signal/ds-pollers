@@ -22,7 +22,7 @@ use clap::Parser;
 /// own field names/`#[arg]` attributes are byte-for-byte what every poller
 /// already exposed individually).
 #[derive(Debug, Parser)]
-pub struct Config {
+pub(crate) struct Config {
     /// `api.irishrail.ie`'s legacy realtime ASMX service root -- real,
     /// key-free, confirmed reachable directly (friction doc section 1;
     /// re-confirmed live during this crate's own implementation:
@@ -43,7 +43,7 @@ pub struct Config {
     )]
     pub api_ingest_url: String,
 
-    /// Shared, non-secret OAuth2 client-credentials config (same value
+    /// Shared, non-secret `OAuth2` client-credentials config (same value
     /// across every real caller).
     #[command(flatten)]
     pub internal_oauth: common::oauth_client::InternalOAuthArgs,
@@ -112,7 +112,7 @@ mod tests {
     /// The only args every real deployment supplies -- `internal_oauth`'s 4
     /// required (no-default) fields. Everything else, including
     /// `station_codes_override`, is left unset so this exercises exactly
-    /// the "STATION_CODES_OVERRIDE absent" shape the Helm chart's
+    /// the "`STATION_CODES_OVERRIDE` absent" shape the Helm chart's
     /// conditional `{{- if .Values.pollerIrishRailLive.stationCodesOverride }}`
     /// produces in production.
     fn required_oauth_args() -> Vec<&'static str> {
