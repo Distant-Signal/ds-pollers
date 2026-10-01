@@ -2,7 +2,7 @@
 //!
 //! Each cycle samples stations one at a time until the 45 s
 //! `CYCLE_TIME_BUDGET` runs out, which in production is about 350-380 of
-//! the 560 sample stations. The list from `api` is sorted, so every cycle
+//! the 560 sample stations (2026-09-27; ~255-290 by 2026-10-01). The list from `api` is sorted, so every cycle
 //! used to start at "AAP" and stop around "RMD": S-Z were never sampled.
 //!
 //! Now each cycle starts where the previous one stopped (the first station
@@ -10,6 +10,12 @@
 //! requests per cycle is unchanged -- still whatever fits the budget -- so
 //! this adds no LDBWS request volume (LEG-18). A station is
 //! sampled at least once every `ceil(stations / per-cycle capacity)` cycles.
+//!
+//! A budget-cut cycle is therefore normal and only logged at debug.
+//! Instead, `main.rs` reports each full pass over the list (counted by
+//! [`Rotation::record_progress`]) with one info line and
+//! `ldbws_full_rotation_seconds`/`_cycles`, and warns only when a pass is
+//! slower than the aggregator's sample-age limit.
 //!
 //! The position survives list changes (it is kept as a CRS, not an index)
 //! but not restarts. A restart starts from a position derived from the wall
@@ -55,6 +61,27 @@ pub struct Rotation {
     /// last did. Excluded from [`Rotation::stalest_age`], and from the cycle
     /// until [`INVALID_CRS_REPROBE`] has passed.
     invalid: HashMap<String, Instant>,
+    /// Progress through the current full rotation: stations completed
+    /// since it began, over how many cycles, and when it began (the end of
+    /// the previous full rotation, or process start).
+    lap_completed: usize,
+    lap_cycles: u32,
+    lap_began: Instant,
+    /// Whether the stalest station was last reported older than the
+    /// aggregator's limit, so only changes are logged.
+    stale: bool,
+}
+
+/// One full pass over the station list, as reported by
+/// [`Rotation::record_progress`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullRotation {
+    /// Cycles the pass took (including the one that finished it).
+    pub cycles: u32,
+    /// From the end of the previous full pass (or process start) to the
+    /// end of the cycle that finished this one: roughly how long a station
+    /// waits between samples.
+    pub duration: Duration,
 }
 
 impl Rotation {
@@ -64,7 +91,46 @@ impl Rotation {
             last_sampled: HashMap::new(),
             started: now,
             invalid: HashMap::new(),
+            lap_completed: 0,
+            lap_cycles: 0,
+            lap_began: now,
+            stale: false,
         }
+    }
+
+    /// Records whether the stalest station is currently too old for the
+    /// aggregator, returning the new state only when it changed.
+    pub fn note_stale(&mut self, stale: bool) -> Option<bool> {
+        (std::mem::replace(&mut self.stale, stale) != stale).then_some(stale)
+    }
+
+    /// Counts one cycle that completed `completed` of the `total` stations
+    /// it was given. Returns the finished pass once the stations completed
+    /// since the last one add up to the whole list; any overshoot counts
+    /// towards the next pass.
+    pub fn record_progress(
+        &mut self,
+        total: usize,
+        completed: usize,
+        now: Instant,
+    ) -> Option<FullRotation> {
+        if total == 0 {
+            return None;
+        }
+        self.lap_completed += completed;
+        self.lap_cycles += 1;
+        if self.lap_completed < total {
+            return None;
+        }
+        let full = FullRotation {
+            cycles: self.lap_cycles,
+            duration: now.saturating_duration_since(self.lap_began),
+        };
+        // `completed <= total`, so at most one pass finishes per cycle.
+        self.lap_completed = (self.lap_completed - total).min(total - 1);
+        self.lap_cycles = 0;
+        self.lap_began = now;
+        Some(full)
     }
 
     /// `stations` (sorted and deduplicated here, so the order does not
@@ -384,6 +450,78 @@ mod tests {
         assert_eq!(recovered, vec![bad.clone()]);
         assert!(rotation.invalid_stations().is_empty());
         assert_eq!(rotation.pollable(&all, due), all);
+    }
+
+    /// Production's shape (2026-10-01): ~255 of 560 stations per 60 s
+    /// cycle. A pass finishes every 3 cycles, then every 2 or 3 as the
+    /// overshoot carries over, and its duration is the time since the last.
+    #[test]
+    fn full_rotations_are_reported_as_the_completed_counts_add_up() {
+        let started = Instant::now();
+        let mut rotation = Rotation::new(started);
+        let at = |cycle: u64| started + Duration::from_secs(60 * cycle);
+        let passes: Vec<(u64, FullRotation)> = (1..=7)
+            .filter_map(|cycle| {
+                rotation
+                    .record_progress(560, 255, at(cycle))
+                    .map(|full| (cycle, full))
+            })
+            .collect();
+        let minute = |n: u64| Duration::from_secs(60 * n);
+        assert_eq!(
+            passes,
+            vec![
+                // 765 >= 560, 205 carried over
+                (
+                    3,
+                    FullRotation {
+                        cycles: 3,
+                        duration: minute(3)
+                    }
+                ),
+                // 205 + 510 = 715, 155 carried
+                (
+                    5,
+                    FullRotation {
+                        cycles: 2,
+                        duration: minute(2)
+                    }
+                ),
+                // 155 + 510 = 665
+                (
+                    7,
+                    FullRotation {
+                        cycles: 2,
+                        duration: minute(2)
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_list_or_a_cycle_with_no_progress_finishes_nothing() {
+        let started = Instant::now();
+        let mut rotation = Rotation::new(started);
+        assert_eq!(rotation.record_progress(0, 0, started), None);
+        assert_eq!(rotation.record_progress(5, 0, started), None);
+        let end = started + Duration::from_secs(120);
+        assert_eq!(
+            rotation.record_progress(5, 5, end),
+            Some(FullRotation {
+                cycles: 2,
+                duration: Duration::from_secs(120)
+            })
+        );
+    }
+
+    #[test]
+    fn staleness_is_only_reported_when_it_changes() {
+        let mut rotation = Rotation::new(Instant::now());
+        assert_eq!(rotation.note_stale(false), None);
+        assert_eq!(rotation.note_stale(true), Some(true));
+        assert_eq!(rotation.note_stale(true), None);
+        assert_eq!(rotation.note_stale(false), Some(false));
     }
 
     /// Fixing the catalogue drops the station from api's list; the invalid

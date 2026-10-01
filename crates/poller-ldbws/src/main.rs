@@ -211,6 +211,7 @@ async fn poll_once(
         completed,
         skipped_for_budget,
         invalid_crs,
+        cut_short: _,
     } = sample_stations_within_budget(
         client,
         config,
@@ -236,12 +237,9 @@ async fn poll_once(
     for (crs, body) in &invalid_crs {
         record_invalid_crs(rotation, crs, body, now);
     }
-    record_cycle_metrics(
-        ordered.len(),
-        completed,
-        samples.len(),
-        rotation.stalest_age(&ordered, now),
-    );
+    let stalest = rotation.stalest_age(&ordered, now);
+    record_cycle_metrics(ordered.len(), completed, samples.len(), stalest);
+    record_rotation_progress(rotation, polled.len(), completed, stalest, now);
 
     if samples.is_empty() {
         tracing::warn!("no station samples collected this cycle; nothing to post");
@@ -277,6 +275,65 @@ fn record_cycle_metrics(total: usize, completed: usize, sampled: usize, stalest:
         "ldbws_stalest_station_age_seconds"
     ))
     .set(stalest.as_secs_f64());
+}
+
+/// The aggregator's [`common::STATION_SAMPLE_MAX_AGE_MINUTES`], the age at
+/// which it stops using a station's sample.
+const AGGREGATOR_MAX_SAMPLE_AGE: Duration =
+    Duration::from_secs(60 * common::STATION_SAMPLE_MAX_AGE_MINUTES as u64);
+
+/// Logs and exports the rotation's progress. A cycle cut short by the time
+/// budget is normal (the next cycle carries on from there; see `rotation`),
+/// so it is only logged at debug. Instead there is one info line per full
+/// pass over the list, plus `ldbws_full_rotation_seconds` and
+/// `ldbws_full_rotation_cycles`. Warnings are kept for the case that
+/// matters: a pass slower than the aggregator's sample-age limit, or a
+/// station not sampled for longer than that limit, so the aggregator is
+/// dropping it.
+fn record_rotation_progress(
+    rotation: &mut Rotation,
+    total: usize,
+    completed: usize,
+    stalest: Duration,
+    now: std::time::Instant,
+) {
+    if let Some(full) = rotation.record_progress(total, completed, now) {
+        metrics::gauge!(common::metrics::metric_name("ldbws_full_rotation_seconds"))
+            .set(full.duration.as_secs_f64());
+        metrics::gauge!(common::metrics::metric_name("ldbws_full_rotation_cycles"))
+            .set(f64::from(full.cycles));
+        if full.duration > AGGREGATOR_MAX_SAMPLE_AGE {
+            tracing::warn!(
+                stations_total = total,
+                cycles = full.cycles,
+                rotation_secs = full.duration.as_secs(),
+                max_sample_age_secs = AGGREGATOR_MAX_SAMPLE_AGE.as_secs(),
+                "a full LDBWS station rotation took longer than the aggregator's sample-age \
+                 limit, so stations go stale between samples; see \
+                 ldbws_stations_attempted_per_cycle"
+            );
+        } else {
+            tracing::info!(
+                stations_total = total,
+                cycles = full.cycles,
+                rotation_secs = full.duration.as_secs(),
+                "completed a full LDBWS station rotation"
+            );
+        }
+    }
+    match rotation.note_stale(stalest > AGGREGATOR_MAX_SAMPLE_AGE) {
+        Some(true) => tracing::warn!(
+            stalest_age_secs = stalest.as_secs(),
+            max_sample_age_secs = AGGREGATOR_MAX_SAMPLE_AGE.as_secs(),
+            "an LDBWS station has gone unsampled for longer than the aggregator's sample-age \
+             limit; the aggregator now ignores it (ldbws_stalest_station_age_seconds)"
+        ),
+        Some(false) => tracing::info!(
+            stalest_age_secs = stalest.as_secs(),
+            "every LDBWS station is within the aggregator's sample-age limit again"
+        ),
+        None => {}
+    }
 }
 
 /// `ldbws_invalid_crs_station{crs}`: 1 while LDBWS rejects `crs` as an
@@ -348,15 +405,17 @@ struct CycleSampling {
     /// response body -- a permanent error, handled apart from the
     /// transient failures that are just logged and retried next time.
     invalid_crs: Vec<(String, String)>,
+    /// The time budget ran out before every station was attempted. The
+    /// normal case in production: the next cycle carries on from here.
+    cut_short: bool,
 }
 
 /// Samples every station in `stations`, but never for longer than
 /// `budget` in total: if the per-station loop (see `sample_all_stations`)
 /// hasn't finished within `budget`, it's aborted in place and whatever
-/// samples were already collected are returned as-is, with a warning
-/// logged. `budget` is a parameter (rather than reading `CYCLE_TIME_BUDGET`
-/// directly) purely so tests can exercise the timeout path with a budget
-/// measured in milliseconds instead of `CYCLE_TIME_BUDGET`'s real 45s.
+/// samples were already collected are returned as-is, with `cut_short`
+/// set. This is [`sample_stations_until`] with a `budget`-long sleep as its
+/// cut-off.
 ///
 /// `request_budget` is the separate, optional hourly request budget: when
 /// it refuses a station, the rest of the list is skipped for this cycle
@@ -369,41 +428,74 @@ async fn sample_stations_within_budget(
     stations: &[String],
     budget: Duration,
 ) -> CycleSampling {
+    sample_stations_until(
+        client,
+        config,
+        platform_history,
+        request_budget,
+        stations,
+        tokio::time::sleep(budget),
+    )
+    .await
+}
+
+/// Samples `stations` in order until every one has been attempted or
+/// `cutoff` resolves, whichever comes first. Production passes a
+/// `CYCLE_TIME_BUDGET` sleep (through [`sample_stations_within_budget`]).
+/// Tests pass a cut-off they fire themselves, so how many stations a cut
+/// cycle completed does not depend on wall-clock timing or machine load.
+///
+/// `cutoff` is polled first (`biased`): once it is ready the loop stops
+/// there, even if a station's response arrived at the same moment.
+async fn sample_stations_until(
+    client: &Client,
+    config: &Config,
+    platform_history: &mut PlatformHistory,
+    request_budget: &mut RequestBudget,
+    stations: &[String],
+    cutoff: impl std::future::Future<Output = ()>,
+) -> CycleSampling {
     let mut sampling = CycleSampling {
         samples: Vec::with_capacity(stations.len()),
         completed: 0,
         skipped_for_budget: None,
         invalid_crs: Vec::new(),
+        cut_short: false,
     };
-    let outcome = tokio::time::timeout(
-        budget,
-        sample_all_stations(
+    sampling.cut_short = {
+        let work = sample_all_stations(
             client,
             config,
             platform_history,
             request_budget,
             stations,
             &mut sampling,
-        ),
-    )
-    .await;
+        );
+        tokio::select! {
+            biased;
+            () = cutoff => true,
+            () = work => false,
+        }
+    };
 
-    if outcome.is_err() {
-        tracing::warn!(
+    if sampling.cut_short {
+        // Debug, not warn: this is every production cycle (~255 of 560
+        // stations fit the budget) and the rotation is designed around it.
+        // `record_rotation_progress` reports per full pass instead.
+        tracing::debug!(
             stations_total = stations.len(),
+            stations_completed = sampling.completed,
             stations_sampled = sampling.samples.len(),
-            budget_secs = budget.as_secs_f64(),
-            "per-cycle station-sampling time budget exceeded; moving on with what was \
-             collected so far rather than blocking this and every subsequent cycle \
-             (the next cycle starts where this one stopped)"
+            "per-cycle station-sampling time budget reached; the next cycle starts where \
+             this one stopped"
         );
     }
 
     sampling
 }
 
-/// The per-station loop itself, extracted so `sample_stations_within_budget`
-/// can wrap it in `tokio::time::timeout` -- when the timeout fires, this
+/// The per-station loop itself, extracted so `sample_stations_until` can
+/// race it against its cut-off -- when the cut-off fires, this
 /// future (and its local state) is dropped mid-iteration, but every sample
 /// already pushed into the caller-owned `samples` accumulator before that
 /// point survives, since it's a `&mut` borrow of state the caller owns,
@@ -1015,25 +1107,53 @@ mod tests {
         );
     }
 
+    /// Answers every board request, and fires `cutoff` when a cycle's
+    /// `per_cycle + 1`th request arrives: the budget "runs out" while that
+    /// station is in flight, exactly `per_cycle` stations into every cycle.
+    struct CutAfter {
+        per_cycle: usize,
+        received: std::sync::atomic::AtomicUsize,
+        cutoff: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl wiremock::Respond for CutAfter {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            let index = self
+                .received
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if index % (self.per_cycle + 1) == self.per_cycle {
+                // Stored as a permit before this response is even sent, so
+                // the loop's biased select sees the cut-off first.
+                self.cutoff.notify_one();
+            }
+            ResponseTemplate::new(200).set_body_string(ONE_SERVICE_BODY)
+        }
+    }
+
     /// SVC-04 end to end through the real budgeted loop: a budget that fits
-    /// about two of five slow stations per cycle still reaches all five
-    /// within ceil(5 / 2) = 3 cycles, each cycle attempting the same number
-    /// of stations it did before rotation.
+    /// two of five stations per cycle still reaches all five within
+    /// ceil(5 / 2) = 3 cycles, each cycle attempting the same number of
+    /// stations it did before rotation.
+    ///
+    /// The budget is a cut-off the mock server fires on each cycle's third
+    /// request, not a wall-clock timeout: the old 500 ms budget over 200 ms
+    /// responses completed only one station in a cycle on a loaded machine.
     #[tokio::test]
     async fn rotation_reaches_every_station_across_budget_cut_cycles() {
         let server = MockServer::start().await;
+        let cutoff = std::sync::Arc::new(tokio::sync::Notify::new());
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex(
+                "^/GetDepBoardWithDetails/[A-Z]{3}$",
+            ))
+            .respond_with(CutAfter {
+                per_cycle: 2,
+                received: std::sync::atomic::AtomicUsize::new(0),
+                cutoff: std::sync::Arc::clone(&cutoff),
+            })
+            .mount(&server)
+            .await;
         let names = ["AAA", "BBB", "CCC", "DDD", "EEE"];
-        for crs in names {
-            Mock::given(method("GET"))
-                .and(path(format!("/GetDepBoardWithDetails/{crs}")))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_string(ONE_SERVICE_BODY)
-                        .set_delay(Duration::from_millis(200)),
-                )
-                .mount(&server)
-                .await;
-        }
         let config = test_config(server.uri(), 10);
         let client = Client::new();
         let stations: Vec<String> = names.iter().map(|s| s.to_string()).collect();
@@ -1045,16 +1165,20 @@ mod tests {
         for cycle in 0..3u64 {
             let ordered = rotation.order(&stations, cycle * 60, 60);
             let CycleSampling {
-                samples, completed, ..
-            } = sample_stations_within_budget(
+                samples,
+                completed,
+                cut_short,
+                ..
+            } = sample_stations_until(
                 &client,
                 &config,
                 &mut history,
                 &mut RequestBudget::unlimited(),
                 &ordered,
-                Duration::from_millis(500),
+                cutoff.notified(),
             )
             .await;
+            assert!(cut_short, "cycle {cycle} ran out of budget");
             rotation.finish_cycle(
                 &ordered,
                 completed,
@@ -1359,6 +1483,36 @@ mod tests {
             handle
                 .render()
                 .contains(r#"distant_signal_ldbws_invalid_crs_station{crs="ANV"} 0"#)
+        );
+    }
+
+    /// A full pass is exported once it completes; cycles in between leave
+    /// the gauges at the previous pass.
+    #[test]
+    fn a_full_rotation_is_exported_when_it_completes() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let started = std::time::Instant::now();
+        let mut rotation = Rotation::new(started);
+        metrics::with_local_recorder(&recorder, || {
+            for cycle in 1..=2u64 {
+                let now = started + Duration::from_secs(60 * cycle);
+                record_rotation_progress(&mut rotation, 560, 255, Duration::ZERO, now);
+            }
+        });
+        assert!(!handle.render().contains("full_rotation"));
+        metrics::with_local_recorder(&recorder, || {
+            let now = started + Duration::from_secs(180);
+            record_rotation_progress(&mut rotation, 560, 255, Duration::ZERO, now);
+        });
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("distant_signal_ldbws_full_rotation_seconds 180"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("distant_signal_ldbws_full_rotation_cycles 3"),
+            "{rendered}"
         );
     }
 
