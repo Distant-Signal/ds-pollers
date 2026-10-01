@@ -189,7 +189,8 @@ async fn poll_once(
     request_budget: &mut RequestBudget,
     internal_oauth: &common::oauth_client::OAuthTokenCache,
 ) -> anyhow::Result<()> {
-    let stations = fetch_sample_stations(client, config, internal_oauth).await?;
+    let stations =
+        well_formed_stations(fetch_sample_stations(client, config, internal_oauth).await?);
     tracing::info!(count = stations.len(), "fetched station list to sample");
 
     // SVC-04: start where the previous cycle stopped, so the budget no
@@ -457,6 +458,32 @@ async fn fetch_sample_stations(
     common::ingest::get_json(client, &url, tokens).await
 }
 
+/// Keeps only stations that are exactly three ASCII letters (uppercased,
+/// first occurrence kept), warning about and skipping anything else.
+///
+/// Defence in depth for M3 (2026-09-26 review): each station is spliced
+/// into a `GetDepBoardWithDetails/{crs}` URL path sent with the org's RDM
+/// key. `api` validates custom-line stations at write time and normalises
+/// the list it serves, but this poller should not depend on that: a row
+/// written before the validation existed, or any future bug upstream,
+/// must not be able to put `/`, `?` or other URL-structuring characters
+/// into that path.
+fn well_formed_stations(stations: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::with_capacity(stations.len());
+    stations
+        .into_iter()
+        .filter_map(|crs| {
+            if crs.len() == 3 && crs.bytes().all(|b| b.is_ascii_alphabetic()) {
+                Some(crs.to_ascii_uppercase())
+            } else {
+                tracing::warn!(crs = ?crs, "skipping sample station that is not a 3-letter CRS code");
+                None
+            }
+        })
+        .filter(|crs| seen.insert(crs.clone()))
+        .collect()
+}
+
 /// `api_sample_stations_url` plus the LEG-18 station-set knobs as query
 /// parameters. With neither knob set it is returned unchanged, so `api`
 /// sees exactly the request it always has.
@@ -688,6 +715,21 @@ async fn fetch_departures(
                 tokio::time::sleep(NUMROWS_RETRY_DELAY).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod well_formed_station_tests {
+    use super::well_formed_stations;
+
+    #[test]
+    fn keeps_three_letter_codes_and_skips_everything_else() {
+        let input = [
+            "WOK", "wok", " CLJ", "WA/", "WA", "WATX", "W?T", "\u{c4}BC", "", "clj", "PAD",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(well_formed_stations(input), vec!["WOK", "CLJ", "PAD"]);
     }
 }
 
