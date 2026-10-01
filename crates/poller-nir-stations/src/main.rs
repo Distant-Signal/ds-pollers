@@ -22,12 +22,14 @@ use reqwest::Client;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    common::logging::exit_code(run().await)
+}
+
+async fn run() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    common::logging::init("poller-nir-stations");
 
     let config = Config::parse();
     let progress = health_http::spawn_liveness(&config.health);
