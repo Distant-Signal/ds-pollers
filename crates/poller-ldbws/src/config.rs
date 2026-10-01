@@ -216,7 +216,7 @@ mod chart_env_wiring_tests {
 
     #[test]
     fn every_volume_knob_is_wired_into_the_poller_template() {
-        let template = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let template = common::manifest_dir!()
             .join("../../charts/distant-signal/templates/poller-deployments.yaml");
         let rendered = std::fs::read_to_string(&template)
             .unwrap_or_else(|err| panic!("read {}: {err}", template.display()));
