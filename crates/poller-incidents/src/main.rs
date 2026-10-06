@@ -61,15 +61,31 @@ async fn poll_once(
     internal_oauth: &common::oauth_client::OAuthTokenCache,
 ) -> anyhow::Result<()> {
     let body = fetch_incidents_xml(client, config).await?;
-    let incidents = schema::parse_incidents(&body)?;
+    let parsed = schema::parse_incidents(&body)?;
 
-    tracing::info!(count = incidents.len(), "parsed incidents from RDM feed");
+    tracing::info!(
+        count = parsed.incidents.len(),
+        skipped = parsed.skipped,
+        document_closed = parsed.document_closed,
+        complete = parsed.complete(),
+        "parsed incidents from RDM feed"
+    );
+    metrics::counter!(common::metrics::metric_name(
+        "poller_incidents_skipped_elements_total"
+    ))
+    .increment(parsed.skipped);
 
-    ingest::post_batch_retrying(
+    // The whole feed, with whether it IS the whole feed: the api infers
+    // "no longer listed" only from complete snapshots (see
+    // `common::IncidentSnapshot`). An api older than this body rejects it
+    // with a 4xx, which fails just this cycle -- deploy the api first.
+    let snapshot = parsed.into_snapshot();
+    ingest::post_counted_retrying(
         client,
         &config.api_ingest_url,
         internal_oauth,
-        &incidents,
+        &snapshot,
+        snapshot.incidents.len(),
         "incidents",
         common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
     )

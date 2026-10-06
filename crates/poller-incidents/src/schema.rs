@@ -121,9 +121,54 @@ impl From<&PtIncident> for IncidentMessage {
 /// each `<PtIncident>` element and deserializes it independently, skipping
 /// (and logging) just the malformed ones -- mirroring the per-station
 /// isolation `poller-ldbws` already does for its own batch of stations.
-pub(crate) fn parse_incidents(xml: &str) -> Result<Vec<IncidentMessage>> {
-    let incidents: Vec<PtIncident> = parse_repeated_elements(xml, "PtIncident")?;
-    Ok(incidents.iter().map(IncidentMessage::from).collect())
+/// The skips are counted, so the snapshot can say it is incomplete.
+pub(crate) fn parse_incidents(xml: &str) -> Result<ParsedIncidents> {
+    let parsed: RepeatedElements<PtIncident> = parse_repeated_elements(xml, "PtIncident")?;
+    Ok(ParsedIncidents {
+        incidents: parsed.items.iter().map(IncidentMessage::from).collect(),
+        skipped: parsed.skipped,
+        document_closed: parsed.document_closed,
+    })
+}
+
+/// One parsed feed document: the incidents, and whether that is ALL of the
+/// feed. See [`common::IncidentSnapshot`] for why the api needs to know.
+#[derive(Debug)]
+pub(crate) struct ParsedIncidents {
+    pub incidents: Vec<IncidentMessage>,
+    /// `<PtIncident>` elements skipped as malformed.
+    pub skipped: u64,
+    /// The document's root element closed before EOF. A body cut off
+    /// between two complete `<PtIncident>`s is otherwise indistinguishable
+    /// from a shorter feed: every element in it parses.
+    pub document_closed: bool,
+}
+
+impl ParsedIncidents {
+    /// Every incident in the document is here: nothing was skipped and the
+    /// document was not cut short. Only such a snapshot lets the api infer
+    /// that an incident it no longer lists has left the feed.
+    pub(crate) fn complete(&self) -> bool {
+        self.skipped == 0 && self.document_closed
+    }
+
+    pub(crate) fn into_snapshot(self) -> common::IncidentSnapshot {
+        let complete = self.complete();
+        common::IncidentSnapshot {
+            incidents: self.incidents,
+            complete,
+            skipped: self.skipped,
+        }
+    }
+}
+
+/// What [`parse_repeated_elements`] found.
+struct RepeatedElements<T> {
+    items: Vec<T>,
+    /// Elements that were well-formed XML but did not deserialize as `T`.
+    skipped: u64,
+    /// A wrapping root element was opened and closed again before EOF.
+    document_closed: bool,
 }
 
 /// Isolates every top-level `<{tag_name}>...</{tag_name}>` element in `xml`
@@ -142,7 +187,13 @@ pub(crate) fn parse_incidents(xml: &str) -> Result<Vec<IncidentMessage>> {
 /// `quick_xml::de::from_str::<T>`. This only fails the WHOLE parse if the
 /// document isn't well-formed XML at all (a genuinely unrecoverable input,
 /// same as before); a single element that's well-formed XML but doesn't
-/// match `T`'s shape is skipped on its own.
+/// match `T`'s shape is skipped on its own, and counted.
+///
+/// Also tracks element depth outside the isolated elements, to report
+/// whether the wrapping root element (`<Incidents>`) was closed: a body
+/// truncated just after a complete element would otherwise read as a
+/// valid, merely shorter, document. A document with no wrapper at all
+/// never counts as closed (conservative: it is not the feed's shape).
 #[expect(
     clippy::cast_possible_truncation,
     reason = "byte offsets into an in-memory document fit in usize"
@@ -150,14 +201,19 @@ pub(crate) fn parse_incidents(xml: &str) -> Result<Vec<IncidentMessage>> {
 fn parse_repeated_elements<T: serde::de::DeserializeOwned>(
     xml: &str,
     tag_name: &str,
-) -> Result<Vec<T>> {
+) -> Result<RepeatedElements<T>> {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
 
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let tag_bytes = tag_name.as_bytes();
-    let mut items = Vec::new();
+    let mut parsed = RepeatedElements {
+        items: Vec::new(),
+        skipped: 0,
+        document_closed: false,
+    };
+    let mut depth: u32 = 0;
 
     loop {
         let start_pos = reader.buffer_position() as usize;
@@ -168,7 +224,7 @@ fn parse_repeated_elements<T: serde::de::DeserializeOwned>(
             Event::Eof => break,
             Event::Empty(e) if e.name().as_ref() == tag_bytes => {
                 let end_pos = reader.buffer_position() as usize;
-                deserialize_fragment_or_warn(&mut items, &xml[start_pos..end_pos], tag_name);
+                deserialize_fragment_or_warn(&mut parsed, &xml[start_pos..end_pos], tag_name);
             }
             Event::Start(e) if e.name().as_ref() == tag_bytes => {
                 let end_tag = e.to_end().into_owned();
@@ -184,23 +240,36 @@ fn parse_repeated_elements<T: serde::de::DeserializeOwned>(
                     ));
                 }
                 let end_pos = reader.buffer_position() as usize;
-                deserialize_fragment_or_warn(&mut items, &xml[start_pos..end_pos], tag_name);
+                deserialize_fragment_or_warn(&mut parsed, &xml[start_pos..end_pos], tag_name);
             }
+            Event::Start(_) => depth += 1,
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    parsed.document_closed = true;
+                }
+            }
+            // A self-closing root (`<Incidents/>`): an empty, but whole, feed.
+            Event::Empty(_) if depth == 0 => parsed.document_closed = true,
             _ => {}
         }
     }
 
-    Ok(items)
+    if depth > 0 {
+        parsed.document_closed = false;
+    }
+    Ok(parsed)
 }
 
 fn deserialize_fragment_or_warn<T: serde::de::DeserializeOwned>(
-    items: &mut Vec<T>,
+    parsed: &mut RepeatedElements<T>,
     fragment: &str,
     tag_name: &str,
 ) {
     match quick_xml::de::from_str::<T>(fragment) {
-        Ok(item) => items.push(item),
+        Ok(item) => parsed.items.push(item),
         Err(err) => {
+            parsed.skipped += 1;
             tracing::warn!(
                 tag = tag_name,
                 error = %err,
@@ -251,7 +320,12 @@ mod tests {
 
     #[test]
     fn parses_sample_incident_and_maps_every_field() {
-        let messages = parse_incidents(SAMPLE_XML).expect("sample XML should parse");
+        let parsed = parse_incidents(SAMPLE_XML).expect("sample XML should parse");
+        assert!(
+            parsed.complete(),
+            "a whole, clean document is a complete snapshot"
+        );
+        let messages = parsed.incidents;
         assert_eq!(messages.len(), 1);
         let message = &messages[0];
 
@@ -314,7 +388,9 @@ mod tests {
             </Incidents>
         ";
 
-        let messages = parse_incidents(xml).expect("sample XML should parse");
+        let messages = parse_incidents(xml)
+            .expect("sample XML should parse")
+            .incidents;
         assert_eq!(messages.len(), 1);
         assert!(!messages[0].is_cleared);
         assert!(messages[0].is_planned);
@@ -363,8 +439,9 @@ mod tests {
             </Incidents>
         ";
 
-        let messages = parse_incidents(xml)
+        let parsed = parse_incidents(xml)
             .expect("one malformed incident must not fail the whole batch parse");
+        let messages = &parsed.incidents;
         assert_eq!(
             messages.len(),
             2,
@@ -372,6 +449,80 @@ mod tests {
         );
         let ids: Vec<&str> = messages.iter().map(|m| m.incident_id.as_str()).collect();
         assert_eq!(ids, vec!["GOOD-1", "GOOD-2"]);
+        // ...but the snapshot must say it is not the whole feed: BAD-1 is
+        // still listed upstream, and the api must not infer it has gone.
+        assert_eq!(parsed.skipped, 1);
+        assert!(!parsed.complete());
+        let snapshot = parsed.into_snapshot();
+        assert!(!snapshot.complete);
+        assert_eq!(snapshot.skipped, 1);
+        assert_eq!(snapshot.incidents.len(), 2);
+    }
+
+    const ONE_GOOD_INCIDENT: &str = r"
+                <PtIncident>
+                    <IncidentNumber>GOOD-1</IncidentNumber>
+                    <Summary>Signal failure at Reading</Summary>
+                    <Description>Disruption caused by a signal failure.</Description>
+                    <Planned>false</Planned>
+                    <ValidityPeriod>
+                        <StartTime>2026-07-01T08:00:00Z</StartTime>
+                    </ValidityPeriod>
+                    <IncidentPriority>2</IncidentPriority>
+                </PtIncident>";
+
+    #[test]
+    fn a_clean_document_is_a_complete_snapshot() {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><Incidents>{ONE_GOOD_INCIDENT}</Incidents>"
+        );
+        let snapshot = parse_incidents(&xml).expect("parses").into_snapshot();
+        assert!(snapshot.complete);
+        assert_eq!(snapshot.skipped, 0);
+        assert_eq!(snapshot.incidents.len(), 1);
+    }
+
+    #[test]
+    fn a_body_cut_off_between_elements_is_not_complete() {
+        // Every element that arrived parses, so only the missing
+        // `</Incidents>` tells this apart from a genuinely shorter feed.
+        let xml = format!("<Incidents>{ONE_GOOD_INCIDENT}");
+        let parsed = parse_incidents(&xml).expect("the elements that arrived still parse");
+        assert_eq!(parsed.incidents.len(), 1);
+        assert_eq!(parsed.skipped, 0);
+        assert!(!parsed.document_closed);
+        assert!(!parsed.complete());
+    }
+
+    #[test]
+    fn an_empty_feed_is_complete_but_empty() {
+        // Complete as a document; the api's own guard refuses to infer
+        // removals from an empty snapshot regardless.
+        for xml in ["<Incidents></Incidents>", "<Incidents/>"] {
+            let parsed = parse_incidents(xml).expect("parses");
+            assert!(parsed.incidents.is_empty(), "{xml}");
+            assert!(parsed.complete(), "{xml}");
+        }
+    }
+
+    #[test]
+    fn a_document_with_no_wrapper_is_not_complete() {
+        let parsed = parse_incidents(ONE_GOOD_INCIDENT).expect("parses");
+        assert_eq!(parsed.incidents.len(), 1);
+        assert!(
+            !parsed.complete(),
+            "not the feed's shape: never trusted as whole"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_serializes_with_its_completeness() {
+        let xml = format!("<Incidents>{ONE_GOOD_INCIDENT}</Incidents>");
+        let snapshot = parse_incidents(&xml).expect("parses").into_snapshot();
+        let json = serde_json::to_value(&snapshot).expect("serializes");
+        assert_eq!(json["complete"], true);
+        assert_eq!(json["skipped"], 0);
+        assert_eq!(json["incidents"][0]["incident_id"], "GOOD-1");
     }
 
     #[test]
