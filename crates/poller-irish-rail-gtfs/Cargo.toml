@@ -10,7 +10,7 @@ health-http = { path = "../health-http" }
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 common = { path = "../common" }
-dotenv = "0.15.0"
+dotenvy = "0.15.7"
 gtfs-structures = "0.50"
 metrics = "0.24"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls", "gzip"] }

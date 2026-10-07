@@ -96,7 +96,7 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> anyhow::Result<()> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     common::logging::init("poller-ldbws");
 
