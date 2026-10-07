@@ -1,0 +1,17 @@
+ds-store v0.1.0 (/repo/crates/ds-store)
+anyhow v1.0.104
+chrono v0.4.45
+iana-time-zone v0.1.65
+common v0.1.0 (/repo/crates/common)
+anyhow v1.0.104
+chrono v0.4.45 (*)
+metrics v0.24.3
+sqlx v0.8.6
+sqlx-core v0.8.6
+tokio v1.52.3
+tokio v1.52.3 (*)
+tracing v0.1.44
+trust-schema v0.1.0 (/repo/crates/trust-schema)
+serde v1.0.229
+towerish v1.0.0
+apis v0.2.0

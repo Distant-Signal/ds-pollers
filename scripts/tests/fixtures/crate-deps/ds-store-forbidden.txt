@@ -1,0 +1,20 @@
+ds-store v0.1.0 (/repo/crates/ds-store)
+anyhow v1.0.104
+common v0.1.0 (/repo/crates/common)
+metrics-exporter-prometheus v0.18.1
+hyper v1.11.1
+hyper-util v0.1.20
+tower-service v0.3.3
+hyper v1.11.1 (*)
+reqwest v0.13.4
+hyper v1.11.1 (*)
+hyper-tls v0.6.0
+redis v0.27.6
+sqlx v0.8.6
+
+api v0.1.0 (/repo/crates/api)
+axum v0.8.9
+axum-core v0.5.2
+tower v0.5.3
+oauth2 v5.0.0
+openidconnect v4.0.1
