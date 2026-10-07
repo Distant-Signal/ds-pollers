@@ -7,7 +7,8 @@ Ingest architecture spec §5.1: `ds-store` is the shared data-access crate
 that every ingest service links, so it must never pull in a web framework,
 an HTTP client, Redis or the api itself. Its NORMAL dependency closure
 (build and dev dependencies do not count) must not contain axum*, tower*,
-hyper*, redis, reqwest, oauth2, openidconnect or api.
+hyper*, redis, reqwest, oauth2, openidconnect or api. The same holds for
+`ds-migrate`, the migrator binary (plan 1B.1), which links only ds-store.
 
 The closure comes from
 
@@ -39,17 +40,20 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # crate -> the patterns (full matches on package names) its normal
 # dependency closure must not contain.
+# No web framework, HTTP client, Redis or api (spec §5.1).
+NO_SERVER_STACK = (
+    r"axum(-.+)?",
+    r"tower(-.+)?",
+    r"hyper(-.+)?",
+    "redis",
+    "reqwest",
+    "oauth2",
+    "openidconnect",
+    "api",
+)
 FORBIDDEN: Mapping[str, Sequence[str]] = {
-    "ds-store": (
-        r"axum(-.+)?",
-        r"tower(-.+)?",
-        r"hyper(-.+)?",
-        "redis",
-        "reqwest",
-        "oauth2",
-        "openidconnect",
-        "api",
-    ),
+    "ds-store": NO_SERVER_STACK,
+    "ds-migrate": NO_SERVER_STACK,
 }
 
 

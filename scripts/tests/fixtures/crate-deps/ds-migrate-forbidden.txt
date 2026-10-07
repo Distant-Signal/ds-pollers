@@ -1,0 +1,6 @@
+ds-migrate v0.1.0 (/repo/crates/ds-migrate)
+anyhow v1.0.104
+api v0.1.0 (/repo/crates/api)
+axum v0.8.4
+ds-store v0.1.0 (/repo/crates/ds-store)
+sqlx v0.8.6

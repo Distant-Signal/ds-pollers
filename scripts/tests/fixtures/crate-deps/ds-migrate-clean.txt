@@ -1,0 +1,9 @@
+ds-migrate v0.1.0 (/repo/crates/ds-migrate)
+anyhow v1.0.104
+clap v4.6.6
+common v0.1.0 (/repo/crates/common)
+ds-store v0.1.0 (/repo/crates/ds-store)
+sqlx v0.8.6
+sqlx-core v0.8.6
+tokio v1.52.3
+tracing v0.1.44

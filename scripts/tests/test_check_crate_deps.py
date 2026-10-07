@@ -5,7 +5,8 @@
 The fixtures in fixtures/crate-deps/ are `cargo tree --prefix none
 --format {p}` outputs: a clean ds-store closure, one holding every
 forbidden crate (through common's HTTP features and the api), and one
-whose root is the wrong crate.
+whose root is the wrong crate; and ds-migrate closures, clean and not,
+so `main` never runs cargo here.
 """
 
 import importlib.util
@@ -34,11 +35,22 @@ def _load() -> ModuleType:
 deps = _load()
 
 
-def run(fixture: str) -> tuple[int, str]:
-    """Run main on a fixture as ds-store's tree; return (status, stdout)."""
+def run(fixture: str, crate: str = "ds-store") -> tuple[int, str]:
+    """Run main on a fixture as CRATE's tree (the others clean); (status, stdout)."""
+    clean = {
+        "ds-store": FIXTURES / "ds-store-clean.txt",
+        "ds-migrate": FIXTURES / "ds-migrate-clean.txt",
+    }
+    trees = {**clean, crate: FIXTURES / fixture}
     out = io.StringIO()
     with redirect_stdout(out):
-        status = deps.main(["--tree-file", f"ds-store={FIXTURES / fixture}"])
+        status = deps.main(
+            [
+                arg
+                for name, path in trees.items()
+                for arg in ("--tree-file", f"{name}={path}")
+            ]
+        )
     return status, out.getvalue()
 
 
@@ -96,7 +108,21 @@ class MainTest(unittest.TestCase):
         status, out = run("ds-store-clean.txt")
         self.assertEqual(status, 0, out)
         self.assertIn("ds-store: 14 packages in the normal closure", out)
+        self.assertIn("ds-migrate: 9 packages in the normal closure", out)
         self.assertNotIn("::error::", out)
+
+    def test_ds_migrate_is_checked_too(self) -> None:
+        """The migrator has the same rules as ds-store (plan 1B.1)."""
+        self.assertEqual(deps.FORBIDDEN["ds-migrate"], deps.FORBIDDEN["ds-store"])
+        status, out = run("ds-migrate-forbidden.txt", crate="ds-migrate")
+        self.assertEqual(status, 1)
+        reported = sorted(
+            line.split(" contains ")[1].split(",")[0]
+            for line in out.splitlines()
+            if line.startswith("::error::ds-migrate's")
+        )
+        self.assertEqual(reported, ["api", "axum"])
+        self.assertIn("ds-store: 14 packages in the normal closure", out)
 
     def test_every_forbidden_crate_is_reported_once(self) -> None:
         """Exit 1, one `::error::` per forbidden crate, with the -i hint."""
