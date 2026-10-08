@@ -39,7 +39,7 @@ impl SinkError {
         let code = err
             .chain()
             .find_map(|cause| match cause.downcast_ref::<sqlx::Error>() {
-                Some(sqlx::Error::Database(db)) => db.code().map(|code| code.into_owned()),
+                Some(sqlx::Error::Database(db)) => db.code().map(std::borrow::Cow::into_owned),
                 _ => None,
             });
         match code.as_deref() {
@@ -439,7 +439,7 @@ mod db_tests {
             .0
     }
 
-    /// What the api receives from [`HttpSink`]: the snapshot POSTed to a
+    /// What the api receives from [`HttpSink`]: the snapshot sent by POST to a
     /// stand-in api, read back with the api's own body parser
     /// (`ds_store::incidents::parse_snapshot`, its handler's first step).
     async fn through_http(snapshot: &IncidentSnapshot) -> IncidentSnapshot {
