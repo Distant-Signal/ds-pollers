@@ -6,7 +6,7 @@
 //! `ioi-stations/1` and `ioi-lines/1` (its own stream; `poller-irish-rail-gtfs`
 //! produces the same schemas on `ds:ingest:ioi-gtfs`; ingest plan 3c.2,
 //! decision D8), which the ingest-writer applies. The api's `/private/island-of-ireland-*` routes
-//! stay until phase 5, but this poller no longer calls them. Tier A of
+//! it used to call were deleted (phase 5 runbook Q9). Tier A of
 //! docs/superpowers/specs/2026-09-05-nir-tier-a-implementation-design.md;
 //! see docs/superpowers/plans/2026-09-05-nir-tier-a-implementation-plan.md
 //! Task 2.

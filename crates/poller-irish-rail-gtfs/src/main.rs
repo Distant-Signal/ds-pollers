@@ -3,8 +3,8 @@
 //! and forwards the derived station/line catalogue to the
 //! `ds:ingest:ioi-gtfs` stream as `ioi-stations/1` and
 //! `ioi-lines/1` (ingest plan 3c.2, decision D8), which the ingest-writer
-//! applies. The api's `/private/island-of-ireland-*` routes stay until
-//! phase 5, but this poller no longer calls them. Tier A of
+//! applies. The api's `/private/island-of-ireland-*` routes it used to
+//! call were deleted (phase 5 runbook Q9). Tier A of
 //! docs/superpowers/specs/2026-09-05-ireland-rail-support-design.md; see
 //! docs/superpowers/plans/2026-09-05-ireland-rail-support-plan.md Task A4.
 
