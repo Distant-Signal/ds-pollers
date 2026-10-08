@@ -2,10 +2,10 @@
 //! ("Northern Ireland Railways Stations"/"...Halts") on an interval,
 //! parses/filters/dedups them, and forwards the derived
 //! `NorthernIreland`-tagged station catalogue -- plus a small hand-curated
-//! line catalogue -- to the `ds:ingest:island-of-ireland` stream as
-//! `ioi-stations/1` and `ioi-lines/1` (shared with
-//! `poller-irish-rail-gtfs`; ingest plan 3c.2, decision D8), which the
-//! ingest-writer applies. The api's `/private/island-of-ireland-*` routes
+//! line catalogue -- to the `ds:ingest:ioi-nir` stream as
+//! `ioi-stations/1` and `ioi-lines/1` (its own stream; `poller-irish-rail-gtfs`
+//! produces the same schemas on `ds:ingest:ioi-gtfs`; ingest plan 3c.2,
+//! decision D8), which the ingest-writer applies. The api's `/private/island-of-ireland-*` routes
 //! stay until phase 5, but this poller no longer calls them. Tier A of
 //! docs/superpowers/specs/2026-09-05-nir-tier-a-implementation-design.md;
 //! see docs/superpowers/plans/2026-09-05-nir-tier-a-implementation-plan.md
@@ -52,14 +52,14 @@ async fn run() -> anyhow::Result<()> {
     let sinks = Sinks {
         stations: SnapshotStream::spawn(
             redis.clone(),
-            ingest_stream::streams::ISLAND_OF_IRELAND,
+            ingest_stream::streams::IOI_NIR,
             SchemaId::new("ioi-stations", 1)?,
             "poller-nir-stations",
             500,
         ),
         lines: SnapshotStream::spawn(
             redis,
-            ingest_stream::streams::ISLAND_OF_IRELAND,
+            ingest_stream::streams::IOI_NIR,
             SchemaId::new("ioi-lines", 1)?,
             "poller-nir-stations",
             500,
@@ -68,9 +68,8 @@ async fn run() -> anyhow::Result<()> {
 
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     // The startup cursor is the newest `ioi-stations/1` entry: both
-    // snapshots are produced together every cycle (see poll_once). The
-    // stream is shared with poller-irish-rail-gtfs, whose stations count
-    // too, which only delays a restart's first poll.
+    // snapshots are produced together every cycle (see poll_once), on
+    // this poller's own stream (poller-irish-rail-gtfs has its own).
     common::poller_loop::run_poll_loop_with_cursor(
         "nir-stations",
         || async { Ok(sinks.stations.last_produced_at().await?) },
@@ -84,7 +83,7 @@ async fn run() -> anyhow::Result<()> {
 }
 
 /// The two schemas this poller produces, one latest-snapshot producer each
-/// on `ds:ingest:island-of-ireland`.
+/// on `ds:ingest:ioi-nir`.
 struct Sinks {
     stations: SnapshotStream,
     lines: SnapshotStream,

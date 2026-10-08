@@ -35,7 +35,7 @@ pub(crate) const USER_AGENT: &str = common::user_agent!();
 /// already established (`crates/poller-irish-rail-gtfs/src/config.rs:1-12`).
 ///
 /// Ingest plan 3c.2 (decision D8): snapshots go to the
-/// `ds:ingest:island-of-ireland` stream only, so there is no api URL or
+/// `ds:ingest:ioi-nir` stream only, so there is no api URL or
 /// internal OAuth credential any more. Does not derive `Debug`: the hand
 /// impl below keeps the Redis credentials redacted (`RedisArgs`).
 #[derive(Parser)]
@@ -62,8 +62,8 @@ pub(crate) struct Config {
     #[arg(long, env = "INGEST_SINK", default_value = "stream", value_parser = ["stream"])]
     pub ingest_sink: String,
 
-    /// Redis for the `ds:ingest:island-of-ireland` stream (shared with
-    /// `poller-irish-rail-gtfs`, which produces the same two schemas).
+    /// Redis for the `ds:ingest:ioi-nir` stream (its own; the same schemas
+    /// as `poller-irish-rail-gtfs` produces on `ds:ingest:ioi-gtfs`).
     #[command(flatten)]
     pub redis: ingest_stream::snapshot::RedisArgs,
 

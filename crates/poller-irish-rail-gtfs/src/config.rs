@@ -12,7 +12,7 @@ use clap::Parser;
 /// unlike an account-gated one."
 ///
 /// Ingest plan 3c.2 (decision D8): snapshots go to the
-/// `ds:ingest:island-of-ireland` stream only, so there is no api URL or
+/// `ds:ingest:ioi-gtfs` stream only, so there is no api URL or
 /// internal OAuth credential any more. Does not derive `Debug`: the hand
 /// impl below keeps the Redis credentials redacted (`RedisArgs`).
 #[derive(Parser)]
@@ -31,7 +31,7 @@ pub(crate) struct Config {
     #[arg(long, env = "INGEST_SINK", default_value = "stream", value_parser = ["stream"])]
     pub ingest_sink: String,
 
-    /// Redis for the `ds:ingest:island-of-ireland` stream.
+    /// Redis for the `ds:ingest:ioi-gtfs` stream.
     #[command(flatten)]
     pub redis: ingest_stream::snapshot::RedisArgs,
 

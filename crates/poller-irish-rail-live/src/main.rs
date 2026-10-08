@@ -1,6 +1,6 @@
 //! `poller-irish-rail-live`: polls `api.irishrail.ie`'s legacy realtime XML
 //! service for every station it lists, and forwards raw per-station
-//! departure-board samples to the `ds:ingest:island-of-ireland` stream as
+//! departure-board samples to the `ds:ingest:ioi-live` stream as
 //! `ioi-station-samples/1` (ingest plan 3c.2, decision D8), which the
 //! ingest-writer applies. The api's
 //! `/private/island-of-ireland-station-samples` route stays until phase 5,
@@ -91,7 +91,7 @@ async fn run() -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)?;
     let samples = SnapshotStream::spawn(
         redis,
-        ingest_stream::streams::ISLAND_OF_IRELAND,
+        ingest_stream::streams::IOI_LIVE,
         SchemaId::new("ioi-station-samples", 1)?,
         "poller-irish-rail-live",
         500,

@@ -41,7 +41,7 @@ pub(crate) struct Config {
     #[arg(long, env = "INGEST_SINK", default_value = "stream", value_parser = ["stream"])]
     pub ingest_sink: String,
 
-    /// Redis for the `ds:ingest:island-of-ireland` stream. Its `Debug`
+    /// Redis for the `ds:ingest:ioi-live` stream. Its `Debug`
     /// redacts the credentials.
     #[command(flatten)]
     pub redis: ingest_stream::snapshot::RedisArgs,

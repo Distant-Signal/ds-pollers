@@ -1,7 +1,7 @@
 //! `poller-irish-rail-gtfs`: downloads Transport for Ireland's public GTFS
 //! zip for Iarnród Éireann on an interval, parses it via `gtfs-structures`,
 //! and forwards the derived station/line catalogue to the
-//! `ds:ingest:island-of-ireland` stream as `ioi-stations/1` and
+//! `ds:ingest:ioi-gtfs` stream as `ioi-stations/1` and
 //! `ioi-lines/1` (ingest plan 3c.2, decision D8), which the ingest-writer
 //! applies. The api's `/private/island-of-ireland-*` routes stay until
 //! phase 5, but this poller no longer calls them. Tier A of
@@ -223,14 +223,14 @@ async fn run() -> anyhow::Result<()> {
     let sinks = Sinks {
         stations: SnapshotStream::spawn(
             redis.clone(),
-            ingest_stream::streams::ISLAND_OF_IRELAND,
+            ingest_stream::streams::IOI_GTFS,
             SchemaId::new("ioi-stations", 1)?,
             "poller-irish-rail-gtfs",
             500,
         ),
         lines: SnapshotStream::spawn(
             redis,
-            ingest_stream::streams::ISLAND_OF_IRELAND,
+            ingest_stream::streams::IOI_GTFS,
             SchemaId::new("ioi-lines", 1)?,
             "poller-irish-rail-gtfs",
             500,
@@ -253,7 +253,7 @@ async fn run() -> anyhow::Result<()> {
 }
 
 /// The two schemas this poller produces, one latest-snapshot producer each
-/// on `ds:ingest:island-of-ireland`.
+/// on `ds:ingest:ioi-gtfs`.
 struct Sinks {
     stations: SnapshotStream,
     lines: SnapshotStream,
