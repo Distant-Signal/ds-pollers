@@ -90,9 +90,10 @@ FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2
 # docker/api.Dockerfile's runtime stage for why, and for the version pin.
 ARG TINI_VERSION=0.19.0-1
 
-# reqwest's native-tls backend verifies certs against the system store, so
-# the runtime image needs a CA bundle even though it otherwise only carries
-# the one binary.
+# reqwest's native-tls backend (and sqlx's, for the DB sink's Postgres
+# connection when TLS is in play) verifies certs against the system store,
+# so the runtime image needs a CA bundle even though it otherwise only
+# carries the one binary and the line catalogue.
 # hadolint ignore=DL3008 # apt versions unpinned on purpose; see .hadolint.yaml
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates "tini=${TINI_VERSION}*" \
@@ -102,6 +103,10 @@ RUN apt-get update \
     && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 1000 --gid 1000 poller
 
 COPY --from=builder /usr/local/bin/poller-incidents /usr/local/bin/poller-incidents
+# The line catalogue (LINES_DIR, default /app/lines): the DB sink
+# (INGEST_SINK=db, ingest plan 2c.2) builds the matcher that fills
+# incidents.affected_lines from it at startup, as the api does.
+COPY --chown=poller:poller lines/ /app/lines/
 
 # Numeric USER, not the `poller` name useradd created above: Kubernetes'
 # runAsNonRoot admission check (this chart's podSecurityContext sets
