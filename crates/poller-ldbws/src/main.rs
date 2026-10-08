@@ -329,41 +329,7 @@ async fn poll_once(
         tracing::warn!("no station samples collected this cycle");
     }
     let pending = &mut state.held.pending;
-    let result = if sink.mode() == SinkMode::Stream && samples.is_empty() {
-        Ok(Vec::new())
-    } else if sink.mode() == SinkMode::Stream {
-        // Stream mode bypasses `pending` (plan 3a.7): a failed XADD fails
-        // the cycle transiently, `Rotation::hold` keeps the next cycle on
-        // the same stations, and the producer's latest-only buffer holds
-        // the undelivered snapshot, which the next cycle's supersedes.
-        let delivered: Vec<(String, std::time::Instant)> = samples
-            .iter()
-            .map(|sample| (sample.crs.clone(), now))
-            .collect();
-        sink.deliver(
-            client,
-            config,
-            internal_oauth,
-            &samples,
-            common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
-        )
-        .await
-        .map(|()| delivered)
-    } else {
-        let evicted = pending.add(samples, now);
-        if evicted > 0 {
-            tracing::warn!(
-                evicted,
-                max = pending::MAX_PENDING_STATIONS,
-                "too many undelivered station samples held; dropped the oldest"
-            );
-            metrics::counter!(common::metrics::metric_name(
-                "ldbws_pending_samples_evicted_total"
-            ))
-            .increment(evicted as u64);
-        }
-        deliver_pending(client, config, internal_oauth, pending, sink).await
-    };
+    let result = deliver_cycle(client, config, internal_oauth, sink, pending, samples, now).await;
     let progressed = match &result {
         Ok(delivered) => {
             rotation.advance(&polled, completed);
@@ -391,6 +357,59 @@ async fn poll_once(
     record_pending_gauge(pending.len());
     record_rotation_progress(rotation, polled.len(), progressed, stalest, now);
     result.map(|_| ())
+}
+
+/// Delivers one cycle's `samples` through `sink` and returns what was
+/// delivered (each station with when it was sampled). Under `stream` (plan
+/// 3a.7) the samples bypass `pending`: a failed XADD fails the cycle
+/// transiently, `Rotation::hold` keeps the next cycle on the same stations,
+/// and the producer's latest-only buffer holds the undelivered snapshot,
+/// which the next cycle's supersedes; an empty cycle sends nothing. Under
+/// `http` and `http+shadow` they join `pending`, and the whole held set is
+/// delivered ([`deliver_pending`]).
+async fn deliver_cycle(
+    client: &Client,
+    config: &Config,
+    internal_oauth: &common::oauth_client::OAuthTokenCache,
+    sink: &SampleSink,
+    pending: &mut PendingSamples,
+    samples: Vec<StationSample>,
+    now: std::time::Instant,
+) -> anyhow::Result<Vec<(String, std::time::Instant)>> {
+    if sink.mode() == SinkMode::Stream {
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
+        let delivered: Vec<(String, std::time::Instant)> = samples
+            .iter()
+            .map(|sample| (sample.crs.clone(), now))
+            .collect();
+        return sink
+            .deliver(
+                client,
+                config,
+                internal_oauth,
+                &samples,
+                common::poller_loop::post_retry_budget(Duration::from_secs(
+                    config.poll_interval_secs,
+                )),
+            )
+            .await
+            .map(|()| delivered);
+    }
+    let evicted = pending.add(samples, now);
+    if evicted > 0 {
+        tracing::warn!(
+            evicted,
+            max = pending::MAX_PENDING_STATIONS,
+            "too many undelivered station samples held; dropped the oldest"
+        );
+        metrics::counter!(common::metrics::metric_name(
+            "ldbws_pending_samples_evicted_total"
+        ))
+        .increment(evicted as u64);
+    }
+    deliver_pending(client, config, internal_oauth, pending, sink).await
 }
 
 /// `ldbws_pending_samples`: how many stations' samples are held for the
@@ -1960,7 +1979,7 @@ mod tests {
     }
 
     /// `INGEST_SINK=stream` with Redis down (plan 3a.7 composed with the
-    /// held samples): the samples bypass `pending`, nothing is POSTed, the
+    /// held samples): the samples bypass `pending`, nothing is `POST`ed, the
     /// cycle fails transiently and the rotation holds, so the next cycle
     /// samples the same stations and its snapshot supersedes the held one.
     #[tokio::test]

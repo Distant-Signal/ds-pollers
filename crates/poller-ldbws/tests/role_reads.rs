@@ -11,6 +11,7 @@ use std::time::Duration;
 use ds_store::reads::sample_stations::SampleSelection;
 use ds_store::schema::{DbRole, SchemaGate, wait_for_schema_with};
 
+#[expect(clippy::expect_used, reason = "a test helper: no database, no test")]
 async fn pool() -> sqlx::PgPool {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
     sqlx::PgPool::connect(&url).await.expect("connect")

@@ -4,7 +4,7 @@
 //! | Sink | Each cycle | Startup cursor |
 //! |---|---|---|
 //! | `http` (default) | `POST /private/station-samples`, retried within the cycle's budget | `GET` on the same route |
-//! | `http+shadow` | the same POST (authoritative: its result is the cycle's), then, if it succeeded, the same samples XADDed to `ds:ingest:station-samples`, best effort | `GET` |
+//! | `http+shadow` | the same POST (authoritative: its result is the cycle's), then, if it succeeded, the same samples `XADD`ed to `ds:ingest:station-samples`, best effort | `GET` |
 //! | `stream` | XADD only | the stream's newest `produced_at` (`XREVRANGE`, spec §11.3) |
 //!
 //! **The stream copy** is one snapshot per cycle, in parts of 100 stations

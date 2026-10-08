@@ -49,7 +49,10 @@ impl SampleStationsArgs {
     /// `db` needs a `DATABASE_URL`.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.sample_stations_source == ReadSource::Db
-            && self.database_url.as_ref().is_none_or(|url| url.is_empty())
+            && self
+                .database_url
+                .as_ref()
+                .is_none_or(common::secret::Secret::is_empty)
         {
             anyhow::bail!("SAMPLE_STATIONS_SOURCE=db needs DATABASE_URL");
         }

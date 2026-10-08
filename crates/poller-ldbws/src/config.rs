@@ -69,7 +69,7 @@ pub(crate) struct Config {
     pub internal_oauth: common::oauth_client::InternalOAuthArgs,
 
     /// Where the samples go (`INGEST_SINK`, ingest architecture plan 3a.7)
-    /// and the Redis they are XADDed to. See `sink.rs`.
+    /// and the Redis they are `XADD`ed to. See `sink.rs`.
     #[command(flatten)]
     pub ingest: IngestArgs,
 
@@ -129,7 +129,7 @@ pub(crate) struct Config {
 #[derive(clap::Args, Clone, Debug, Default)]
 pub(crate) struct IngestArgs {
     /// `http` (the default): POST each cycle's samples to the api.
-    /// `http+shadow`: the same POST, plus a copy XADDed to
+    /// `http+shadow`: the same POST, plus a copy `XADD`ed to
     /// `ds:ingest:station-samples` for the ingest-writer's `shadow` mode.
     /// `stream`: XADD only, keeping the latest unsent snapshot while Redis
     /// is down, and read the startup cursor from the stream.
