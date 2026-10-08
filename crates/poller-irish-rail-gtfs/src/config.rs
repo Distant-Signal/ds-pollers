@@ -56,6 +56,23 @@ pub(crate) struct Config {
     /// `/livez` listener and stall window (SVC-08).
     #[command(flatten)]
     pub health: common::service_args::HealthArgs,
+
+    /// Sharp-drop guard (`feed_guard`): a feed whose station or line count
+    /// fell by more than this fraction since the last published feed is
+    /// not published. 0.3 refuses a drop of over 30%; 1.0 turns the check
+    /// off (an empty feed is still refused).
+    #[arg(long, env, default_value_t = 0.3, value_parser = parse_fraction)]
+    pub feed_max_drop_fraction: f64,
+}
+
+/// A fraction in `0.0..=1.0`.
+fn parse_fraction(raw: &str) -> Result<f64, String> {
+    let value: f64 = raw.parse().map_err(|err| format!("{err}"))?;
+    if (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{value} is not a fraction between 0 and 1"))
+    }
 }
 
 impl std::fmt::Debug for Config {
@@ -68,6 +85,7 @@ impl std::fmt::Debug for Config {
             .field("metrics_port", &self.metrics_port)
             .field("metrics_enabled", &self.metrics_enabled)
             .field("health", &self.health)
+            .field("feed_max_drop_fraction", &self.feed_max_drop_fraction)
             .finish()
     }
 }
@@ -104,5 +122,20 @@ mod config_debug_tests {
         assert!(
             Config::try_parse_from(["poller-irish-rail-gtfs", "--ingest-sink", "http"]).is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod feed_max_drop_fraction_tests {
+    use super::parse_fraction;
+
+    #[test]
+    fn only_fractions_between_zero_and_one_parse() {
+        assert_eq!(parse_fraction("0.3"), Ok(0.3));
+        assert_eq!(parse_fraction("0"), Ok(0.0));
+        assert_eq!(parse_fraction("1"), Ok(1.0));
+        for bad in ["-0.1", "1.5", "30%", "NaN", ""] {
+            assert!(parse_fraction(bad).is_err(), "{bad}");
+        }
     }
 }

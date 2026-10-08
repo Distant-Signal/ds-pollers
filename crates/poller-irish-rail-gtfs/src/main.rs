@@ -9,6 +9,7 @@
 //! docs/superpowers/plans/2026-09-05-ireland-rail-support-plan.md Task A4.
 
 mod config;
+mod feed_guard;
 mod mapping;
 
 use std::io::Read;
@@ -281,16 +282,26 @@ async fn poll_once(client: &Client, config: &Config, sinks: &Sinks) -> anyhow::R
         anyhow::anyhow!("GTFS parse task panicked or was cancelled: {join_err}")
     })??;
 
-    let stations = mapping::map_stations(&gtfs);
-    let lines = mapping::map_lines(&gtfs);
+    let mapping::MappedFeed {
+        stations,
+        lines,
+        issues,
+    } = mapping::map_feed(&gtfs);
+    issues.record();
     tracing::info!(
         stations = stations.len(),
         lines = lines.len(),
         "parsed Iarnrod Eireann GTFS feed"
     );
+    let counts = feed_guard::FeedCounts {
+        stations: stations.len(),
+        lines: lines.len(),
+    };
+    feed_guard::check_against_last_published(counts, config.feed_max_drop_fraction)?;
 
     sinks.stations.publish(&stations, fetched_at).await?;
     sinks.lines.publish(&lines, fetched_at).await?;
+    feed_guard::record_published(counts);
     Ok(())
 }
 
