@@ -209,6 +209,10 @@ impl Rotation {
     /// out, and `sampled` the stations that produced a sample. The next
     /// cycle starts at the first station not completed. Returns the
     /// sampled stations that had been marked invalid (they recovered).
+    /// `main.rs` calls [`Rotation::advance`] and [`Rotation::note_sampled`]
+    /// itself (it advances only once api took the samples); the tests
+    /// drive whole cycles through this.
+    #[cfg(test)]
     pub(crate) fn finish_cycle<'a>(
         &mut self,
         ordered: &[String],

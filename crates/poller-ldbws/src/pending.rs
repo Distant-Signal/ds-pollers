@@ -161,11 +161,11 @@ mod tests {
         let now = Instant::now();
         let old: Vec<StationSample> = (0..10).map(|i| sample(&format!("O{i:02}"), 0)).collect();
         pending.add(old, now);
-        let new: Vec<StationSample> = (0..MAX_PENDING_STATIONS)
+        let fresh: Vec<StationSample> = (0..MAX_PENDING_STATIONS)
             .map(|i| sample(&format!("N{i:04}"), 5))
             .collect();
 
-        let evicted = pending.add(new, now);
+        let evicted = pending.add(fresh, now);
 
         assert_eq!(evicted, 10);
         assert_eq!(pending.len(), MAX_PENDING_STATIONS);
