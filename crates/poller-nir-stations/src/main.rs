@@ -36,6 +36,7 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("poller-nir-stations");
 
     let config = Config::parse();
+    common::metrics::ingest_sink_info(&config.ingest_sink);
     let progress = health_http::spawn_liveness(&config.health);
     // `.user_agent(...)` is NOT optional -- see config::USER_AGENT's own
     // doc comment and this plan's Global Constraints. Every request this

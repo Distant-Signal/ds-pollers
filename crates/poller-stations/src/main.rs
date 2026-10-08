@@ -47,6 +47,7 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("poller-stations");
 
     let config = Config::parse();
+    common::metrics::ingest_sink_info(&common::metrics::value_enum_name(&config.ingest_sink));
     config.validate()?;
     // Installed here rather than by the poll loop, so the schema gate's
     // `db_schema_ready` (under `INGEST_SINK=db`) is exported while it waits.

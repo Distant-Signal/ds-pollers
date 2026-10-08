@@ -46,6 +46,7 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("poller-incidents");
 
     let config = Config::parse();
+    common::metrics::ingest_sink_info(&common::metrics::value_enum_name(&config.ingest_sink));
     config.validate()?;
     let progress = health_http::spawn_liveness(&config.health);
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
@@ -143,6 +144,8 @@ async fn db_sink(
         },
     )
     .await;
+    // The db_pool_* series at 0 (the recorder is installed above).
+    ds_store::pool::register_metrics();
     let pool = ds_store::pool::PoolSettings::from_env(APPLICATION_NAME, DEFAULT_MAX_CONNECTIONS)?
         .connect(database_url.expose())
         .await?;

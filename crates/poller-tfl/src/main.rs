@@ -88,6 +88,7 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("poller-tfl");
 
     let config = Config::parse();
+    common::metrics::ingest_sink_info(&config.ingest_sink.to_string());
     let progress = health_http::spawn_liveness(&config.health);
     // `clap` treats a present-but-empty env var as a supplied value, so an
     // orchestrator (e.g. `docker-compose.yml`'s `TFL_APP_KEY: ${TFL_APP_KEY}`)
@@ -191,8 +192,11 @@ fn stream_sink(config: &Config) -> anyhow::Result<Option<SnapshotStream>> {
 }
 
 /// Sends one snapshot where `INGEST_SINK` says (see the module docs): the
-/// stream copy first (never failing the cycle under `http+shadow`), then
-/// the api's `POST` under `http` and `http+shadow`.
+/// api's `POST` under `http` and `http+shadow`, then the stream copy under
+/// `http+shadow` and `stream`. Under `http+shadow` the copy is of a
+/// snapshot the api accepted (a failed `POST` fails the cycle before it,
+/// as poller-ldbws does), so the compare step counts the same snapshots on
+/// both sides, and the copy never fails the cycle.
 async fn deliver(
     client: &Client,
     config: &Config,
@@ -201,15 +205,6 @@ async fn deliver(
     reports: &[common::LineStatusReport],
     fetched_at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    if let Some(stream) = stream {
-        match stream.publish(reports, fetched_at).await {
-            Ok(()) => {}
-            Err(err) if config.ingest_sink == SinkMode::HttpShadow => {
-                tracing::warn!(error = %err, "shadow copy to ds:ingest:tfl not queued; the api POST is unaffected");
-            }
-            Err(err) => return Err(err.into()),
-        }
-    }
     if config.ingest_sink.posts_http() {
         ingest::post_batch_retrying(
             client,
@@ -220,6 +215,18 @@ async fn deliver(
             common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
         )
         .await?;
+        if let Some(stream) = stream {
+            stream.record_http(reports.len());
+        }
+    }
+    if let Some(stream) = stream {
+        match stream.publish(reports, fetched_at).await {
+            Ok(()) => {}
+            Err(err) if config.ingest_sink == SinkMode::HttpShadow => {
+                tracing::warn!(error = %err, "shadow copy to ds:ingest:tfl not queued; the api POST already landed");
+            }
+            Err(err) => return Err(err.into()),
+        }
     }
     Ok(())
 }

@@ -107,6 +107,11 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("poller-ldbws");
 
     let mut config = Config::parse();
+    common::metrics::ingest_sink_info(&config.ingest.ingest_sink.to_string());
+    common::metrics::internal_reads_source_info(
+        "sample_stations",
+        &common::metrics::value_enum_name(&config.reads.sample_stations_source),
+    );
     config.reads.validate()?;
     let progress = health_http::spawn_liveness(&config.health);
     // SAMPLE_STATIONS_SOURCE=db (ingest plan 4.5): the catalogue, Postgres

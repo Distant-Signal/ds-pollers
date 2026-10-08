@@ -41,6 +41,7 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("poller-tocs");
 
     let config = Config::parse();
+    common::metrics::ingest_sink_info(&config.ingest_sink.to_string());
     let progress = health_http::spawn_liveness(&config.health);
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let internal_oauth = config.internal_oauth.token_cache();
@@ -111,28 +112,34 @@ async fn poll_once(
 
     tracing::info!(count = tocs.len(), "parsed TOCs from RDM feed");
 
-    // The stream copy first: under `http+shadow` it never fails the cycle.
+    // The api's POST first, then the stream copy: under `http+shadow` the
+    // copy is of a snapshot the api accepted (as poller-ldbws), so the
+    // compare step counts the same snapshots on both sides, and the copy
+    // never fails the cycle.
+    if config.ingest_sink.posts_http() {
+        ingest::post_batch_retrying(
+            client,
+            &config.api_ingest_url,
+            internal_oauth,
+            &tocs,
+            "TOCs",
+            common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
+        )
+        .await?;
+        if let Some(stream) = stream {
+            stream.record_http(tocs.len());
+        }
+    }
     if let Some(stream) = stream {
         match stream.publish(&tocs, fetched_at).await {
             Ok(()) => {}
             Err(err) if config.ingest_sink == SinkMode::HttpShadow => {
-                tracing::warn!(error = %err, "shadow copy to ds:ingest:reference not queued; the api POST is unaffected");
+                tracing::warn!(error = %err, "shadow copy to ds:ingest:reference not queued; the api POST already landed");
             }
             Err(err) => return Err(err.into()),
         }
     }
-    if !config.ingest_sink.posts_http() {
-        return Ok(());
-    }
-    ingest::post_batch_retrying(
-        client,
-        &config.api_ingest_url,
-        internal_oauth,
-        &tocs,
-        "TOCs",
-        common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
-    )
-    .await
+    Ok(())
 }
 
 async fn fetch_tocs_xml(client: &Client, config: &Config) -> anyhow::Result<String> {
