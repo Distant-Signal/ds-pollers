@@ -24,6 +24,7 @@
 
 mod budget;
 mod config;
+mod pending;
 mod platform_history;
 mod rotation;
 mod schema;
@@ -38,6 +39,7 @@ use clap::Parser;
 use common::ingest::{self, RDM_AUTH_HEADER_NAME};
 use common::{StationDeparture, StationSample};
 use config::Config;
+use pending::PendingSamples;
 use platform_history::PlatformHistory;
 use reqwest::{Client, StatusCode};
 use rotation::Rotation;
@@ -137,7 +139,16 @@ async fn run() -> anyhow::Result<()> {
         );
     }
 
-    common::poller_loop::run_poll_loop(
+    // Samples `api` has not taken yet, and the last station list it served,
+    // so a cycle keeps sampling LDBWS while `api` is down (see `pending`).
+    let held = Rc::new(RefCell::new(HeldState::default()));
+    metrics::counter!(common::metrics::metric_name(
+        "ldbws_pending_samples_evicted_total"
+    ))
+    .increment(0);
+
+    common::poller_loop::run_poll_loop_with_policy(
+        &retry_policy(poll_interval),
         "ldbws",
         &client,
         &config.api_ingest_url,
@@ -150,6 +161,8 @@ async fn run() -> anyhow::Result<()> {
             let platform_history = Rc::clone(&platform_history);
             let rotation = Rc::clone(&rotation);
             let budget = Rc::clone(&budget);
+            let held = Rc::clone(&held);
+            let progress = &progress;
             let client = &client;
             let config = &config;
             let internal_oauth = &internal_oauth;
@@ -162,18 +175,25 @@ async fn run() -> anyhow::Result<()> {
                     config.hourly_request_budget,
                     config.poll_interval_secs,
                 ));
+                let mut held_state = std::mem::take(&mut *held.borrow_mut());
                 let result = poll_once(
                     client,
                     config,
-                    &mut history,
-                    &mut rotation_state,
-                    &mut budget_state,
+                    &mut CycleState {
+                        platform_history: &mut history,
+                        rotation: &mut rotation_state,
+                        request_budget: &mut budget_state,
+                        held: &mut held_state,
+                    },
                     internal_oauth,
+                    &ingest::API_STARTUP_WAIT,
+                    Some(progress),
                 )
                 .await;
                 *platform_history.borrow_mut() = history;
                 *rotation.borrow_mut() = rotation_state;
                 *budget.borrow_mut() = budget_state;
+                *held.borrow_mut() = held_state;
                 result
             }
         },
@@ -181,17 +201,73 @@ async fn run() -> anyhow::Result<()> {
     .await
 }
 
+/// How `common::poller_loop` retries around this poller (2026-10-08).
+///
+/// - `api_wait` gives up after one attempt (`max_wait` zero): the loop no
+///   longer waits for `api` before a cycle, at startup or after a failed
+///   cycle. A cycle samples LDBWS whether or not `api` is up and holds what
+///   it could not deliver (`pending`), so waiting would only lose samples.
+///   The one wait still needed, for a fresh process's first station list,
+///   is in [`station_list`].
+/// - `failed_cycle` retries a failed cycle at the next interval, never
+///   sooner: a cycle whose POST failed has already spent its LDBWS requests,
+///   so an early retry would raise the request rate (LEG-18). Its ceiling is
+///   twice the interval because `Backoff` jitters down to half, and
+///   `poller_loop` caps the delay at the interval.
+fn retry_policy(poll_interval: Duration) -> common::poller_loop::RetryPolicy {
+    common::poller_loop::RetryPolicy {
+        api_wait: ingest::ApiWait {
+            backoff: ingest::API_STARTUP_WAIT.backoff,
+            max_wait: Duration::ZERO,
+        },
+        failed_cycle: common::backoff::Backoff::new(poll_interval * 2, poll_interval * 2),
+    }
+}
+
+/// State that outlives a cycle, apart from the platform history, the
+/// rotation and the request budget.
+#[derive(Debug, Default)]
+struct HeldState {
+    /// The last station list `api` served, used while it cannot serve one.
+    stations: Option<Vec<String>>,
+    /// Samples not yet delivered to `api`.
+    pending: PendingSamples,
+}
+
+/// Everything a cycle reads and updates, borrowed for the cycle.
+struct CycleState<'a> {
+    platform_history: &'a mut PlatformHistory,
+    rotation: &'a mut Rotation,
+    request_budget: &'a mut RequestBudget,
+    held: &'a mut HeldState,
+}
+
+/// One cycle: sample as many stations as the budgets allow, then POST them
+/// together with any samples earlier cycles could not deliver.
+///
+/// The rotation advances past this cycle's stations only once that POST
+/// succeeds. While it fails, the samples are held (the latest per station,
+/// see `pending`), the next cycle samples the same stations again, and the
+/// cycle reports failure. So an `api` outage costs no station its turn and
+/// loses no sample: the first POST after it delivers everything held.
 async fn poll_once(
     client: &Client,
     config: &Config,
-    platform_history: &mut PlatformHistory,
-    rotation: &mut Rotation,
-    request_budget: &mut RequestBudget,
+    state: &mut CycleState<'_>,
     internal_oauth: &common::oauth_client::OAuthTokenCache,
+    first_list_wait: &ingest::ApiWait,
+    progress: Option<&common::progress::Progress>,
 ) -> anyhow::Result<()> {
-    let stations =
-        well_formed_stations(fetch_sample_stations(client, config, internal_oauth).await?);
-    tracing::info!(count = stations.len(), "fetched station list to sample");
+    let stations = station_list(
+        client,
+        config,
+        internal_oauth,
+        &mut state.held.stations,
+        first_list_wait,
+        progress,
+    )
+    .await?;
+    let rotation = &mut *state.rotation;
 
     // SVC-04: start where the previous cycle stopped, so the budget no
     // longer always truncates the same (late-alphabet) tail. Same number of
@@ -205,7 +281,7 @@ async fn poll_once(
     // Stations LDBWS rejected as invalid are left out until their hourly
     // re-probe is due -- see `rotation`'s module docs.
     let polled = rotation.pollable(&ordered, std::time::Instant::now());
-    request_budget.start_cycle();
+    state.request_budget.start_cycle();
     let CycleSampling {
         samples,
         completed,
@@ -215,8 +291,8 @@ async fn poll_once(
     } = sample_stations_within_budget(
         client,
         config,
-        platform_history,
-        request_budget,
+        state.platform_history,
+        state.request_budget,
         &polled,
         CYCLE_TIME_BUDGET,
     )
@@ -225,36 +301,162 @@ async fn poll_once(
         record_budget_skip(config, polled.len(), skipped, limit);
     }
     let now = std::time::Instant::now();
-    for crs in rotation.finish_cycle(
-        &polled,
-        completed,
-        samples.iter().map(|sample| sample.crs.as_str()),
-        now,
-    ) {
-        tracing::info!(crs = %crs, "station LDBWS had rejected as an invalid CRS sampled successfully again");
-        set_invalid_crs_gauge(&crs, false);
-    }
     for (crs, body) in &invalid_crs {
         record_invalid_crs(rotation, crs, body, now);
     }
-    let stalest = rotation.stalest_age(&ordered, now);
-    record_cycle_metrics(ordered.len(), completed, samples.len(), stalest);
-    record_rotation_progress(rotation, polled.len(), completed, stalest, now);
-
-    if samples.is_empty() {
-        tracing::warn!("no station samples collected this cycle; nothing to post");
-        return Ok(());
+    let sampled = samples.len();
+    if sampled == 0 {
+        tracing::warn!("no station samples collected this cycle");
+    }
+    let pending = &mut state.held.pending;
+    let evicted = pending.add(samples, now);
+    if evicted > 0 {
+        tracing::warn!(
+            evicted,
+            max = pending::MAX_PENDING_STATIONS,
+            "too many undelivered station samples held; dropped the oldest"
+        );
+        metrics::counter!(common::metrics::metric_name(
+            "ldbws_pending_samples_evicted_total"
+        ))
+        .increment(evicted as u64);
     }
 
-    ingest::post_batch_retrying(
+    let result = deliver_pending(client, config, internal_oauth, pending).await;
+    let progressed = match &result {
+        Ok(delivered) => {
+            rotation.advance(&polled, completed);
+            for (crs, sampled_at) in delivered {
+                if rotation.note_sampled(crs, *sampled_at) {
+                    tracing::info!(crs = %crs, "station LDBWS had rejected as an invalid CRS sampled successfully again");
+                    set_invalid_crs_gauge(crs, false);
+                }
+            }
+            completed
+        }
+        // `deliver_pending` dropped the rejected samples: sampling the same
+        // stations again would not change that, so the rotation moves on.
+        Err(err) if ingest::classify_failure(err) == ingest::FailureClass::Rejected => {
+            rotation.advance(&polled, completed);
+            completed
+        }
+        Err(_) => {
+            rotation.hold(&ordered);
+            0
+        }
+    };
+    let stalest = rotation.stalest_age(&ordered, now);
+    record_cycle_metrics(ordered.len(), completed, sampled, stalest);
+    record_pending_gauge(pending.len());
+    record_rotation_progress(rotation, polled.len(), progressed, stalest, now);
+    result.map(|_| ())
+}
+
+/// `ldbws_pending_samples`: how many stations' samples are held for the
+/// next POST. 0 whenever `api` takes every POST.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "metric gauges take f64, and this count stays far below 2^52"
+)]
+fn record_pending_gauge(held: usize) {
+    metrics::gauge!(common::metrics::metric_name("ldbws_pending_samples")).set(held as f64);
+}
+
+/// The stations to sample this cycle: `api`'s current list or, while `api`
+/// cannot serve one, the last list it served. A fresh process has no last
+/// list, so it waits for `api` (retrying with `wait`, beating `progress`)
+/// before it can sample anything.
+async fn station_list(
+    client: &Client,
+    config: &Config,
+    tokens: &common::oauth_client::OAuthTokenCache,
+    cached: &mut Option<Vec<String>>,
+    wait: &ingest::ApiWait,
+    progress: Option<&common::progress::Progress>,
+) -> anyhow::Result<Vec<String>> {
+    let started = tokio::time::Instant::now();
+    let mut failures: u32 = 0;
+    loop {
+        let err = match fetch_sample_stations(client, config, tokens).await {
+            Ok(stations) => {
+                let stations = well_formed_stations(stations);
+                tracing::info!(count = stations.len(), "fetched station list to sample");
+                *cached = Some(stations.clone());
+                return Ok(stations);
+            }
+            Err(err) => err,
+        };
+        if let Some(stations) = cached {
+            tracing::warn!(
+                error = ?err,
+                count = stations.len(),
+                "could not fetch the station list from api; sampling the last one it served"
+            );
+            return Ok(stations.clone());
+        }
+        let delay = wait
+            .backoff
+            .delay_honouring(failures, ingest::retry_after(&err));
+        if started.elapsed() + delay > wait.max_wait {
+            return Err(err.context("no station list to sample: api has not served one yet"));
+        }
+        tracing::warn!(
+            error = ?err,
+            attempt = failures + 1,
+            retry_in_secs = delay.as_secs(),
+            "api has not served a station list yet; waiting for it"
+        );
+        if let Some(progress) = progress {
+            progress.beat();
+        }
+        tokio::time::sleep(delay).await;
+        failures = failures.saturating_add(1);
+    }
+}
+
+/// POSTs every held sample (`pending`), retrying a transient failure for a
+/// quarter of the poll interval (`post_retry_budget`). On success, empties
+/// `pending` and returns what it delivered. On a transient failure, keeps
+/// everything for the next cycle. On a rejection (400/413/422, which the
+/// same body would get again), drops it all, logged, so one bad sample
+/// cannot block every later one.
+async fn deliver_pending(
+    client: &Client,
+    config: &Config,
+    tokens: &common::oauth_client::OAuthTokenCache,
+    pending: &mut PendingSamples,
+) -> anyhow::Result<Vec<(String, std::time::Instant)>> {
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let result = ingest::post_batch_retrying(
         client,
         &config.api_ingest_url,
-        internal_oauth,
-        &samples,
+        tokens,
+        &pending.batch(),
         "station samples",
         common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
     )
-    .await
+    .await;
+    match result {
+        Ok(()) => Ok(pending.clear()),
+        Err(err) if ingest::classify_failure(&err) == ingest::FailureClass::Rejected => {
+            tracing::error!(
+                error = ?err,
+                dropped = pending.len(),
+                "api rejected the station samples; dropping them"
+            );
+            pending.clear();
+            Err(err)
+        }
+        Err(err) => {
+            tracing::warn!(
+                held = pending.len(),
+                "station samples not delivered; holding them for the next cycle"
+            );
+            Err(err)
+        }
+    }
 }
 
 /// SVC-04's per-cycle gauges: how many stations there are, how many the
@@ -1539,5 +1741,348 @@ mod tests {
             sample_stations_url(&config).expect("valid url"),
             "http://api:8080/private/sample-stations?pinned_lines_only=true&max_stations=150"
         );
+    }
+
+    /// A stand-in for `api`: the token endpoint always answers; the
+    /// sample-station list and the ingest POST answer only while `up`.
+    struct FakeApi {
+        up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        stations: Vec<String>,
+    }
+
+    impl wiremock::Respond for FakeApi {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            if request.url.path() == "/token/" {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "fake-jwt",
+                    "expires_in": 300,
+                }));
+            }
+            if !self.up.load(std::sync::atomic::Ordering::SeqCst) {
+                return ResponseTemplate::new(503).set_body_string("api is restarting");
+            }
+            match request.url.path() {
+                "/private/sample-stations" => {
+                    ResponseTemplate::new(200).set_body_json(&self.stations)
+                }
+                _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({"upserted": 0})),
+            }
+        }
+    }
+
+    /// LDBWS answering every station except those in `failing` (a 500).
+    struct FakeLdbws {
+        failing: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl wiremock::Respond for FakeLdbws {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let crs = request.url.path().rsplit('/').next().unwrap_or_default();
+            if self.failing.lock().unwrap().iter().any(|f| f == crs) {
+                ResponseTemplate::new(500).set_body_string("Internal Server Error")
+            } else {
+                ResponseTemplate::new(200).set_body_string(ONE_SERVICE_BODY)
+            }
+        }
+    }
+
+    /// The `api` and LDBWS fakes plus the poller's cross-cycle state, wired
+    /// up the way `run` wires them.
+    struct Outage {
+        api: MockServer,
+        ldbws: MockServer,
+        api_up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ldbws_failing: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        config: Config,
+        tokens: common::oauth_client::OAuthTokenCache,
+        history: PlatformHistory,
+        rotation: Rotation,
+        budget: RequestBudget,
+        held: HeldState,
+    }
+
+    /// Never waits long for a first station list.
+    const TEST_LIST_WAIT: ingest::ApiWait = ingest::ApiWait {
+        backoff: common::backoff::Backoff::new(
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        ),
+        max_wait: Duration::from_millis(100),
+    };
+
+    impl Outage {
+        async fn start(names: &[&str]) -> Self {
+            let api_up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let api = MockServer::start().await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(FakeApi {
+                    up: std::sync::Arc::clone(&api_up),
+                    stations: names.iter().map(ToString::to_string).collect(),
+                })
+                .mount(&api)
+                .await;
+            let ldbws_failing = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let ldbws = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(FakeLdbws {
+                    failing: std::sync::Arc::clone(&ldbws_failing),
+                })
+                .mount(&ldbws)
+                .await;
+            // numRows 1: a failing station is not retried with fewer rows.
+            let mut config = test_config(ldbws.uri(), 1);
+            config.api_sample_stations_url = format!("{}/private/sample-stations", api.uri());
+            config.api_ingest_url = format!("{}/private/station-samples", api.uri());
+            config.internal_oauth.internal_oauth_token_url = format!("{}/token/", api.uri());
+            // A 0.5 s POST retry budget: shorter than the first retry
+            // delay, so a failed POST fails at once.
+            config.poll_interval_secs = 2;
+            let tokens = config.internal_oauth.token_cache();
+            Self {
+                api,
+                ldbws,
+                api_up,
+                ldbws_failing,
+                config,
+                tokens,
+                history: PlatformHistory::new(),
+                rotation: Rotation::new(std::time::Instant::now()),
+                // Two stations a cycle (120 an hour at 60 s cycles).
+                budget: RequestBudget::new(120, 60),
+                held: HeldState::default(),
+            }
+        }
+
+        async fn cycle(&mut self) -> anyhow::Result<()> {
+            poll_once(
+                &Client::new(),
+                &self.config,
+                &mut CycleState {
+                    platform_history: &mut self.history,
+                    rotation: &mut self.rotation,
+                    request_budget: &mut self.budget,
+                    held: &mut self.held,
+                },
+                &self.tokens,
+                &TEST_LIST_WAIT,
+                None,
+            )
+            .await
+        }
+
+        /// LDBWS requests (CRS codes, in order) and decoded ingest POSTs
+        /// since the last call.
+        async fn take_requests(
+            &self,
+            seen: &mut (usize, usize),
+        ) -> (Vec<String>, Vec<Vec<StationSample>>) {
+            let ldbws = self.ldbws.received_requests().await.expect("recording");
+            let boards: Vec<String> = ldbws[seen.0..]
+                .iter()
+                .map(|r| r.url.path().rsplit('/').next().unwrap().to_string())
+                .collect();
+            let posts: Vec<_> = self
+                .api
+                .received_requests()
+                .await
+                .expect("recording")
+                .into_iter()
+                .filter(|r| {
+                    r.method.as_str() == "POST" && r.url.path() == "/private/station-samples"
+                })
+                .collect();
+            let new_posts = posts[seen.1..]
+                .iter()
+                .map(|r| serde_json::from_slice(&r.body).expect("a StationSample array"))
+                .collect();
+            *seen = (ldbws.len(), posts.len());
+            (boards, new_posts)
+        }
+    }
+
+    /// The deploy case: `api` is down for three cycles. The poller keeps
+    /// sampling LDBWS every cycle, but the rotation holds (the same two
+    /// stations each time), every cycle reports failure, and only the latest
+    /// sample per station is held. The first cycle after `api` is back
+    /// delivers everything held -- including a sample from the outage it
+    /// could not take again, with its original `polled_at` -- and the
+    /// rotation then moves on to the stations it had not reached.
+    #[tokio::test]
+    async fn an_api_outage_over_several_cycles_loses_no_sample_and_skips_no_station() {
+        let names = ["AAA", "BBB", "CCC", "DDD", "EEE"];
+        let mut outage = Outage::start(&names).await;
+        let mut seen = (0, 0);
+
+        // Cycle 1: api up. Two stations sampled and delivered.
+        outage.cycle().await.expect("api is up");
+        let (first_boards, posts) = outage.take_requests(&mut seen).await;
+        assert_eq!(first_boards.len(), 2, "{first_boards:?}");
+        assert_eq!(posts.len(), 1);
+        assert!(outage.held.pending.is_empty());
+
+        // Cycles 2-4: api down. LDBWS is still sampled every cycle, the same
+        // two stations each time; nothing is delivered and the cycle fails.
+        outage
+            .api_up
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut outage_boards = Vec::new();
+        let mut held_polled_at = Vec::new();
+        for cycle in 2..=4 {
+            let err = outage
+                .cycle()
+                .await
+                .expect_err("the POST fails while api is down");
+            assert_eq!(
+                ingest::classify_failure(&err),
+                ingest::FailureClass::Transient,
+                "{err:?}"
+            );
+            let (boards, _) = outage.take_requests(&mut seen).await;
+            assert_eq!(boards.len(), 2, "cycle {cycle} still sampled LDBWS");
+            outage_boards.push(boards);
+            assert_eq!(
+                outage.held.pending.len(),
+                2,
+                "latest sample per station only"
+            );
+            held_polled_at.push(
+                outage
+                    .held
+                    .pending
+                    .batch()
+                    .iter()
+                    .map(|s| (s.crs.clone(), s.polled_at))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(outage_boards[0], outage_boards[1], "the rotation held");
+        assert_eq!(outage_boards[1], outage_boards[2], "the rotation held");
+        assert!(
+            outage_boards[0]
+                .iter()
+                .all(|crs| !first_boards.contains(crs)),
+            "the outage cycles sample the stations after cycle 1's: {first_boards:?} then {outage_boards:?}"
+        );
+        assert!(
+            held_polled_at[2][0].1 > held_polled_at[0][0].1,
+            "a newer sample replaces the held one"
+        );
+
+        // Cycle 5: api back. One held station now fails upstream, so its
+        // sample from cycle 4 is the one delivered, polled_at unchanged.
+        let (stale_crs, stale_polled_at) = held_polled_at[2][1].clone();
+        outage.ldbws_failing.lock().unwrap().push(stale_crs.clone());
+        outage
+            .api_up
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        outage.cycle().await.expect("api is back");
+        let (boards, posts) = outage.take_requests(&mut seen).await;
+        assert_eq!(
+            boards, outage_boards[2],
+            "the held stations are sampled again"
+        );
+        assert_eq!(posts.len(), 1, "one POST delivers everything");
+        let delivered: Vec<&str> = posts[0].iter().map(|s| s.crs.as_str()).collect();
+        let mut expected = outage_boards[2]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert_eq!(delivered, expected);
+        let resent = posts[0].iter().find(|s| s.crs == stale_crs).unwrap();
+        assert_eq!(resent.polled_at, stale_polled_at, "original polled_at kept");
+        assert!(outage.held.pending.is_empty());
+
+        // Cycle 6: the rotation has moved on to the station not yet reached.
+        outage.ldbws_failing.lock().unwrap().clear();
+        outage.cycle().await.expect("api is up");
+        let (boards, _) = outage.take_requests(&mut seen).await;
+        let reached: std::collections::HashSet<&String> = first_boards
+            .iter()
+            .chain(&outage_boards[2])
+            .chain(&boards)
+            .collect();
+        assert_eq!(
+            reached.len(),
+            names.len(),
+            "every station reached, none skipped"
+        );
+    }
+
+    /// A fresh process has no station list to fall back on: while api is
+    /// down it waits (briefly here), then fails without calling LDBWS.
+    #[tokio::test]
+    async fn a_fresh_process_with_api_down_waits_for_the_station_list() {
+        let mut outage = Outage::start(&["AAA", "BBB"]).await;
+        outage
+            .api_up
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let err = outage.cycle().await.expect_err("no station list yet");
+
+        assert!(format!("{err:#}").contains("no station list"), "{err:#}");
+        let gets = outage
+            .api
+            .received_requests()
+            .await
+            .expect("recording")
+            .iter()
+            .filter(|r| r.url.path() == "/private/sample-stations")
+            .count();
+        assert!(gets > 1, "retried the station list: {gets}");
+        assert!(
+            outage
+                .ldbws
+                .received_requests()
+                .await
+                .expect("recording")
+                .is_empty()
+        );
+    }
+
+    /// A rejected batch would be rejected again, so it is dropped rather
+    /// than held forever, and the rotation moves on.
+    #[tokio::test]
+    async fn a_rejected_batch_is_dropped_not_held() {
+        let mut outage = Outage::start(&["AAA", "BBB", "CCC"]).await;
+        outage.api.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/token/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fake-jwt",
+                "expires_in": 300,
+            })))
+            .mount(&outage.api)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/private/sample-stations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(["AAA", "BBB", "CCC"]))
+            .mount(&outage.api)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/private/station-samples"))
+            .respond_with(ResponseTemplate::new(422).set_body_string("bad sample"))
+            .mount(&outage.api)
+            .await;
+
+        let err = outage.cycle().await.expect_err("rejected");
+
+        assert_eq!(
+            ingest::classify_failure(&err),
+            ingest::FailureClass::Rejected
+        );
+        assert!(outage.held.pending.is_empty());
+    }
+
+    /// The loop never waits for api before a cycle, and never retries a
+    /// failed cycle before the next interval (no extra LDBWS requests).
+    #[test]
+    fn the_retry_policy_never_waits_for_api_or_retries_early() {
+        let interval = Duration::from_secs(60);
+        let policy = retry_policy(interval);
+        assert_eq!(policy.api_wait.max_wait, Duration::ZERO);
+        for attempt in 0..10 {
+            assert!(policy.failed_cycle.delay(attempt) >= interval);
+        }
     }
 }

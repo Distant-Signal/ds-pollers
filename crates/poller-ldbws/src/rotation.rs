@@ -216,17 +216,41 @@ impl Rotation {
         sampled: impl IntoIterator<Item = &'a str>,
         now: Instant,
     ) -> Vec<String> {
+        self.advance(ordered, completed);
+        sampled
+            .into_iter()
+            .filter(|crs| self.note_sampled(crs, now))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Moves the next cycle's start past the first `completed` stations of
+    /// `ordered` (the list the cycle polled). `main.rs` calls this only once
+    /// the cycle's samples were delivered to `api`; see [`Rotation::hold`].
+    pub(crate) fn advance(&mut self, ordered: &[String], completed: usize) {
         if !ordered.is_empty() {
             self.next_start = Some(ordered[completed % ordered.len()].clone());
         }
-        let mut recovered = Vec::new();
-        for crs in sampled {
-            self.last_sampled.insert(crs.to_string(), now);
-            if self.invalid.remove(crs).is_some() {
-                recovered.push(crs.to_string());
-            }
+    }
+
+    /// Keeps the next cycle's start where this cycle's was, for a cycle
+    /// whose samples `api` did not take: the next cycle samples the same
+    /// stations again, so no station is skipped. `ordered` is what
+    /// [`Rotation::order`] returned this cycle; this pins its first station
+    /// when the start was still the clock-derived one, which would
+    /// otherwise move on with the clock.
+    pub(crate) fn hold(&mut self, ordered: &[String]) {
+        if self.next_start.is_none() {
+            self.next_start = ordered.first().cloned();
         }
-        recovered
+    }
+
+    /// Records that `crs` produced a sample, taken at `at`, that reached
+    /// `api`. Returns `true` if it had been marked invalid (it recovered).
+    pub(crate) fn note_sampled(&mut self, crs: &str, at: Instant) -> bool {
+        let last = self.last_sampled.entry(crs.to_string()).or_insert(at);
+        *last = (*last).max(at);
+        self.invalid.remove(crs).is_some()
     }
 
     /// How long ago the least recently sampled station in `stations` was
@@ -350,6 +374,24 @@ mod tests {
         let ordered = rotation.order(&all, 0, 60);
         rotation.finish_cycle(&ordered, 2, [], Instant::now());
         assert_eq!(rotation.order(&all, 60, 60)[0], ordered[2]);
+    }
+
+    /// A cycle whose samples were not delivered leaves the start where it
+    /// was, including a fresh process's clock-derived start, which would
+    /// otherwise move on with the clock.
+    #[test]
+    fn a_held_cycle_starts_the_next_one_at_the_same_station() {
+        let all = stations(560);
+        let mut rotation = Rotation::new(Instant::now());
+        let first = rotation.order(&all, 1_790_000_000, 60);
+        rotation.hold(&first);
+        assert_eq!(rotation.order(&all, 1_790_000_060, 60)[0], first[0]);
+
+        rotation.advance(&first, 2);
+        let second = rotation.order(&all, 1_790_000_120, 60);
+        assert_eq!(second[0], first[2]);
+        rotation.hold(&second);
+        assert_eq!(rotation.order(&all, 1_790_000_180, 60)[0], first[2]);
     }
 
     /// A restart does not start at "A" every time: the first cycle's offset
