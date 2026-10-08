@@ -28,6 +28,7 @@ mod pending;
 mod platform_history;
 mod rotation;
 mod schema;
+mod sink;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -39,10 +40,12 @@ use clap::Parser;
 use common::ingest::{self, RDM_AUTH_HEADER_NAME};
 use common::{StationDeparture, StationSample};
 use config::Config;
+use ingest_stream::snapshot::SinkMode;
 use pending::PendingSamples;
 use platform_history::PlatformHistory;
 use reqwest::{Client, StatusCode};
 use rotation::Rotation;
+use sink::SampleSink;
 
 /// Per-request timeout — see the other three pollers' identical rationale.
 /// 30s is comfortably short relative to the 60s default poll interval.
@@ -147,12 +150,17 @@ async fn run() -> anyhow::Result<()> {
     ))
     .increment(0);
 
-    common::poller_loop::run_poll_loop_with_policy(
+    // Plan 3a.7: where the samples go (INGEST_SINK; `sink.rs`), and so
+    // where the startup cursor comes from. Under `stream` the cycle
+    // bypasses `pending`: the producer's latest-only buffer holds the
+    // undelivered snapshot instead.
+    let sink = SampleSink::from_config(&config)?;
+    tracing::info!(ingest_sink = %sink.mode(), "station samples sink");
+
+    common::poller_loop::run_poll_loop_with_policy_and_cursor(
         &retry_policy(poll_interval),
         "ldbws",
-        &client,
-        &config.api_ingest_url,
-        &internal_oauth,
+        || sink.last_fetched(&client, &config, &internal_oauth),
         poll_interval,
         config.metrics.metrics_enabled,
         config.metrics_port,
@@ -163,6 +171,7 @@ async fn run() -> anyhow::Result<()> {
             let budget = Rc::clone(&budget);
             let held = Rc::clone(&held);
             let progress = &progress;
+            let sink = &sink;
             let client = &client;
             let config = &config;
             let internal_oauth = &internal_oauth;
@@ -188,6 +197,7 @@ async fn run() -> anyhow::Result<()> {
                     internal_oauth,
                     &ingest::API_STARTUP_WAIT,
                     Some(progress),
+                    sink,
                 )
                 .await;
                 *platform_history.borrow_mut() = history;
@@ -250,6 +260,10 @@ struct CycleState<'a> {
 /// see `pending`), the next cycle samples the same stations again, and the
 /// cycle reports failure. So an `api` outage costs no station its turn and
 /// loses no sample: the first POST after it delivers everything held.
+///
+/// Under `INGEST_SINK=stream` (plan 3a.7) the samples skip `pending` and go
+/// to the stream as one snapshot; a failed XADD holds the rotation the same
+/// way, and the producer keeps the latest undelivered snapshot.
 async fn poll_once(
     client: &Client,
     config: &Config,
@@ -257,6 +271,7 @@ async fn poll_once(
     internal_oauth: &common::oauth_client::OAuthTokenCache,
     first_list_wait: &ingest::ApiWait,
     progress: Option<&common::progress::Progress>,
+    sink: &SampleSink,
 ) -> anyhow::Result<()> {
     let stations = station_list(
         client,
@@ -309,20 +324,41 @@ async fn poll_once(
         tracing::warn!("no station samples collected this cycle");
     }
     let pending = &mut state.held.pending;
-    let evicted = pending.add(samples, now);
-    if evicted > 0 {
-        tracing::warn!(
-            evicted,
-            max = pending::MAX_PENDING_STATIONS,
-            "too many undelivered station samples held; dropped the oldest"
-        );
-        metrics::counter!(common::metrics::metric_name(
-            "ldbws_pending_samples_evicted_total"
-        ))
-        .increment(evicted as u64);
-    }
-
-    let result = deliver_pending(client, config, internal_oauth, pending).await;
+    let result = if sink.mode() == SinkMode::Stream && samples.is_empty() {
+        Ok(Vec::new())
+    } else if sink.mode() == SinkMode::Stream {
+        // Stream mode bypasses `pending` (plan 3a.7): a failed XADD fails
+        // the cycle transiently, `Rotation::hold` keeps the next cycle on
+        // the same stations, and the producer's latest-only buffer holds
+        // the undelivered snapshot, which the next cycle's supersedes.
+        let delivered: Vec<(String, std::time::Instant)> = samples
+            .iter()
+            .map(|sample| (sample.crs.clone(), now))
+            .collect();
+        sink.deliver(
+            client,
+            config,
+            internal_oauth,
+            &samples,
+            common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
+        )
+        .await
+        .map(|()| delivered)
+    } else {
+        let evicted = pending.add(samples, now);
+        if evicted > 0 {
+            tracing::warn!(
+                evicted,
+                max = pending::MAX_PENDING_STATIONS,
+                "too many undelivered station samples held; dropped the oldest"
+            );
+            metrics::counter!(common::metrics::metric_name(
+                "ldbws_pending_samples_evicted_total"
+            ))
+            .increment(evicted as u64);
+        }
+        deliver_pending(client, config, internal_oauth, pending, sink).await
+    };
     let progressed = match &result {
         Ok(delivered) => {
             rotation.advance(&polled, completed);
@@ -414,7 +450,8 @@ async fn station_list(
     }
 }
 
-/// POSTs every held sample (`pending`), retrying a transient failure for a
+/// Delivers every held sample (`pending`) through `sink` (`http` or
+/// `http+shadow`: the POST is authoritative), retrying a transient failure for a
 /// quarter of the poll interval (`post_retry_budget`). On success, empties
 /// `pending` and returns what it delivered. On a transient failure, keeps
 /// everything for the next cycle. On a rejection (400/413/422, which the
@@ -425,19 +462,20 @@ async fn deliver_pending(
     config: &Config,
     tokens: &common::oauth_client::OAuthTokenCache,
     pending: &mut PendingSamples,
+    sink: &SampleSink,
 ) -> anyhow::Result<Vec<(String, std::time::Instant)>> {
     if pending.is_empty() {
         return Ok(Vec::new());
     }
-    let result = ingest::post_batch_retrying(
-        client,
-        &config.api_ingest_url,
-        tokens,
-        &pending.batch(),
-        "station samples",
-        common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
-    )
-    .await;
+    let result = sink
+        .deliver(
+            client,
+            config,
+            tokens,
+            &pending.batch(),
+            common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
+        )
+        .await;
     match result {
         Ok(()) => Ok(pending.clear()),
         Err(err) if ingest::classify_failure(&err) == ingest::FailureClass::Rejected => {
@@ -1089,6 +1127,7 @@ mod tests {
                 internal_oauth_username: "svc-poller-ldbws".to_string(),
                 internal_oauth_password: "app-password".to_string(),
             },
+            ingest: config::IngestArgs::default(),
             poll_interval_secs: 60,
             hourly_request_budget: 0,
             sample_pinned_lines_only: false,
@@ -1799,6 +1838,7 @@ mod tests {
         rotation: Rotation,
         budget: RequestBudget,
         held: HeldState,
+        sink: SampleSink,
     }
 
     /// Never waits long for a first station list.
@@ -1838,6 +1878,8 @@ mod tests {
             // delay, so a failed POST fails at once.
             config.poll_interval_secs = 2;
             let tokens = config.internal_oauth.token_cache();
+            // `http` (the default): no Redis.
+            let sink = SampleSink::from_config(&config).expect("http sink");
             Self {
                 api,
                 ldbws,
@@ -1850,6 +1892,7 @@ mod tests {
                 // Two stations a cycle (120 an hour at 60 s cycles).
                 budget: RequestBudget::new(120, 60),
                 held: HeldState::default(),
+                sink,
             }
         }
 
@@ -1866,6 +1909,7 @@ mod tests {
                 &self.tokens,
                 &TEST_LIST_WAIT,
                 None,
+                &self.sink,
             )
             .await
         }
@@ -1898,6 +1942,40 @@ mod tests {
             *seen = (ldbws.len(), posts.len());
             (boards, new_posts)
         }
+    }
+
+    /// `INGEST_SINK=stream` with Redis down (plan 3a.7 composed with the
+    /// held samples): the samples bypass `pending`, nothing is POSTed, the
+    /// cycle fails transiently and the rotation holds, so the next cycle
+    /// samples the same stations and its snapshot supersedes the held one.
+    #[tokio::test]
+    async fn stream_mode_with_redis_down_bypasses_pending_and_holds_the_rotation() {
+        let mut outage = Outage::start(&["AAA", "BBB", "CCC"]).await;
+        outage.config.ingest.ingest_sink = SinkMode::Stream;
+        outage.config.ingest.redis_url = Some("redis://127.0.0.1:1".to_owned());
+        outage.sink = SampleSink::from_config(&outage.config).expect("stream sink");
+        let mut seen = (0, 0);
+        let mut boards = Vec::new();
+        for _ in 0..2 {
+            let err = outage
+                .cycle()
+                .await
+                .expect_err("the XADD cannot be written");
+            assert_eq!(
+                ingest::classify_failure(&err),
+                ingest::FailureClass::Transient,
+                "{err:?}"
+            );
+            let (cycle_boards, posts) = outage.take_requests(&mut seen).await;
+            assert!(posts.is_empty(), "stream mode never POSTs");
+            assert!(
+                outage.held.pending.is_empty(),
+                "stream mode bypasses pending"
+            );
+            boards.push(cycle_boards);
+        }
+        assert_eq!(boards[0].len(), 2, "{boards:?}");
+        assert_eq!(boards[0], boards[1], "the rotation held");
     }
 
     /// The deploy case: `api` is down for three cycles. The poller keeps

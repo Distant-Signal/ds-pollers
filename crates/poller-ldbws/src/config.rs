@@ -1,4 +1,5 @@
 use clap::Parser;
+use ingest_stream::snapshot::SinkMode;
 
 /// CLI/env configuration for the `poller-ldbws` service.
 ///
@@ -67,6 +68,11 @@ pub(crate) struct Config {
     #[command(flatten)]
     pub internal_oauth: common::oauth_client::InternalOAuthArgs,
 
+    /// Where the samples go (`INGEST_SINK`, ingest architecture plan 3a.7)
+    /// and the Redis they are XADDed to. See `sink.rs`.
+    #[command(flatten)]
+    pub ingest: IngestArgs,
+
     /// DESIGN.md §4's aggregator polling cadence target is "30-60s"; 60 is
     /// the conservative end. The resulting request volume (one request per
     /// sample station, about 560 of them, as many as fit `main.rs`'s 45 s
@@ -113,6 +119,53 @@ pub(crate) struct Config {
     pub health: common::service_args::HealthArgs,
 }
 
+/// `INGEST_SINK` and its Redis (ingest architecture plan 3a.7, spec §13.1).
+/// The defaults are today's behaviour: `http`, no Redis.
+#[derive(clap::Args, Clone, Debug, Default)]
+pub(crate) struct IngestArgs {
+    /// `http` (the default): POST each cycle's samples to the api.
+    /// `http+shadow`: the same POST, plus a copy XADDed to
+    /// `ds:ingest:station-samples` for the ingest-writer's `shadow` mode.
+    /// `stream`: XADD only, keeping the latest unsent snapshot while Redis
+    /// is down, and read the startup cursor from the stream.
+    #[arg(long, env, default_value_t = SinkMode::Http)]
+    pub ingest_sink: SinkMode,
+
+    /// Redis for `http+shadow` and `stream`. Unused under `http`.
+    #[arg(long, env)]
+    pub redis_url: Option<String>,
+
+    /// The `poller-ldbws` ACL user (chart `redis.acl.clients.pollerLdbws`).
+    /// Unset or empty: the `default` user.
+    #[arg(long, env)]
+    pub redis_username: Option<String>,
+
+    /// That user's password (or the `redis.auth` one). Never logged.
+    #[arg(long, env, hide_env_values = true)]
+    pub redis_password: Option<common::secret::Secret>,
+}
+
+impl IngestArgs {
+    /// The Redis client for a sink that XADDs, or `None` under `http`.
+    pub(crate) fn redis_client(&self) -> anyhow::Result<Option<redis::Client>> {
+        if !self.ingest_sink.produces() {
+            return Ok(None);
+        }
+        let Some(url) = self.redis_url.as_deref().filter(|url| !url.is_empty()) else {
+            anyhow::bail!("INGEST_SINK={} needs REDIS_URL", self.ingest_sink);
+        };
+        let url = common::redis_auth::redis_url_with_credentials(
+            url,
+            self.redis_username.as_deref(),
+            self.redis_password.as_ref(),
+        )?;
+        // No `.context(url)`: it carries the password.
+        let client = redis::Client::open(url.expose())
+            .map_err(|_| anyhow::anyhow!("REDIS_URL is not a valid Redis URL (value not shown)"))?;
+        Ok(Some(client))
+    }
+}
+
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
@@ -122,6 +175,7 @@ impl std::fmt::Debug for Config {
             .field("api_sample_stations_url", &self.api_sample_stations_url)
             .field("api_ingest_url", &self.api_ingest_url)
             .field("internal_oauth", &self.internal_oauth)
+            .field("ingest", &self.ingest)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("hourly_request_budget", &self.hourly_request_budget)
             .field("sample_pinned_lines_only", &self.sample_pinned_lines_only)
@@ -137,7 +191,7 @@ impl std::fmt::Debug for Config {
 mod config_debug_tests {
     use clap::Parser;
 
-    use super::Config;
+    use super::{Config, SinkMode};
 
     #[test]
     fn debug_redacts_the_rdm_api_key() {
@@ -196,6 +250,44 @@ mod config_debug_tests {
         assert_eq!(config.hourly_request_budget, 0);
         assert!(!config.sample_pinned_lines_only);
         assert_eq!(config.sample_max_stations, 0);
+        // Plan 3a.7: the sink defaults to today's POST, with no Redis.
+        assert_eq!(config.ingest.ingest_sink, SinkMode::Http);
+        assert!(config.ingest.redis_client().unwrap().is_none());
+    }
+
+    /// `http+shadow` and `stream` XADD, so they need `REDIS_URL`.
+    #[test]
+    fn a_stream_sink_needs_redis() {
+        use super::IngestArgs;
+
+        for sink in [SinkMode::HttpShadow, SinkMode::Stream] {
+            let mut args = IngestArgs {
+                ingest_sink: sink,
+                ..IngestArgs::default()
+            };
+            assert!(args.redis_client().is_err(), "{sink}");
+            args.redis_url = Some("redis://redis:6379".to_owned());
+            assert!(args.redis_client().unwrap().is_some(), "{sink}");
+        }
+        let parsed = Config::try_parse_from([
+            "poller-ldbws",
+            "--ldbws-base-url",
+            "https://example.invalid",
+            "--rdm-api-key",
+            "key",
+            "--internal-oauth-token-url",
+            "http://authentik.example/token",
+            "--internal-oauth-client-id",
+            "client-id",
+            "--internal-oauth-username",
+            "svc-account",
+            "--internal-oauth-password",
+            "svc-password",
+            "--ingest-sink",
+            "http+shadow",
+        ])
+        .expect("http+shadow parses");
+        assert_eq!(parsed.ingest.ingest_sink, SinkMode::HttpShadow);
     }
 }
 
