@@ -1,6 +1,7 @@
 //! `poller-stations`: polls the RDM Stations JSON feed on an interval and
 //! forwards parsed `StationReference`s to the `api` crate's
-//! `/private/stations` ingestion endpoint.
+//! `/private/stations` ingestion endpoint, or (`INGEST_SINK=db`, ingest
+//! architecture plan 2b) writes them to Postgres directly; see `sink.rs`.
 //!
 //! Built against RSPS5050 P-03-00 Rev A, §6 — this is the best-documented of
 //! the three RDM products: the `/stations` endpoint path and the 24-hour
@@ -12,13 +13,21 @@
 mod alloc_meter;
 mod config;
 mod schema;
+mod sink;
 
 use std::time::Duration;
 
 use clap::Parser;
 use common::ingest::{self, RDM_AUTH_HEADER_NAME};
-use config::Config;
+use config::{Config, IngestSink};
 use reqwest::Client;
+use sink::{DbSink, HttpSink, StationsSink};
+
+/// `pg_stat_activity.application_name` under `INGEST_SINK=db`.
+const APPLICATION_NAME: &str = "distant-signal-poller-stations";
+/// Spec §6.6: pool 1, role limit 2. The writes are one transaction per
+/// day, after the cursor read; nothing runs concurrently.
+const DEFAULT_MAX_CONNECTIONS: u32 = 1;
 
 /// Per-request timeout for both the RDM fetch and the ingestion POST. A
 /// peer that accepts the TCP connection but never responds would otherwise
@@ -38,46 +47,106 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("poller-stations");
 
     let config = Config::parse();
+    config.validate()?;
+    // Installed here rather than by the poll loop, so the schema gate's
+    // `db_schema_ready` (under `INGEST_SINK=db`) is exported while it waits.
+    if config.metrics.metrics_enabled {
+        common::metrics::install(config.metrics_port)?;
+    }
     let progress = health_http::spawn_liveness(&config.health);
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
-    let internal_oauth = config.internal_oauth.token_cache();
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
+    let retry_budget = common::poller_loop::post_retry_budget(poll_interval);
 
-    common::poller_loop::run_poll_loop(
+    match config.ingest_sink {
+        IngestSink::Http => {
+            let sink = HttpSink {
+                client: client.clone(),
+                url: config.api_ingest_url.clone(),
+                tokens: config.internal_oauth.token_cache(),
+                retry_budget,
+            };
+            run_with(&client, &config, &progress, &sink).await
+        }
+        IngestSink::Db => {
+            let pool = connect_database(&config, &progress).await?;
+            tracing::info!("INGEST_SINK=db: writing stations to Postgres directly");
+            let sink = DbSink {
+                pool,
+                retry_budget,
+                backoff: ingest::POST_RETRY_BACKOFF,
+            };
+            run_with(&client, &config, &progress, &sink).await
+        }
+    }
+}
+
+/// `INGEST_SINK=db`: waits for Postgres (INF-5), connects the pool (with
+/// the `db_pool_*` metrics) and passes the schema gate as the `stations`
+/// role (spec §12.2) before the first poll.
+async fn connect_database(
+    config: &Config,
+    progress: &common::progress::Progress,
+) -> anyhow::Result<sqlx::PgPool> {
+    let url = config
+        .database_url
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("INGEST_SINK=db needs DATABASE_URL"))?;
+    common::startup::retry_until_ready(
+        "Postgres",
+        common::startup::CONNECT_BACKOFF,
+        Some(progress),
+        || async {
+            use sqlx::Connection;
+            sqlx::PgConnection::connect(url.expose())
+                .await?
+                .close()
+                .await
+        },
+    )
+    .await;
+    ds_store::pool::register_metrics();
+    let pool = ds_store::pool::PoolSettings::from_env(APPLICATION_NAME, DEFAULT_MAX_CONNECTIONS)?
+        .connect(url.expose())
+        .await?;
+    ds_store::schema::wait_for_schema(&pool, ds_store::schema::DbRole::Stations, Some(progress))
+        .await?;
+    Ok(pool)
+}
+
+async fn run_with<S: StationsSink>(
+    client: &Client,
+    config: &Config,
+    progress: &common::progress::Progress,
+    sink: &S,
+) -> anyhow::Result<()> {
+    common::poller_loop::run_poll_loop_with_cursor(
         "stations",
-        &client,
-        &config.api_ingest_url,
-        &internal_oauth,
-        poll_interval,
-        config.metrics.metrics_enabled,
+        || sink.last_fetched(),
+        Duration::from_secs(config.poll_interval_secs),
+        // Installed in `run`.
+        false,
         config.metrics_port,
-        &progress,
-        || poll_once(&client, &config, &internal_oauth),
+        progress,
+        || poll_once(client, config, sink),
     )
     .await
 }
 
-async fn poll_once(
+async fn poll_once<S: StationsSink>(
     client: &Client,
     config: &Config,
-    internal_oauth: &common::oauth_client::OAuthTokenCache,
+    sink: &S,
 ) -> anyhow::Result<()> {
     // `stations` borrows its passthrough JSON from `body` (see
-    // `schema::parse_stations` on memory), so `body` stays alive for the POST.
+    // `schema::parse_stations` on memory), so `body` stays alive for the
+    // write.
     let body = fetch_stations_json(client, config).await?;
     let stations = schema::parse_stations(&body)?;
 
     tracing::info!(count = stations.len(), "parsed stations from RDM feed");
 
-    ingest::post_batch_retrying(
-        client,
-        &config.api_ingest_url,
-        internal_oauth,
-        &stations,
-        "stations",
-        common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
-    )
-    .await
+    sink.publish(&stations).await
 }
 
 /// Returns the raw body as bytes, not `.text()`: `.text()` copies the whole

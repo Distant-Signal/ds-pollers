@@ -8,9 +8,14 @@ publish.workspace = true
 [dependencies]
 health-http = { path = "../health-http" }
 anyhow = "1.0.102"
+# The startup cursor (`ingest_freshness.fetched_at`).
+chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 common = { path = "../common" }
 dotenvy = "0.15.7"
+# `INGEST_SINK=db` (ingest architecture plan 2b.1): `reference::upsert_stations`,
+# `freshness::last_stations_fetch`, the pool and the schema gate.
+ds-store = { path = "../ds-store" }
 metrics = "0.24"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls", "gzip"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -18,8 +23,15 @@ serde = { version = "1.0.228", features = ["derive"] }
 # fields as `&RawValue` slices of the fetched body instead of building a
 # `serde_json::Value` tree per station -- see its doc comment.
 serde_json = { version = "1.0.149", features = ["raw_value"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+# The ingest-writer's features (the pool type, the Postgres wait).
+sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "tls-native-tls"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1.44"
+
+[dev-dependencies]
+# The sink tests: the api side of `HttpSink` (`POST /private/stations` and
+# the token endpoint).
+wiremock = "0.6"
 
 [lints]
 workspace = true
