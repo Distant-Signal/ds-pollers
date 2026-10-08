@@ -1,7 +1,7 @@
 //! Where a parsed stations feed goes (ingest architecture plan 2b.1,
 //! spec §9.3), chosen by `INGEST_SINK`:
 //!
-//! | Sink | `publish` | `last_fetched` (the startup cursor) |
+//! | Sink | `publish` | `cursor` (the startup cursor, plan 4.6) |
 //! |---|---|---|
 //! | [`HttpSink`] (`http`, the default) | `POST /private/stations` on the api, retried within the poll's budget | `GET /private/stations` |
 //! | [`DbSink`] (`db`) | `ds_store::reference::upsert_stations`, retried the same way | `ds_store::freshness::last_stations_fetch` |
@@ -15,9 +15,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use common::backoff::Backoff;
-use common::ingest::{self, LastFetchedResponse};
+use common::ingest;
 use common::oauth_client::OAuthTokenCache;
 use ds_store::reference::StationRow;
 use serde_json::value::RawValue;
@@ -27,9 +26,11 @@ use crate::schema::StationRecord;
 
 /// One destination for the parsed feed.
 pub(crate) trait StationsSink {
-    /// When the stations feed last landed, or `None` if never: the poll
-    /// loop waits out the rest of the interval after a restart.
-    async fn last_fetched(&self) -> anyhow::Result<Option<DateTime<Utc>>>;
+    /// When the stations feed last landed (`None` if never), as the poll
+    /// loop reads it: the poll waits out the rest of the interval after a
+    /// restart. The api's GET for [`HttpSink`], the freshness row for
+    /// [`DbSink`] (plan 4.6's `CursorSource`).
+    fn cursor(&self) -> ingest::CursorSource<'_>;
 
     /// Writes one whole parsed feed.
     async fn publish(&self, stations: &[StationRecord<'_>]) -> anyhow::Result<()>;
@@ -46,10 +47,8 @@ pub(crate) struct HttpSink {
 }
 
 impl StationsSink for HttpSink {
-    async fn last_fetched(&self) -> anyhow::Result<Option<DateTime<Utc>>> {
-        let body: LastFetchedResponse =
-            ingest::get_json(&self.client, &self.url, &self.tokens).await?;
-        Ok(body.fetched_at)
+    fn cursor(&self) -> ingest::CursorSource<'_> {
+        ingest::CursorSource::http(&self.client, &self.url, &self.tokens)
     }
 
     async fn publish(&self, stations: &[StationRecord<'_>]) -> anyhow::Result<()> {
@@ -75,8 +74,8 @@ pub(crate) struct DbSink {
 }
 
 impl StationsSink for DbSink {
-    async fn last_fetched(&self) -> anyhow::Result<Option<DateTime<Utc>>> {
-        ds_store::freshness::last_stations_fetch(&self.pool).await
+    fn cursor(&self) -> ingest::CursorSource<'_> {
+        ingest::CursorSource::db(|| ds_store::freshness::last_stations_fetch(&self.pool))
     }
 
     async fn publish(&self, stations: &[StationRecord<'_>]) -> anyhow::Result<()> {
@@ -145,6 +144,8 @@ mod db_tests {
     use common::oauth_client::OAuthCredentials;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use common::ingest::LastFetched as _;
 
     use super::*;
     use crate::schema::parse_stations;
@@ -291,7 +292,7 @@ mod db_tests {
         assert_eq!(via_db, via_http);
         assert!(via_db[0].5.contains("sink-test-one"), "{:?}", via_db[0]);
         assert!(
-            db.last_fetched().await.unwrap().is_some(),
+            db.cursor().last_fetched().await.unwrap().is_some(),
             "the db sink records ingest_freshness('stations') and reads it back"
         );
 

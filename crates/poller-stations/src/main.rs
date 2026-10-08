@@ -120,9 +120,9 @@ async fn run_with<S: StationsSink>(
     progress: &common::progress::Progress,
     sink: &S,
 ) -> anyhow::Result<()> {
-    common::poller_loop::run_poll_loop_with_cursor(
+    common::poller_loop::run_poll_loop_with_source(
         "stations",
-        || sink.last_fetched(),
+        sink.cursor(),
         Duration::from_secs(config.poll_interval_secs),
         // Installed in `run`.
         false,

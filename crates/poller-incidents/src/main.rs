@@ -83,11 +83,18 @@ async fn run() -> anyhow::Result<()> {
                 row_heartbeat = config.incidents_row_heartbeat,
                 "writing incident snapshots to Postgres (INGEST_SINK=db)"
             );
-            common::poller_loop::run_poll_loop_from_cursor(
+            // Plan 4.6: the startup cursor is the freshness row, read
+            // with the same wait the HTTP loop gives the api's GET.
+            common::poller_loop::run_poll_loop_with_source(
                 "incidents",
+                common::ingest::CursorSource::db(|| {
+                    ds_store::freshness::last_incidents_fetch(&sink.pool)
+                }),
                 poll_interval,
+                // Installed above.
+                false,
+                config.metrics_port,
                 &progress,
-                || ds_store::freshness::last_incidents_fetch(&sink.pool),
                 || poll_once(&client, &config, &sink),
             )
             .await

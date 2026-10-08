@@ -105,6 +105,10 @@ RUN apt-get update \
     && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 1000 --gid 1000 poller
 
 COPY --from=builder /usr/local/bin/poller-ldbws /usr/local/bin/poller-ldbws
+# The line catalogue (LINES_DIR, default /app/lines): under
+# SAMPLE_STATIONS_SOURCE=db (ingest plan 4.5) the poller computes the
+# stations to sample from it, as the api does.
+COPY --chown=poller:poller lines/ /app/lines/
 
 # Numeric USER, not the `poller` name useradd created above: Kubernetes'
 # runAsNonRoot admission check (this chart's podSecurityContext sets

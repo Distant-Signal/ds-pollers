@@ -117,6 +117,11 @@ pub(crate) struct Config {
     /// `/livez` listener and stall window (SVC-08).
     #[command(flatten)]
     pub health: common::service_args::HealthArgs,
+
+    /// `SAMPLE_STATIONS_SOURCE`, `DATABASE_URL` and `LINES_DIR` (ingest
+    /// architecture plan 4.5): see `sample_source.rs`.
+    #[command(flatten)]
+    pub reads: crate::sample_source::SampleStationsArgs,
 }
 
 /// `INGEST_SINK` and its Redis (ingest architecture plan 3a.7, spec §13.1).
@@ -183,6 +188,7 @@ impl std::fmt::Debug for Config {
             .field("metrics_port", &self.metrics_port)
             .field("metrics", &self.metrics)
             .field("health", &self.health)
+            .field("reads", &self.reads)
             .finish()
     }
 }
