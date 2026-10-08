@@ -34,16 +34,10 @@ pub(crate) const USER_AGENT: &str = common::user_agent!();
 /// precedent `poller-irish-rail-gtfs::Config::gtfs_url`'s own doc comment
 /// already established (`crates/poller-irish-rail-gtfs/src/config.rs:1-12`).
 ///
-/// Signal Box Audit, poll-area Low finding -- "secret-bearing config
-/// structs derive Debug": does NOT derive `Debug`. `internal_oauth_password`
-/// is a real Authentik service-account credential; a derived `Debug` would
-/// print it in full to any future `tracing::debug!("{config:?}")`, matching
-/// the same class of bug already fixed for
-/// `common::oauth_client::OAuthCredentials`/`InternalOAuthArgs` (this crate
-/// hand-rolls the individual `internal_oauth_*` fields rather than
-/// flattening `InternalOAuthArgs` in, matching `poller-irish-rail-gtfs`'s
-/// own precedent, and therefore needs its own redacting impl). The
-/// hand-written impl below redacts it.
+/// Ingest plan 3c.2 (decision D8): snapshots go to the
+/// `ds:ingest:island-of-ireland` stream only, so there is no api URL or
+/// internal OAuth credential any more. Does not derive `Debug`: the hand
+/// impl below keeps the Redis credentials redacted (`RedisArgs`).
 #[derive(Parser)]
 pub(crate) struct Config {
     /// `OpenDataNI`'s "Northern Ireland Railways Stations" CSV.
@@ -62,35 +56,16 @@ pub(crate) struct Config {
     )]
     pub halts_csv_url: String,
 
-    /// The `api` crate's ingestion endpoint for the station catalogue --
-    /// SAME endpoint `poller-irish-rail-gtfs` posts to (see
-    /// docs/superpowers/plans/2026-09-05-nir-tier-a-implementation-plan.md
-    /// Task 1's route-auth widening).
-    #[arg(
-        long,
-        env,
-        default_value = "http://api:8080/private/island-of-ireland-stations"
-    )]
-    pub api_stations_ingest_url: String,
+    /// Where snapshots go: `stream` is the only sink (decision D8: the
+    /// island-of-Ireland pollers keep no HTTP path). Kept so `INGEST_SINK`
+    /// is uniform across the stream producers.
+    #[arg(long, env = "INGEST_SINK", default_value = "stream", value_parser = ["stream"])]
+    pub ingest_sink: String,
 
-    /// The `api` crate's ingestion endpoint for the line catalogue.
-    #[arg(
-        long,
-        env,
-        default_value = "http://api:8080/private/island-of-ireland-lines"
-    )]
-    pub api_lines_ingest_url: String,
-
-    #[arg(long, env)]
-    pub internal_oauth_token_url: String,
-    #[arg(long, env)]
-    pub internal_oauth_client_id: String,
-    #[arg(long, env, default_value = "groups")]
-    pub internal_oauth_scope: String,
-    #[arg(long, env)]
-    pub internal_oauth_username: String,
-    #[arg(long, env)]
-    pub internal_oauth_password: String,
+    /// Redis for the `ds:ingest:island-of-ireland` stream (shared with
+    /// `poller-irish-rail-gtfs`, which produces the same two schemas).
+    #[command(flatten)]
+    pub redis: ingest_stream::snapshot::RedisArgs,
 
     /// `OpenDataNI`'s own CKAN metadata confirms `frequency: "irregular"`
     /// for both CSVs (design spec §2.1/§2.2) -- no committed update
@@ -116,13 +91,8 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("stations_csv_url", &self.stations_csv_url)
             .field("halts_csv_url", &self.halts_csv_url)
-            .field("api_stations_ingest_url", &self.api_stations_ingest_url)
-            .field("api_lines_ingest_url", &self.api_lines_ingest_url)
-            .field("internal_oauth_token_url", &self.internal_oauth_token_url)
-            .field("internal_oauth_client_id", &self.internal_oauth_client_id)
-            .field("internal_oauth_scope", &self.internal_oauth_scope)
-            .field("internal_oauth_username", &self.internal_oauth_username)
-            .field("internal_oauth_password", &"[REDACTED]")
+            .field("ingest_sink", &self.ingest_sink)
+            .field("redis", &self.redis)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("metrics_port", &self.metrics_port)
             .field("metrics_enabled", &self.metrics_enabled)
@@ -138,29 +108,29 @@ mod config_debug_tests {
     use super::Config;
 
     #[test]
-    fn debug_redacts_the_internal_oauth_password() {
+    fn debug_redacts_the_redis_password() {
         let config = Config::try_parse_from([
             "poller-nir-stations",
-            "--internal-oauth-token-url",
-            "http://authentik.example/token",
-            "--internal-oauth-client-id",
-            "client-id",
-            "--internal-oauth-username",
-            "svc-account",
-            "--internal-oauth-password",
+            "--redis-url",
+            "redis://redis:6379",
+            "--redis-password",
             "super-secret-password",
         ])
-        .expect("required args should parse");
+        .expect("args should parse");
 
         let debug_output = format!("{config:?}");
         assert!(
-            debug_output.contains("[REDACTED]"),
-            "internal_oauth_password must be redacted: {debug_output}"
-        );
-        assert!(
             !debug_output.contains("super-secret-password"),
-            "the real internal_oauth_password must never appear in Debug output: {debug_output}"
+            "the Redis password must never appear in Debug output: {debug_output}"
         );
+    }
+
+    /// Plan 3c.2 (D8): `stream` is the default and the only sink.
+    #[test]
+    fn ingest_sink_is_stream_only() {
+        let config = Config::try_parse_from(["poller-nir-stations"]).unwrap();
+        assert_eq!(config.ingest_sink, "stream");
+        assert!(Config::try_parse_from(["poller-nir-stations", "--ingest-sink", "http"]).is_err());
     }
 }
 

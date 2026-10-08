@@ -32,6 +32,17 @@ pub(crate) struct Config {
     #[arg(long, env, default_value = "http://api:8080/private/tocs")]
     pub api_ingest_url: String,
 
+    /// Where each snapshot goes (ingest plan 3c.2, decision D8): `http`
+    /// (the default: `POST` to `API_INGEST_URL`), `http+shadow` (that, plus
+    /// a copy to `ds:ingest:reference`) or `stream` (the stream only; the
+    /// ingest-writer applies it). See `ingest_stream::snapshot`.
+    #[arg(long, env = "INGEST_SINK", default_value = "http")]
+    pub ingest_sink: ingest_stream::snapshot::SinkMode,
+
+    /// Redis for the stream sinks.
+    #[command(flatten)]
+    pub redis: ingest_stream::snapshot::RedisArgs,
+
     /// Shared, non-secret `OAuth2` client-credentials config (same value
     /// across all 9 real callers).
     #[command(flatten)]
@@ -61,6 +72,8 @@ impl std::fmt::Debug for Config {
             .field("rdm_tocs_base_url", &self.rdm_tocs_base_url)
             .field("rdm_api_key", &"[REDACTED]")
             .field("api_ingest_url", &self.api_ingest_url)
+            .field("ingest_sink", &self.ingest_sink)
+            .field("redis", &self.redis)
             .field("internal_oauth", &self.internal_oauth)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("metrics_port", &self.metrics_port)
@@ -108,5 +121,32 @@ mod tests {
             !debug_output.contains("svc-password"),
             "the real internal_oauth password must never appear in Debug output: {debug_output}"
         );
+    }
+
+    /// Plan 3c.2: `http` by default; the stream sinks parse.
+    #[test]
+    fn ingest_sink_defaults_to_http() {
+        use ingest_stream::snapshot::SinkMode;
+
+        let args = [
+            "poller-tocs",
+            "--rdm-tocs-base-url",
+            "https://example.invalid",
+            "--rdm-api-key",
+            "k",
+            "--internal-oauth-token-url",
+            "http://authentik.example/token",
+            "--internal-oauth-client-id",
+            "client-id",
+            "--internal-oauth-username",
+            "svc-account",
+            "--internal-oauth-password",
+            "svc-password",
+        ];
+        let config = Config::try_parse_from(args).unwrap();
+        assert_eq!(config.ingest_sink, SinkMode::Http);
+        let config =
+            Config::try_parse_from(args.iter().chain(&["--ingest-sink", "http+shadow"])).unwrap();
+        assert_eq!(config.ingest_sink, SinkMode::HttpShadow);
     }
 }

@@ -42,6 +42,18 @@ pub(crate) struct Config {
     #[arg(long, env, default_value = "http://api:8080/private/tfl-line-status")]
     pub api_ingest_url: String,
 
+    /// Where each snapshot goes (ingest plan 3c.2): `http` (the default:
+    /// `POST` to `API_INGEST_URL`), `http+shadow` (that, plus a copy to the
+    /// `ds:ingest:tfl` stream for the writer's `shadow` mode) or `stream`
+    /// (the stream only; the ingest-writer applies it). See
+    /// `ingest_stream::snapshot`.
+    #[arg(long, env = "INGEST_SINK", default_value = "http")]
+    pub ingest_sink: ingest_stream::snapshot::SinkMode,
+
+    /// Redis for the stream sinks.
+    #[command(flatten)]
+    pub redis: ingest_stream::snapshot::RedisArgs,
+
     /// Shared, non-secret `OAuth2` client-credentials config (same value
     /// across all 9 real callers).
     #[command(flatten)]
@@ -95,6 +107,8 @@ impl std::fmt::Debug for Config {
             .field("tfl_app_key", &"[REDACTED]")
             .field("tfl_modes", &self.tfl_modes)
             .field("api_ingest_url", &self.api_ingest_url)
+            .field("ingest_sink", &self.ingest_sink)
+            .field("redis", &self.redis)
             .field("internal_oauth", &self.internal_oauth)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("dlr_pilot_enabled", &self.dlr_pilot_enabled)
@@ -142,5 +156,39 @@ mod config_debug_tests {
             !debug_output.contains("svc-password"),
             "the real internal_oauth password must never appear in Debug output: {debug_output}"
         );
+    }
+
+    /// Plan 3c.2: `http` by default; the stream sinks parse.
+    #[test]
+    fn ingest_sink_defaults_to_http() {
+        use ingest_stream::snapshot::SinkMode;
+
+        let args = [
+            "poller-tfl",
+            "--tfl-app-key",
+            "k",
+            "--internal-oauth-token-url",
+            "http://authentik.example/token",
+            "--internal-oauth-client-id",
+            "client-id",
+            "--internal-oauth-username",
+            "svc-account",
+            "--internal-oauth-password",
+            "svc-password",
+        ];
+        let config = Config::try_parse_from(args).unwrap();
+        assert_eq!(config.ingest_sink, SinkMode::Http);
+        let config = Config::try_parse_from(args.iter().chain(&[
+            "--ingest-sink",
+            "stream",
+            "--redis-url",
+            "redis://redis:6379",
+            "--redis-password",
+            "redis-secret",
+        ]))
+        .unwrap();
+        assert_eq!(config.ingest_sink, SinkMode::Stream);
+        assert!(!format!("{config:?}").contains("redis-secret"));
+        assert!(Config::try_parse_from(args.iter().chain(&["--ingest-sink", "db"])).is_err());
     }
 }

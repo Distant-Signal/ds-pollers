@@ -35,18 +35,16 @@ pub(crate) struct Config {
     )]
     pub irish_rail_base_url: String,
 
-    /// The `api` crate's ingestion endpoint for station samples.
-    #[arg(
-        long,
-        env,
-        default_value = "http://api:8080/private/island-of-ireland-station-samples"
-    )]
-    pub api_ingest_url: String,
+    /// Where snapshots go: `stream` is the only sink (ingest plan 3c.2,
+    /// decision D8: the island-of-Ireland pollers keep no HTTP path). Kept
+    /// so `INGEST_SINK` is uniform across the stream producers.
+    #[arg(long, env = "INGEST_SINK", default_value = "stream", value_parser = ["stream"])]
+    pub ingest_sink: String,
 
-    /// Shared, non-secret `OAuth2` client-credentials config (same value
-    /// across every real caller).
+    /// Redis for the `ds:ingest:island-of-ireland` stream. Its `Debug`
+    /// redacts the credentials.
     #[command(flatten)]
-    pub internal_oauth: common::oauth_client::InternalOAuthArgs,
+    pub redis: ingest_stream::snapshot::RedisArgs,
 
     /// Conservative default (5 minutes), NOT `poller-ldbws`'s 60s, despite
     /// the structural similarity -- `api.irishrail.ie`'s real rate limits
@@ -109,24 +107,31 @@ mod tests {
 
     use super::Config;
 
-    /// The only args every real deployment supplies -- `internal_oauth`'s 4
-    /// required (no-default) fields. Everything else, including
-    /// `station_codes_override`, is left unset so this exercises exactly
-    /// the "`STATION_CODES_OVERRIDE` absent" shape the Helm chart's
-    /// conditional `{{- if .Values.pollerIrishRailLive.stationCodesOverride }}`
+    /// No required args at all (since ingest plan 3c.2 dropped the OAuth
+    /// ones). Everything, including `station_codes_override`, is left unset
+    /// so this exercises exactly the "`STATION_CODES_OVERRIDE` absent"
+    /// shape the Helm chart's conditional
+    /// `{{- if .Values.pollerIrishRailLive.stationCodesOverride }}`
     /// produces in production.
     fn required_oauth_args() -> Vec<&'static str> {
-        vec![
+        vec!["poller-irish-rail-live"]
+    }
+
+    /// Plan 3c.2 (D8): `stream` is the default and the only sink, and the
+    /// Redis password never reaches `Debug`.
+    #[test]
+    fn ingest_sink_is_stream_only() {
+        let config = Config::try_parse_from([
             "poller-irish-rail-live",
-            "--internal-oauth-token-url",
-            "http://authentik.example/token",
-            "--internal-oauth-client-id",
-            "client-id",
-            "--internal-oauth-username",
-            "svc-account",
-            "--internal-oauth-password",
-            "secret",
-        ]
+            "--redis-password",
+            "super-secret-password",
+        ])
+        .unwrap();
+        assert_eq!(config.ingest_sink, "stream");
+        assert!(!format!("{config:?}").contains("super-secret-password"));
+        assert!(
+            Config::try_parse_from(["poller-irish-rail-live", "--ingest-sink", "http"]).is_err()
+        );
     }
 
     #[test]
@@ -140,7 +145,7 @@ mod tests {
         // `default_value = ""` made this assert fail: the vec came back as
         // `[""]` (len 1), never empty.
         let config = Config::try_parse_from(required_oauth_args())
-            .expect("only the required OAuth args should be needed to parse");
+            .expect("no args should be needed to parse");
         assert_eq!(
             config.station_codes_override,
             Vec::<String>::new(),
@@ -155,8 +160,7 @@ mod tests {
         let mut args = required_oauth_args();
         args.push("--station-codes-override");
         args.push("BFSTC,CNLLY");
-        let config = Config::try_parse_from(args)
-            .expect("required OAuth args plus the override should parse");
+        let config = Config::try_parse_from(args).expect("the override alone should parse");
         assert_eq!(
             config.station_codes_override,
             vec!["BFSTC".to_string(), "CNLLY".to_string()]

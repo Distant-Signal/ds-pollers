@@ -1,7 +1,10 @@
 //! `poller-irish-rail-live`: polls `api.irishrail.ie`'s legacy realtime XML
 //! service for every station it lists, and forwards raw per-station
-//! departure-board samples to `api`'s
-//! `/private/island-of-ireland-station-samples` endpoint. Tier B of
+//! departure-board samples to the `ds:ingest:island-of-ireland` stream as
+//! `ioi-station-samples/1` (ingest plan 3c.2, decision D8), which the
+//! ingest-writer applies. The api's
+//! `/private/island-of-ireland-station-samples` route stays until phase 5,
+//! but this poller no longer calls it. Tier B of
 //! docs/superpowers/specs/2026-09-05-ireland-rail-support-design.md; see
 //! docs/superpowers/plans/2026-09-05-ireland-rail-support-plan.md Task B4.
 //! Deliberately raw ingestion only -- no severity inference, no
@@ -21,9 +24,11 @@ mod schema;
 
 use std::time::Duration;
 
+use chrono::Utc;
 use clap::Parser;
-use common::ingest;
 use config::Config;
+use ingest_stream::SchemaId;
+use ingest_stream::snapshot::SnapshotStream;
 use reqwest::Client;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -79,19 +84,28 @@ async fn run() -> anyhow::Result<()> {
     let config = Config::parse();
     let progress = health_http::spawn_liveness(&config.health);
     let client = build_client()?;
-    let internal_oauth = config.internal_oauth.token_cache();
+    let redis = config
+        .redis
+        .client("INGEST_SINK=stream")
+        .map_err(anyhow::Error::msg)?;
+    let samples = SnapshotStream::spawn(
+        redis,
+        ingest_stream::streams::ISLAND_OF_IRELAND,
+        SchemaId::new("ioi-station-samples", 1)?,
+        "poller-irish-rail-live",
+        500,
+    );
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
 
-    common::poller_loop::run_poll_loop(
+    // The startup cursor is the newest `ioi-station-samples/1` entry.
+    common::poller_loop::run_poll_loop_with_cursor(
         "irish-rail-live",
-        &client,
-        &config.api_ingest_url,
-        &internal_oauth,
+        || async { Ok(samples.last_produced_at().await?) },
         poll_interval,
         config.metrics.metrics_enabled,
         config.metrics_port,
         &progress,
-        || poll_once(&client, &config, &internal_oauth),
+        || poll_once(&client, &config, &samples),
     )
     .await
 }
@@ -99,8 +113,11 @@ async fn run() -> anyhow::Result<()> {
 async fn poll_once(
     client: &Client,
     config: &Config,
-    internal_oauth: &common::oauth_client::OAuthTokenCache,
+    stream: &SnapshotStream,
 ) -> anyhow::Result<()> {
+    // The snapshot's `produced_at` (decision D13): the cycle's start. Each
+    // sample also carries its own `polled_at`, the writer's observed time.
+    let fetched_at = Utc::now();
     let station_codes = if config.station_codes_override.is_empty() {
         fetch_all_station_codes(client, config).await?
     } else {
@@ -119,15 +136,8 @@ async fn poll_once(
         return Ok(());
     }
 
-    ingest::post_batch_retrying(
-        client,
-        &config.api_ingest_url,
-        internal_oauth,
-        &samples,
-        "island-of-ireland station samples",
-        common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
-    )
-    .await
+    stream.publish(&samples, fetched_at).await?;
+    Ok(())
 }
 
 /// Samples every code in `station_codes`, but never for longer than
@@ -267,13 +277,11 @@ mod tests {
     fn test_config(base_url: String) -> Config {
         Config {
             irish_rail_base_url: base_url,
-            api_ingest_url: "http://api:8080/private/island-of-ireland-station-samples".to_string(),
-            internal_oauth: common::oauth_client::InternalOAuthArgs {
-                internal_oauth_token_url: "http://auth.invalid/token".to_string(),
-                internal_oauth_client_id: "distant-signal-internal".to_string(),
-                internal_oauth_scope: "groups".to_string(),
-                internal_oauth_username: "svc-poller-irish-rail-live".to_string(),
-                internal_oauth_password: "app-password".to_string(),
+            ingest_sink: "stream".to_string(),
+            redis: ingest_stream::snapshot::RedisArgs {
+                redis_url: None,
+                redis_password: None,
+                redis_username: None,
             },
             poll_interval_secs: 300,
             station_codes_override: vec![],

@@ -1,6 +1,9 @@
 //! `poller-tfl`: polls `TfL`'s Unified API for line status across the modes
 //! this app displays (tube, DLR, Overground, Elizabeth line, tram) and
-//! forwards it to the `api` crate's `/private/tfl-line-status` endpoint.
+//! forwards it to the `api` crate's `/private/tfl-line-status` endpoint, or
+//! (`INGEST_SINK=http+shadow|stream`, ingest plan 3c.2) to the
+//! `ds:ingest:tfl` stream as `tfl-line-status/1`, whose body is the same
+//! JSON; see `ingest_stream::snapshot`.
 //!
 //! Unlike the four RDM pollers, what this one carries is already finished
 //! line status — `TfL` publishes status directly, so nothing downstream has
@@ -18,10 +21,11 @@ mod schema;
 
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use common::ingest;
 use config::Config;
+use ingest_stream::snapshot::{SinkMode, SnapshotStream};
 use reqwest::{Client, StatusCode};
 
 /// `TfL`'s subscription-key header. Not in `common::ingest` alongside
@@ -111,39 +115,113 @@ async fn run() -> anyhow::Result<()> {
     // in flight at once, but avoiding the guard-across-await pattern
     // entirely is simpler than arguing why it would be fine to allow here.
     let dlr_state = std::rc::Rc::new(std::cell::RefCell::new(dlr::inference::DlrMatchState::new()));
+    let stream = stream_sink(&config)?;
+    let stream = stream.as_ref();
 
-    common::poller_loop::run_poll_loop(
-        "tfl",
-        &client,
-        &config.api_ingest_url,
-        &internal_oauth,
-        poll_interval,
-        config.metrics.metrics_enabled,
-        config.metrics_port,
-        &progress,
-        || {
-            // Reborrow each of `client`/`config`/`internal_oauth` as a
-            // plain (Copy) reference right before the `async move` block:
-            // the block needs `move` for `dlr_state`'s fresh `Rc` clone
-            // (above), but `async move` captures every named variable it
-            // touches by move -- rebinding these three to local `&T`
-            // values first means the block only moves the (trivially
-            // Copy) reference itself, not the long-lived `Client`/
-            // `Config`/`OAuthTokenCache` values these closures share
-            // across every cycle.
-            let dlr_state = std::rc::Rc::clone(&dlr_state);
-            let client = &client;
-            let config = &config;
-            let internal_oauth = &internal_oauth;
-            async move {
-                let mut state = std::mem::take(&mut *dlr_state.borrow_mut());
-                let result = poll_once(client, config, &mut state, internal_oauth).await;
-                *dlr_state.borrow_mut() = state;
-                result
+    let cycle = || {
+        // Reborrow each of `client`/`config`/`internal_oauth` as a
+        // plain (Copy) reference right before the `async move` block:
+        // the block needs `move` for `dlr_state`'s fresh `Rc` clone
+        // (above), but `async move` captures every named variable it
+        // touches by move -- rebinding these three to local `&T`
+        // values first means the block only moves the (trivially
+        // Copy) reference itself, not the long-lived `Client`/
+        // `Config`/`OAuthTokenCache` values these closures share
+        // across every cycle.
+        let dlr_state = std::rc::Rc::clone(&dlr_state);
+        let client = &client;
+        let config = &config;
+        let internal_oauth = &internal_oauth;
+        async move {
+            let mut state = std::mem::take(&mut *dlr_state.borrow_mut());
+            let result = poll_once(client, config, &mut state, internal_oauth, stream).await;
+            *dlr_state.borrow_mut() = state;
+            result
+        }
+    };
+
+    match (config.ingest_sink, stream) {
+        (SinkMode::Stream, Some(stream)) => {
+            // The startup cursor is the stream's newest entry (spec §11.3).
+            common::poller_loop::run_poll_loop_with_cursor(
+                "tfl",
+                || async { Ok(stream.last_produced_at().await?) },
+                poll_interval,
+                config.metrics.metrics_enabled,
+                config.metrics_port,
+                &progress,
+                cycle,
+            )
+            .await
+        }
+        _ => {
+            common::poller_loop::run_poll_loop(
+                "tfl",
+                &client,
+                &config.api_ingest_url,
+                &internal_oauth,
+                poll_interval,
+                config.metrics.metrics_enabled,
+                config.metrics_port,
+                &progress,
+                cycle,
+            )
+            .await
+        }
+    }
+}
+
+/// The `ds:ingest:tfl` producer under `INGEST_SINK=http+shadow` or
+/// `stream`; `None` under `http`. One part per snapshot (about 20 lines),
+/// so the writer's prune sees every line.
+fn stream_sink(config: &Config) -> anyhow::Result<Option<SnapshotStream>> {
+    if !config.ingest_sink.produces() {
+        return Ok(None);
+    }
+    let why = format!("INGEST_SINK={}", config.ingest_sink);
+    let client = config.redis.client(&why).map_err(anyhow::Error::msg)?;
+    tracing::info!(sink = %config.ingest_sink, "producing TfL snapshots to ds:ingest:tfl");
+    Ok(Some(SnapshotStream::spawn(
+        client,
+        ingest_stream::streams::TFL,
+        ingest_stream::SchemaId::new("tfl-line-status", 1)?,
+        "poller-tfl",
+        usize::MAX,
+    )))
+}
+
+/// Sends one snapshot where `INGEST_SINK` says (see the module docs): the
+/// stream copy first (never failing the cycle under `http+shadow`), then
+/// the api's `POST` under `http` and `http+shadow`.
+async fn deliver(
+    client: &Client,
+    config: &Config,
+    internal_oauth: &common::oauth_client::OAuthTokenCache,
+    stream: Option<&SnapshotStream>,
+    reports: &[common::LineStatusReport],
+    fetched_at: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    if let Some(stream) = stream {
+        match stream.publish(reports, fetched_at).await {
+            Ok(()) => {}
+            Err(err) if config.ingest_sink == SinkMode::HttpShadow => {
+                tracing::warn!(error = %err, "shadow copy to ds:ingest:tfl not queued; the api POST is unaffected");
             }
-        },
-    )
-    .await
+            Err(err) => return Err(err.into()),
+        }
+    }
+    if config.ingest_sink.posts_http() {
+        ingest::post_batch_retrying(
+            client,
+            &config.api_ingest_url,
+            internal_oauth,
+            reports,
+            "TfL line statuses",
+            common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn poll_once(
@@ -151,9 +229,13 @@ async fn poll_once(
     config: &Config,
     dlr_state: &mut dlr::inference::DlrMatchState,
     internal_oauth: &common::oauth_client::OAuthTokenCache,
+    stream: Option<&SnapshotStream>,
 ) -> anyhow::Result<()> {
+    // The snapshot's `produced_at` on the stream (decision D13): when it
+    // was fetched, not when it is sent.
+    let fetched_at = Utc::now();
     let body = fetch_status_json(client, config).await?;
-    let mut reports = schema::parse_line_status(&body, Utc::now())?;
+    let mut reports = schema::parse_line_status(&body, fetched_at)?;
 
     // Never post an empty batch. The ingest endpoint prunes TfL rows that
     // are missing from the batch it receives, so an empty one would read as
@@ -185,15 +267,7 @@ async fn poll_once(
 
     tracing::info!(count = reports.len(), "parsed line statuses from TfL");
 
-    ingest::post_batch_retrying(
-        client,
-        &config.api_ingest_url,
-        internal_oauth,
-        &reports,
-        "TfL line statuses",
-        common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
-    )
-    .await
+    deliver(client, config, internal_oauth, stream, &reports, fetched_at).await
 }
 
 /// The DLR's line id as this poller publishes it. Built from the same

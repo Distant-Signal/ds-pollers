@@ -2,9 +2,11 @@
 //! ("Northern Ireland Railways Stations"/"...Halts") on an interval,
 //! parses/filters/dedups them, and forwards the derived
 //! `NorthernIreland`-tagged station catalogue -- plus a small hand-curated
-//! line catalogue -- to `api`'s existing
-//! `/private/island-of-ireland-{stations,lines}` ingestion endpoints
-//! (shared with `poller-irish-rail-gtfs`). Tier A of
+//! line catalogue -- to the `ds:ingest:island-of-ireland` stream as
+//! `ioi-stations/1` and `ioi-lines/1` (shared with
+//! `poller-irish-rail-gtfs`; ingest plan 3c.2, decision D8), which the
+//! ingest-writer applies. The api's `/private/island-of-ireland-*` routes
+//! stay until phase 5, but this poller no longer calls them. Tier A of
 //! docs/superpowers/specs/2026-09-05-nir-tier-a-implementation-design.md;
 //! see docs/superpowers/plans/2026-09-05-nir-tier-a-implementation-plan.md
 //! Task 2.
@@ -14,9 +16,11 @@ mod mapping;
 
 use std::time::Duration;
 
+use chrono::Utc;
 use clap::Parser;
-use common::ingest;
 use config::Config;
+use ingest_stream::SchemaId;
+use ingest_stream::snapshot::SnapshotStream;
 use reqwest::Client;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -40,37 +44,54 @@ async fn run() -> anyhow::Result<()> {
         .timeout(REQUEST_TIMEOUT)
         .user_agent(config::USER_AGENT)
         .build()?;
-    let internal_oauth =
-        common::oauth_client::OAuthTokenCache::new(common::oauth_client::OAuthCredentials {
-            token_url: config.internal_oauth_token_url.clone(),
-            client_id: config.internal_oauth_client_id.clone(),
-            scope: config.internal_oauth_scope.clone(),
-            username: config.internal_oauth_username.clone(),
-            password: config.internal_oauth_password.clone(),
-        });
+    let redis = config
+        .redis
+        .client("INGEST_SINK=stream")
+        .map_err(anyhow::Error::msg)?;
+    let sinks = Sinks {
+        stations: SnapshotStream::spawn(
+            redis.clone(),
+            ingest_stream::streams::ISLAND_OF_IRELAND,
+            SchemaId::new("ioi-stations", 1)?,
+            "poller-nir-stations",
+            500,
+        ),
+        lines: SnapshotStream::spawn(
+            redis,
+            ingest_stream::streams::ISLAND_OF_IRELAND,
+            SchemaId::new("ioi-lines", 1)?,
+            "poller-nir-stations",
+            500,
+        ),
+    };
 
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
-    // Freshness is checked against the stations endpoint only: both
-    // endpoints are posted together every cycle (see poll_once).
-    common::poller_loop::run_poll_loop(
+    // The startup cursor is the newest `ioi-stations/1` entry: both
+    // snapshots are produced together every cycle (see poll_once). The
+    // stream is shared with poller-irish-rail-gtfs, whose stations count
+    // too, which only delays a restart's first poll.
+    common::poller_loop::run_poll_loop_with_cursor(
         "nir-stations",
-        &client,
-        &config.api_stations_ingest_url,
-        &internal_oauth,
+        || async { Ok(sinks.stations.last_produced_at().await?) },
         poll_interval,
         config.metrics_enabled,
         config.metrics_port,
         &progress,
-        || poll_once(&client, &config, &internal_oauth),
+        || poll_once(&client, &config, &sinks),
     )
     .await
 }
 
-async fn poll_once(
-    client: &Client,
-    config: &Config,
-    internal_oauth: &common::oauth_client::OAuthTokenCache,
-) -> anyhow::Result<()> {
+/// The two schemas this poller produces, one latest-snapshot producer each
+/// on `ds:ingest:island-of-ireland`.
+struct Sinks {
+    stations: SnapshotStream,
+    lines: SnapshotStream,
+}
+
+async fn poll_once(client: &Client, config: &Config, sinks: &Sinks) -> anyhow::Result<()> {
+    // The snapshots' `produced_at` (decision D13): the fetch time.
+    let fetched_at = Utc::now();
     let stations_csv = client
         .get(&config.stations_csv_url)
         .send()
@@ -94,24 +115,8 @@ async fn poll_once(
         "parsed NIR station/line catalogue"
     );
 
-    ingest::post_batch_retrying(
-        client,
-        &config.api_stations_ingest_url,
-        internal_oauth,
-        &stations,
-        "island-of-ireland stations (NIR)",
-        common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
-    )
-    .await?;
-    ingest::post_batch_retrying(
-        client,
-        &config.api_lines_ingest_url,
-        internal_oauth,
-        &lines,
-        "island-of-ireland lines (NIR)",
-        common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
-    )
-    .await?;
+    sinks.stations.publish(&stations, fetched_at).await?;
+    sinks.lines.publish(&lines, fetched_at).await?;
     Ok(())
 }
 
