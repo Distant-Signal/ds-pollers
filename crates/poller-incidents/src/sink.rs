@@ -259,6 +259,11 @@ mod tests {
 /// Against a real database (and, where noted, local Redis/valkey): the DB
 /// sink against the api's write path, the publish order, and a Redis
 /// outage. Resets `incident_feed_state`, so needs `--test-threads=1`.
+///
+/// They also run as the narrow `incidents` role (CI's per-service step),
+/// which has no `DELETE`: the sinks write through `DATABASE_URL`, but
+/// [`reset`] deletes through `MIGRATION_DATABASE_URL` (the schema owner
+/// `test-postgres-roles.py` sets) when it is set, else `DATABASE_URL`.
 #[cfg(test)]
 mod db_tests {
     use std::sync::Mutex;
@@ -279,14 +284,32 @@ mod db_tests {
             .expect("connect to postgres")
     }
 
-    async fn reset(pool: &PgPool) {
+    /// A connection that may `DELETE` the test rows: the schema owner
+    /// under `test-postgres-roles.py`, else `DATABASE_URL` itself (a
+    /// superuser or the app role).
+    async fn cleanup_pool() -> PgPool {
+        let database_url = std::env::var("MIGRATION_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .expect("DATABASE_URL must be set to run this test");
+        PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres for cleanup")
+    }
+
+    /// Deletes this module's rows and the feed state, through
+    /// [`cleanup_pool`]: `_pool` (the sink's own role) may lack `DELETE`.
+    async fn reset(_pool: &PgPool) {
+        let pool = cleanup_pool().await;
         for sql in [
             "DELETE FROM incident_history WHERE incident_id LIKE 'TEST-POLLER-SINK-%'",
             "DELETE FROM incidents WHERE incident_id LIKE 'TEST-POLLER-SINK-%'",
             "DELETE FROM incident_feed_state",
         ] {
-            sqlx::query(sql).execute(pool).await.expect(sql);
+            sqlx::query(sql).execute(&pool).await.expect(sql);
         }
+        pool.close().await;
     }
 
     fn incident(suffix: &str, summary: &str) -> IncidentMessage {
