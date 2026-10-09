@@ -66,26 +66,6 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 300)]
     pub poll_interval_secs: u64,
 
-    /// Enables the DLR arrivals-diffing pilot (see `crate::dlr` and
-    /// `docs/superpowers/specs/2026-08-22-tfl-service-metrics-v2-design.md`,
-    /// Area 3).
-    ///
-    /// Defaults **off**: the pilot was built without a real deployment to
-    /// run it against (no Docker or Postgres in the sandbox), so it has
-    /// never completed a clean cycle against the live API. It stays off
-    /// until the plan's Task 8 manual verification checklist has been run
-    /// clean once against a real deployment; after that it can be turned
-    /// on via this flag or `DLR_PILOT_ENABLED` with no redeploy. Off means
-    /// DLR reports `sample_stats: None`, same as every other `TfL` line.
-    #[arg(long, env, default_value_t = false)]
-    pub dlr_pilot_enabled: bool,
-
-    /// Poplar's Naptan id, used as the `stopPointId` for the DLR
-    /// Timetable poll. Not derived — this pilot covers one fixed station
-    /// only (see the plan's Global Constraints).
-    #[arg(long, env, default_value = "940GZZDLPOP")]
-    pub dlr_pilot_stop_point_id: String,
-
     /// Port for this poller's Prometheus `/metrics` endpoint. Stays a
     /// plain field, not part of `MetricsArgs` -- its default differs per
     /// crate and `docker-compose.yml` relies on the code default.
@@ -111,8 +91,6 @@ impl std::fmt::Debug for Config {
             .field("redis", &self.redis)
             .field("internal_oauth", &self.internal_oauth)
             .field("poll_interval_secs", &self.poll_interval_secs)
-            .field("dlr_pilot_enabled", &self.dlr_pilot_enabled)
-            .field("dlr_pilot_stop_point_id", &self.dlr_pilot_stop_point_id)
             .field("metrics_port", &self.metrics_port)
             .field("metrics", &self.metrics)
             .field("health", &self.health)

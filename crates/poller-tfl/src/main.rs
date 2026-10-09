@@ -16,7 +16,6 @@
 //! wrote into `line_status_history` at the time.
 
 mod config;
-mod dlr;
 mod schema;
 
 use std::time::Duration;
@@ -37,12 +36,6 @@ const TFL_AUTH_HEADER_NAME: &str = "Ocp-Apim-Subscription-Key";
 /// Per-request timeout, matching the other pollers: a peer that accepts the
 /// connection and never answers would otherwise hang the poll loop forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The one direction the DLR pilot looks at, shared by the Timetable
-/// request's `direction` query param and the filter applied to live
-/// Arrivals predictions — the two halves of the diff have to agree, or
-/// inbound trains get matched against outbound schedules.
-const DLR_PILOT_DIRECTION: &str = "outbound";
 
 /// Attempts per poll cycle before giving up and waiting for the next tick.
 /// `TfL`'s registered free tier is documented at roughly 500 requests per
@@ -100,46 +93,10 @@ async fn run() -> anyhow::Result<()> {
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let internal_oauth = config.internal_oauth.token_cache();
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
-    // `Rc<RefCell<_>>`, not a bare `&mut dlr_state` capture: `run_poll_loop`'s
-    // `cycle: FnMut() -> Fut` cannot let a per-call `Fut` borrow the
-    // closure's own captured environment past that call (a plain `FnMut`
-    // has no way to tie a returned future's borrow to one specific
-    // invocation the way `AsyncFnMut` does -- see this plan's Open
-    // Question 2, which did not anticipate this). Cloning the `Rc` into
-    // each `async move` block instead gives that future its own owned
-    // handle, independent of the closure's `self`. The cycle body below
-    // takes the state out of the `RefCell` by value (`mem::take`, valid
-    // since `DlrMatchState: Default`) before awaiting and stores it back
-    // afterward, rather than holding a `borrow_mut()` guard across the
-    // `.await` -- clippy's `await_holding_refcell_ref` correctly flags
-    // that as unsound in general; this loop never has two cycles
-    // in flight at once, but avoiding the guard-across-await pattern
-    // entirely is simpler than arguing why it would be fine to allow here.
-    let dlr_state = std::rc::Rc::new(std::cell::RefCell::new(dlr::inference::DlrMatchState::new()));
     let stream = stream_sink(&config)?;
     let stream = stream.as_ref();
 
-    let cycle = || {
-        // Reborrow each of `client`/`config`/`internal_oauth` as a
-        // plain (Copy) reference right before the `async move` block:
-        // the block needs `move` for `dlr_state`'s fresh `Rc` clone
-        // (above), but `async move` captures every named variable it
-        // touches by move -- rebinding these three to local `&T`
-        // values first means the block only moves the (trivially
-        // Copy) reference itself, not the long-lived `Client`/
-        // `Config`/`OAuthTokenCache` values these closures share
-        // across every cycle.
-        let dlr_state = std::rc::Rc::clone(&dlr_state);
-        let client = &client;
-        let config = &config;
-        let internal_oauth = &internal_oauth;
-        async move {
-            let mut state = std::mem::take(&mut *dlr_state.borrow_mut());
-            let result = poll_once(client, config, &mut state, internal_oauth, stream).await;
-            *dlr_state.borrow_mut() = state;
-            result
-        }
-    };
+    let cycle = || poll_once(&client, &config, &internal_oauth, stream);
 
     match (config.ingest_sink, stream) {
         (SinkMode::Stream, Some(stream)) => {
@@ -234,7 +191,6 @@ async fn deliver(
 async fn poll_once(
     client: &Client,
     config: &Config,
-    dlr_state: &mut dlr::inference::DlrMatchState,
     internal_oauth: &common::oauth_client::OAuthTokenCache,
     stream: Option<&SnapshotStream>,
 ) -> anyhow::Result<()> {
@@ -242,7 +198,7 @@ async fn poll_once(
     // was fetched, not when it is sent.
     let fetched_at = Utc::now();
     let body = fetch_status_json(client, config).await?;
-    let mut reports = schema::parse_line_status(&body, fetched_at)?;
+    let reports = schema::parse_line_status(&body, fetched_at)?;
 
     // Never post an empty batch. The ingest endpoint prunes TfL rows that
     // are missing from the batch it receives, so an empty one would read as
@@ -255,133 +211,9 @@ async fn poll_once(
         );
     }
 
-    if config.dlr_pilot_enabled {
-        match poll_dlr_sample_stats(client, config, dlr_state).await {
-            Ok(Some(stats)) => merge_dlr_sample_stats(&mut reports, stats),
-            Ok(None) => mark_dlr_pending(&mut reports),
-            Err(err) => {
-                // The DLR pilot failing must never take down the rest of
-                // the TfL line-status batch — log and post everything
-                // else as normal, same as any other line keeps reporting
-                // if one call in a multi-call cycle has a bad day. Left at
-                // whatever schema.rs already set (NoCoverage) for
-                // sample_availability -- a known, accepted simplification,
-                // not a gap this task claims to close (Decision 4).
-                tracing::warn!(error = ?err, "DLR arrivals-diffing pilot failed this cycle; continuing without it");
-            }
-        }
-    }
-
     tracing::info!(count = reports.len(), "parsed line statuses from TfL");
 
     deliver(client, config, internal_oauth, stream, &reports, fetched_at).await
-}
-
-/// The DLR's line id as this poller publishes it. Built from the same
-/// `TFL_LINE_ID_PREFIX` `schema.rs` uses, so a change to the prefix can't
-/// leave the merge below quietly matching nothing.
-fn dlr_line_id() -> String {
-    format!("{}dlr", common::TFL_LINE_ID_PREFIX)
-}
-
-/// Attaches `stats` to every status entry on the `tfl-dlr` line only —
-/// mirrors the aggregator's own attach-to-every-status-on-the-line
-/// pattern (`crates/aggregator/src/aggregation.rs:96-106`), minus its
-/// severity escalation, which this pilot deliberately does not adopt (see
-/// the plan's Global Constraints).
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "callers hand over values they no longer need"
-)]
-fn merge_dlr_sample_stats(reports: &mut [common::LineStatusReport], stats: common::SampleStats) {
-    let line_id = dlr_line_id();
-    for report in reports.iter_mut().filter(|r| r.id == line_id) {
-        for status in &mut report.statuses {
-            status.sample_stats = Some(stats.clone());
-            status.sample_availability = common::SampleAvailability::Available(stats.clone());
-        }
-    }
-}
-
-/// The DLR pilot has no tunable `min_sample_size`-equivalent -- it
-/// structurally needs at least one resolved trip before it can report
-/// anything, so `required: 1` is literally true (not a borrowed LDBWS
-/// constant) and `observed: 0` accurately reports "zero trips have
-/// resolved yet." An honest, deliberately imperfect reuse of
-/// `BelowThreshold`'s shape for a mechanically different producer
-/// (per-trip resolution warm-up, not a station-count threshold) -- see
-/// docs/superpowers/specs/2026-09-01-line-status-sample-coverage-design.md
-/// Decision 4 and its Open Question 2.
-fn mark_dlr_pending(reports: &mut [common::LineStatusReport]) {
-    let line_id = dlr_line_id();
-    for report in reports.iter_mut().filter(|r| r.id == line_id) {
-        for status in &mut report.statuses {
-            status.sample_availability = common::SampleAvailability::BelowThreshold {
-                observed: 0,
-                required: 1,
-            };
-        }
-    }
-}
-
-/// Polls DLR's live Arrivals and Poplar's Timetable, and feeds both into
-/// `state` to produce (once at least one trip has resolved) the
-/// `SampleStats` this pilot attaches to the DLR line's report. Returns
-/// `Ok(None)` when nothing has resolved yet — not an error, just "too soon
-/// to say".
-async fn poll_dlr_sample_stats(
-    client: &Client,
-    config: &Config,
-    state: &mut dlr::inference::DlrMatchState,
-) -> anyhow::Result<Option<common::SampleStats>> {
-    let arrivals_url = format!(
-        "{}/Line/dlr/Arrivals",
-        config.tfl_base_url.trim_end_matches('/')
-    );
-    let arrivals_body = fetch_json(client, &arrivals_url, config, "dlr-arrivals").await?;
-    // `/Line/dlr/Arrivals` covers the whole DLR network in one call (see
-    // `dlr::arrivals`'s module docs), but `match_trips` matches purely on
-    // time and documents its own precondition as "the live prediction (at
-    // the same station)" — it does not filter by station itself. This is
-    // the pilot's one fixed station, so narrow to Poplar's own predictions
-    // here, before anything is matched against Poplar's timetable.
-    //
-    // The direction filter matters just as much: the timetable half of the
-    // diff is fetched `?direction=outbound` (see below), while Arrivals
-    // returns both directions at Poplar (6 each in the captured response).
-    // Inbound trains land on the same clockface minutes as outbound
-    // scheduled departures, so without this an inbound arrival can be
-    // claimed as evidence an outbound trip ran.
-    let predictions: Vec<_> = dlr::arrivals::parse_arrivals(&arrivals_body)?
-        .into_iter()
-        .filter(|p| {
-            p.naptan_id == config.dlr_pilot_stop_point_id && p.direction == DLR_PILOT_DIRECTION
-        })
-        .collect();
-
-    // Poplar sits on a junction served by multiple DLR routes; without a
-    // `direction` query param TfL returns a disambiguation response (no
-    // `timetable` key at all) instead of an actual timetable, which
-    // `parse_timetable` cannot parse. Confirmed against the live API in
-    // Task 2's recon (see `crates/poller-tfl/tests/fixtures/README.md`).
-    // The pilot fixes on `outbound`, consistent with its single-station
-    // scope.
-    let timetable_url = format!(
-        "{}/Line/dlr/Timetable/{}?direction={DLR_PILOT_DIRECTION}",
-        config.tfl_base_url.trim_end_matches('/'),
-        config.dlr_pilot_stop_point_id
-    );
-    let timetable_body = fetch_json(client, &timetable_url, config, "dlr-timetable").await?;
-    let now = Utc::now();
-    // TfL's timetable service day is a *London* day, not a UTC one — the
-    // published `hour`/`minute` pairs are local wall-clock times (see
-    // `dlr::timetable`). Between midnight and 01:00 BST the UTC date is
-    // still the previous day, so asking for `now.date_naive()` would fetch
-    // the wrong day's schedule for that hour every summer night.
-    let service_date = now.with_timezone(&chrono_tz::Europe::London).date_naive();
-    let trips = dlr::timetable::parse_timetable(&timetable_body, service_date)?;
-
-    Ok(state.resolve(trips, &predictions, now))
 }
 
 async fn fetch_status_json(client: &Client, config: &Config) -> anyhow::Result<String> {
@@ -500,113 +332,5 @@ mod tests {
     #[test]
     fn a_real_key_is_accepted() {
         assert!(require_non_empty_key("abc123").is_ok());
-    }
-
-    #[test]
-    fn dlr_sample_stats_are_merged_onto_the_matching_line_only() {
-        let mut reports = vec![
-            common::LineStatusReport {
-                id: "tfl-dlr".to_string(),
-                name: "DLR".to_string(),
-                mode_name: "dlr".to_string(),
-                operators: vec!["TfL".to_string()],
-                statuses: vec![common::LineStatus {
-                    severity: common::Severity::GoodService,
-                    reason: "Good Service".to_string(),
-                    validity: common::ValidityPeriod {
-                        from_date: Utc::now(),
-                        to_date: None,
-                        is_now: true,
-                    },
-                    disruption: None,
-                    data_quality: common::DataQuality::Tfl,
-                    sample_stats: None,
-                    sample_availability: common::SampleAvailability::NoCoverage,
-                    full_coverage_stats: None,
-                    full_coverage_availability: common::FullCoverageAvailability::NotEnabled,
-                }],
-            },
-            common::LineStatusReport {
-                id: "tfl-victoria".to_string(),
-                name: "Victoria".to_string(),
-                mode_name: "tube".to_string(),
-                operators: vec!["TfL".to_string()],
-                statuses: vec![common::LineStatus {
-                    severity: common::Severity::GoodService,
-                    reason: "Good Service".to_string(),
-                    validity: common::ValidityPeriod {
-                        from_date: Utc::now(),
-                        to_date: None,
-                        is_now: true,
-                    },
-                    disruption: None,
-                    data_quality: common::DataQuality::Tfl,
-                    sample_stats: None,
-                    sample_availability: common::SampleAvailability::NoCoverage,
-                    full_coverage_stats: None,
-                    full_coverage_availability: common::FullCoverageAvailability::NotEnabled,
-                }],
-            },
-        ];
-        let stats = common::SampleStats {
-            total: 10,
-            delayed: 2,
-            cancelled: 1,
-            skipped: 0,
-            avg_delay_minutes: 3.5,
-        };
-
-        merge_dlr_sample_stats(&mut reports, stats.clone());
-
-        assert_eq!(reports[0].statuses[0].sample_stats, Some(stats.clone()));
-        assert_eq!(reports[1].statuses[0].sample_stats, None);
-        assert_eq!(
-            reports[0].statuses[0].sample_availability,
-            common::SampleAvailability::Available(stats)
-        );
-        assert_eq!(
-            reports[1].statuses[0].sample_availability,
-            common::SampleAvailability::NoCoverage,
-            "unaffected line's availability must be untouched"
-        );
-    }
-
-    #[test]
-    fn dlr_ok_none_marks_below_threshold_pending_on_the_matching_line_only() {
-        let mut reports = vec![common::LineStatusReport {
-            id: "tfl-dlr".to_string(),
-            name: "DLR".to_string(),
-            mode_name: "dlr".to_string(),
-            operators: vec!["TfL".to_string()],
-            statuses: vec![common::LineStatus {
-                severity: common::Severity::GoodService,
-                reason: "Good Service".to_string(),
-                validity: common::ValidityPeriod {
-                    from_date: Utc::now(),
-                    to_date: None,
-                    is_now: true,
-                },
-                disruption: None,
-                data_quality: common::DataQuality::Tfl,
-                sample_stats: None,
-                sample_availability: common::SampleAvailability::NoCoverage,
-                full_coverage_stats: None,
-                full_coverage_availability: common::FullCoverageAvailability::NotEnabled,
-            }],
-        }];
-
-        mark_dlr_pending(&mut reports);
-
-        assert_eq!(
-            reports[0].statuses[0].sample_availability,
-            common::SampleAvailability::BelowThreshold {
-                observed: 0,
-                required: 1
-            }
-        );
-        assert_eq!(
-            reports[0].statuses[0].sample_stats, None,
-            "Ok(None) must not fabricate sample_stats"
-        );
     }
 }
