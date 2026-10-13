@@ -415,6 +415,50 @@ mod db_tests {
         reset(&pool).await;
     }
 
+    /// 2026-10-12: a flag-only reopen (cleared to uncleared, same text) is
+    /// published, so the enricher extracts the reopened incident at once.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p \
+                poller-incidents sink::db_tests -- --ignored --test-threads=1`"]
+    async fn a_reopen_with_unchanged_text_is_published() {
+        let pool = test_pool().await;
+        reset(&pool).await;
+        let sink = sink(
+            &pool,
+            Recorder {
+                pool: pool.clone(),
+                seen: Mutex::new(Vec::new()),
+            },
+        );
+        let live = incident("REOPEN", "Disruption between Woking and Guildford");
+        let cleared = IncidentMessage {
+            is_cleared: true,
+            ..live.clone()
+        };
+        for batch in [&cleared, &cleared, &live, &cleared] {
+            sink.publish(&complete(vec![batch.clone()]))
+                .await
+                .expect("written");
+        }
+        let seen: Vec<Vec<String>> = sink
+            .publisher
+            .seen
+            .into_inner()
+            .expect("not poisoned")
+            .into_iter()
+            .map(|at| at.ids)
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                vec![live.incident_id.clone()],
+                vec![live.incident_id.clone()],
+            ],
+            "new, then the reopen; neither the unchanged cleared poll nor the flag-only clear"
+        );
+        reset(&pool).await;
+    }
+
     /// `(incidents, incident_history, affected_lines)` for this module's
     /// rows, without the times: what both sinks must agree on.
     async fn table_contents(pool: &PgPool) -> Vec<String> {
