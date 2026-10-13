@@ -7,8 +7,8 @@ publish.workspace = true
 
 [dependencies]
 health-http = { path = "../health-http" }
-# `INGEST_SINK=http+shadow|stream` (ingest plan 3c.2): the snapshot producer
-# for `ds:ingest:tfl`.
+# The snapshot producer for `ds:ingest:tfl` (ingest plan 3c.2): the only
+# sink since release B.
 ingest-stream = { path = "../ingest-stream" }
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }

@@ -1,84 +1,45 @@
 //! Where a parsed stations feed goes (ingest architecture plan 2b.1,
-//! spec §9.3), chosen by `INGEST_SINK`:
+//! spec §9.3): [`DbSink`] writes it with
+//! `ds_store::reference::upsert_stations`, retried within the poll's
+//! budget, as the `stations` role, and reads the startup cursor (plan 4.6)
+//! from `ds_store::freshness::last_stations_fetch`. Release B (ingest phase
+//! 5) removed the `http` sink (`POST /private/stations`).
 //!
-//! | Sink | `publish` | `cursor` (the startup cursor, plan 4.6) |
-//! |---|---|---|
-//! | [`HttpSink`] (`http`, the default) | `POST /private/stations` on the api, retried within the poll's budget | `GET /private/stations` |
-//! | [`DbSink`] (`db`) | `ds_store::reference::upsert_stations`, retried the same way | `ds_store::freshness::last_stations_fetch` |
-//!
-//! Both end in the same `upsert_stations` call, so the `stations` rows and
-//! the `ingest_freshness('stations')` marker are the same either way. The
-//! api's `POST` also rebuilds the CORPUS crosswalk if stale; under `db`
-//! the ingest-writer's 10-minute `CORPUS_CROSSWALK` loop does (plan 2b.2,
-//! spec §9.3), so the `stations` role needs no crosswalk grants.
+//! The ingest-writer's 10-minute `CORPUS_CROSSWALK` loop rebuilds the
+//! CORPUS crosswalk after a refresh (plan 2b.2, spec §9.3), so the
+//! `stations` role needs no crosswalk grants.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use common::backoff::Backoff;
 use common::ingest;
-use common::oauth_client::OAuthTokenCache;
 use ds_store::reference::StationRow;
 use serde_json::value::RawValue;
 use sqlx::PgPool;
 
 use crate::schema::StationRecord;
 
-/// One destination for the parsed feed.
-pub(crate) trait StationsSink {
-    /// When the stations feed last landed (`None` if never), as the poll
-    /// loop reads it: the poll waits out the rest of the interval after a
-    /// restart. The api's GET for [`HttpSink`], the freshness row for
-    /// [`DbSink`] (plan 4.6's `CursorSource`).
-    fn cursor(&self) -> ingest::CursorSource<'_>;
-
-    /// Writes one whole parsed feed.
-    async fn publish(&self, stations: &[StationRecord<'_>]) -> anyhow::Result<()>;
-}
-
-/// `INGEST_SINK=http`: today's path through the api.
-pub(crate) struct HttpSink {
-    pub client: reqwest::Client,
-    pub url: String,
-    pub tokens: OAuthTokenCache,
-    /// How long one `publish` may retry a transient failure
-    /// (`common::poller_loop::post_retry_budget`).
-    pub retry_budget: Duration,
-}
-
-impl StationsSink for HttpSink {
-    fn cursor(&self) -> ingest::CursorSource<'_> {
-        ingest::CursorSource::http(&self.client, &self.url, &self.tokens)
-    }
-
-    async fn publish(&self, stations: &[StationRecord<'_>]) -> anyhow::Result<()> {
-        ingest::post_batch_retrying(
-            &self.client,
-            &self.url,
-            &self.tokens,
-            stations,
-            "stations",
-            self.retry_budget,
-        )
-        .await
-    }
-}
-
 /// `INGEST_SINK=db`: straight into Postgres, as the `stations` role.
 pub(crate) struct DbSink {
     pub pool: PgPool,
-    /// As [`HttpSink::retry_budget`]: a transient failure is retried
-    /// without re-fetching the 38 MB feed.
+    /// How long one `publish` may retry a transient failure
+    /// (`common::poller_loop::post_retry_budget`), without re-fetching the
+    /// 38 MB feed.
     pub retry_budget: Duration,
     pub backoff: Backoff,
 }
 
-impl StationsSink for DbSink {
-    fn cursor(&self) -> ingest::CursorSource<'_> {
+impl DbSink {
+    /// When the stations feed last landed (`None` if never), as the poll
+    /// loop reads it: the poll waits out the rest of the interval after a
+    /// restart (plan 4.6's `CursorSource`).
+    pub(crate) fn cursor(&self) -> ingest::CursorSource<'_> {
         ingest::CursorSource::db(|| ds_store::freshness::last_stations_fetch(&self.pool))
     }
 
-    async fn publish(&self, stations: &[StationRecord<'_>]) -> anyhow::Result<()> {
+    /// Writes one whole parsed feed.
+    pub(crate) async fn publish(&self, stations: &[StationRecord<'_>]) -> anyhow::Result<()> {
         let started = tokio::time::Instant::now();
         let mut attempt: u32 = 0;
         loop {
@@ -141,10 +102,6 @@ impl<'a> StationRow for StationRecord<'a> {
 /// and its final `delete` is best effort.
 #[cfg(test)]
 mod db_tests {
-    use common::oauth_client::OAuthCredentials;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
     use common::ingest::LastFetched as _;
 
     use super::*;
@@ -230,54 +187,18 @@ mod db_tests {
     ]}"#;
     const CODES: [&str; 3] = ["ZQS", "ZQT", "ZQU"];
 
-    /// Plan 2b.1: the same feed through either sink leaves the same rows.
-    /// The HTTP side is what the api does with the POST body: decode it as
-    /// `Vec<StationReference>` and call the same `upsert_stations`.
+    /// Plan 2b.1: the feed through the sink leaves the same rows as the
+    /// retired api route did with the same body (decoded as
+    /// `Vec<StationReference>` and passed to the same `upsert_stations`).
     #[tokio::test]
     #[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
-    async fn both_sinks_write_the_same_rows_for_a_fixture_feed() {
+    async fn the_db_sink_writes_the_rows_the_api_route_did_for_a_fixture_feed() {
         let pool = pool().await;
         scramble(&pool, &CODES).await;
         let stations = parse_stations(FEED.as_bytes()).unwrap();
 
-        let api = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/token/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "fake-jwt",
-                "expires_in": 300,
-            })))
-            .mount(&api)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/private/stations"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "upserted": 3
-            })))
-            .expect(1)
-            .mount(&api)
-            .await;
-        let http = HttpSink {
-            client: reqwest::Client::new(),
-            url: format!("{}/private/stations", api.uri()),
-            tokens: OAuthTokenCache::new(OAuthCredentials {
-                token_url: format!("{}/token/", api.uri()),
-                client_id: "test".to_owned(),
-                scope: "groups".to_owned(),
-                username: "test".to_owned(),
-                password: "test".to_owned(),
-            }),
-            retry_budget: Duration::ZERO,
-        };
-        http.publish(&stations).await.unwrap();
-        let posted = api
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|request| request.url.path() == "/private/stations")
-            .expect("the stations POST");
-        let body: Vec<common::StationReference> = serde_json::from_slice(&posted.body).unwrap();
+        let wire = serde_json::to_vec(&stations).unwrap();
+        let body: Vec<common::StationReference> = serde_json::from_slice(&wire).unwrap();
         ds_store::reference::upsert_stations(&pool, &body)
             .await
             .unwrap();
@@ -338,8 +259,8 @@ mod db_tests {
     /// writing a production-sized feed through `DbSink` allocates about
     /// what the parsed vector itself does, far less than the feed. The
     /// write encodes `UPSERT_STATIONS_CHUNK` rows at a time straight from
-    /// the borrowed `&RawValue`s; the HTTP path serializes the whole feed
-    /// into one POST body instead. Measured (2026-10-07, debug build): a
+    /// the borrowed `&RawValue`s (the retired HTTP path serialized the
+    /// whole feed into one POST body). Measured (2026-10-07, debug build): a
     /// 36 MB feed, 1.9 MB to parse, 6.7 MB to write; 29 MB to write with
     /// 500 rows per statement.
     ///

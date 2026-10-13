@@ -1,5 +1,4 @@
 use clap::Parser;
-use ingest_stream::snapshot::SinkMode;
 
 /// CLI/env configuration for the `poller-ldbws` service.
 ///
@@ -54,20 +53,6 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 10)]
     pub num_rows: u32,
 
-    /// The `api` crate's endpoint for the deduplicated list of stations to
-    /// sample (`GET /private/sample-stations`) — not an RDM endpoint.
-    #[arg(long, env, default_value = "http://api:8080/private/sample-stations")]
-    pub api_sample_stations_url: String,
-
-    /// The `api` crate's ingestion endpoint for station samples.
-    #[arg(long, env, default_value = "http://api:8080/private/station-samples")]
-    pub api_ingest_url: String,
-
-    /// Shared, non-secret `OAuth2` client-credentials config (same value
-    /// across all 9 real callers).
-    #[command(flatten)]
-    pub internal_oauth: common::oauth_client::InternalOAuthArgs,
-
     /// Where the samples go (`INGEST_SINK`, ingest architecture plan 3a.7)
     /// and the Redis they are `XADD`ed to. See `sink.rs`.
     #[command(flatten)]
@@ -92,16 +77,14 @@ pub(crate) struct Config {
     pub hourly_request_budget: u32,
 
     /// LEG-18 operator knob: only sample stations on lines at least one
-    /// user has pinned. Sent to `api` as `pinned_lines_only=true` on the
-    /// sample-stations request (see `crates/api/src/routes/samples.rs`).
-    /// Off by default. With nothing pinned, nothing is sampled.
+    /// user has pinned (`sample_source::selection`). Off by default. With nothing pinned, nothing is sampled.
     #[arg(long, env, default_value_t = false)]
     pub sample_pinned_lines_only: bool,
 
-    /// LEG-18 operator knob: at most this many sample stations, chosen by
-    /// `api` line-fairly with the most-pinned lines first (see
-    /// `crates/api/src/data/samples.rs::select_sample_stations`). Sent as
-    /// `max_stations=N`. 0, the default, means no cap.
+    /// LEG-18 operator knob: at most this many sample stations, chosen
+    /// line-fairly with the most-pinned lines first (see
+    /// `ds_store::reads::sample_stations::select_sample_stations`). 0, the
+    /// default, means no cap.
     #[arg(long, env, default_value_t = 0)]
     pub sample_max_stations: u32,
 
@@ -125,18 +108,18 @@ pub(crate) struct Config {
 }
 
 /// `INGEST_SINK` and its Redis (ingest architecture plan 3a.7, spec §13.1).
-/// The defaults are today's behaviour: `http`, no Redis.
 #[derive(clap::Args, Clone, Debug, Default)]
 pub(crate) struct IngestArgs {
-    /// `http` (the default): POST each cycle's samples to the api.
-    /// `http+shadow`: the same POST, plus a copy `XADD`ed to
-    /// `ds:ingest:station-samples` for the ingest-writer's `shadow` mode.
-    /// `stream`: XADD only, keeping the latest unsent snapshot while Redis
-    /// is down, and read the startup cursor from the stream.
-    #[arg(long, env, default_value_t = SinkMode::Http)]
-    pub ingest_sink: SinkMode,
+    /// `stream` only: XADD each cycle's samples to
+    /// `ds:ingest:station-samples`, keeping the latest unsent snapshot
+    /// while Redis is down, and read the startup cursor from the stream.
+    /// Release B (ingest phase 5, docs/ingest-phase5-runbook.md) removed
+    /// `http` and `http+shadow` with the api's `/private` routes; an old
+    /// value fails at startup. The next release drops the variable.
+    #[arg(long, env, default_value = "stream", value_parser = ["stream"])]
+    pub ingest_sink: String,
 
-    /// Redis for `http+shadow` and `stream`. Unused under `http`.
+    /// Redis for the stream (required).
     #[arg(long, env)]
     pub redis_url: Option<String>,
 
@@ -151,13 +134,10 @@ pub(crate) struct IngestArgs {
 }
 
 impl IngestArgs {
-    /// The Redis client for a sink that XADDs, or `None` under `http`.
-    pub(crate) fn redis_client(&self) -> anyhow::Result<Option<redis::Client>> {
-        if !self.ingest_sink.produces() {
-            return Ok(None);
-        }
+    /// The Redis client for the stream.
+    pub(crate) fn redis_client(&self) -> anyhow::Result<redis::Client> {
         let Some(url) = self.redis_url.as_deref().filter(|url| !url.is_empty()) else {
-            anyhow::bail!("INGEST_SINK={} needs REDIS_URL", self.ingest_sink);
+            anyhow::bail!("poller-ldbws needs REDIS_URL, for ds:ingest:station-samples");
         };
         let url = common::redis_auth::redis_url_with_credentials(
             url,
@@ -167,7 +147,7 @@ impl IngestArgs {
         // No `.context(url)`: it carries the password.
         let client = redis::Client::open(url.expose())
             .map_err(|_| anyhow::anyhow!("REDIS_URL is not a valid Redis URL (value not shown)"))?;
-        Ok(Some(client))
+        Ok(client)
     }
 }
 
@@ -177,9 +157,6 @@ impl std::fmt::Debug for Config {
             .field("ldbws_base_url", &self.ldbws_base_url)
             .field("rdm_api_key", &"[REDACTED]")
             .field("num_rows", &self.num_rows)
-            .field("api_sample_stations_url", &self.api_sample_stations_url)
-            .field("api_ingest_url", &self.api_ingest_url)
-            .field("internal_oauth", &self.internal_oauth)
             .field("ingest", &self.ingest)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("hourly_request_budget", &self.hourly_request_budget)
@@ -197,7 +174,7 @@ impl std::fmt::Debug for Config {
 mod config_debug_tests {
     use clap::Parser;
 
-    use super::{Config, SinkMode};
+    use super::Config;
 
     #[test]
     fn debug_redacts_the_rdm_api_key() {
@@ -207,14 +184,8 @@ mod config_debug_tests {
             "https://example.invalid",
             "--rdm-api-key",
             "super-secret-rdm-key",
-            "--internal-oauth-token-url",
-            "http://authentik.example/token",
-            "--internal-oauth-client-id",
-            "client-id",
-            "--internal-oauth-username",
-            "svc-account",
-            "--internal-oauth-password",
-            "svc-password",
+            "--redis-password",
+            "redis-password",
         ])
         .expect("required args should parse");
 
@@ -228,8 +199,8 @@ mod config_debug_tests {
             "the real rdm_api_key must never appear in Debug output: {debug_output}"
         );
         assert!(
-            !debug_output.contains("svc-password"),
-            "the real internal_oauth password must never appear in Debug output: {debug_output}"
+            !debug_output.contains("redis-password"),
+            "the Redis password must never appear in Debug output: {debug_output}"
         );
     }
 
@@ -242,58 +213,41 @@ mod config_debug_tests {
             "https://example.invalid",
             "--rdm-api-key",
             "key",
-            "--internal-oauth-token-url",
-            "http://authentik.example/token",
-            "--internal-oauth-client-id",
-            "client-id",
-            "--internal-oauth-username",
-            "svc-account",
-            "--internal-oauth-password",
-            "svc-password",
         ])
         .expect("required args should parse");
         assert_eq!(config.poll_interval_secs, 60);
         assert_eq!(config.hourly_request_budget, 0);
         assert!(!config.sample_pinned_lines_only);
         assert_eq!(config.sample_max_stations, 0);
-        // Plan 3a.7: the sink defaults to today's POST, with no Redis.
-        assert_eq!(config.ingest.ingest_sink, SinkMode::Http);
-        assert!(config.ingest.redis_client().unwrap().is_none());
+        // Release B: `stream` is the only sink.
+        assert_eq!(config.ingest.ingest_sink, "stream");
     }
 
-    /// `http+shadow` and `stream` XADD, so they need `REDIS_URL`.
+    /// The stream needs `REDIS_URL`; the removed `http` and `http+shadow`
+    /// fail at startup.
     #[test]
-    fn a_stream_sink_needs_redis() {
+    fn the_stream_sink_needs_redis_and_http_is_gone() {
         use super::IngestArgs;
 
-        for sink in [SinkMode::HttpShadow, SinkMode::Stream] {
-            let mut args = IngestArgs {
-                ingest_sink: sink,
-                ..IngestArgs::default()
-            };
-            assert!(args.redis_client().is_err(), "{sink}");
-            args.redis_url = Some("redis://redis:6379".to_owned());
-            assert!(args.redis_client().unwrap().is_some(), "{sink}");
+        let mut args = IngestArgs::default();
+        assert!(args.redis_client().is_err());
+        args.redis_url = Some("redis://redis:6379".to_owned());
+        assert!(args.redis_client().is_ok());
+        for removed in ["http", "http+shadow"] {
+            assert!(
+                Config::try_parse_from([
+                    "poller-ldbws",
+                    "--ldbws-base-url",
+                    "https://example.invalid",
+                    "--rdm-api-key",
+                    "key",
+                    "--ingest-sink",
+                    removed,
+                ])
+                .is_err(),
+                "{removed}"
+            );
         }
-        let parsed = Config::try_parse_from([
-            "poller-ldbws",
-            "--ldbws-base-url",
-            "https://example.invalid",
-            "--rdm-api-key",
-            "key",
-            "--internal-oauth-token-url",
-            "http://authentik.example/token",
-            "--internal-oauth-client-id",
-            "client-id",
-            "--internal-oauth-username",
-            "svc-account",
-            "--internal-oauth-password",
-            "svc-password",
-            "--ingest-sink",
-            "http+shadow",
-        ])
-        .expect("http+shadow parses");
-        assert_eq!(parsed.ingest.ingest_sink, SinkMode::HttpShadow);
     }
 }
 

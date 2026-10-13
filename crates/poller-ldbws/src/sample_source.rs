@@ -1,18 +1,16 @@
 //! Where the station list to sample comes from (ingest architecture spec
-//! §11.2, plan 4.5): `SAMPLE_STATIONS_SOURCE=http` (the default, today's
-//! behaviour) asks the api's `GET /private/sample-stations`; `db` computes
-//! the same list here, from the line catalogue in this image (`LINES_DIR`)
-//! plus the custom lines and pin counts read through the views
+//! §11.2, plan 4.5): computed here, from the line catalogue in this image
+//! (`LINES_DIR`) plus the custom lines and pin counts read through the views
 //! `ingest_custom_line_stations` and `ingest_sample_station_pins` (no user
-//! ids), as the read-only `ldbws_ro` role. Both run
-//! `ds_store::reads::sample_stations::select_sample_stations`, so the two
-//! lists are the same by construction, LEG-18's knobs included.
+//! ids), as the read-only `ldbws_ro` role, with
+//! `ds_store::reads::sample_stations::select_sample_stations` (what the
+//! api's retired `GET /private/sample-stations` ran), LEG-18's knobs
+//! included.
 
 use common::LineDefinition;
-use common::ingest::ReadSource;
 use ds_store::reads::sample_stations::SampleSelection;
 
-/// `pg_stat_activity.application_name` under `db`.
+/// `pg_stat_activity.application_name`.
 const APPLICATION_NAME: &str = "distant-signal-poller-ldbws";
 /// Spec §6.6: pool 1, role limit 2. One read per cycle.
 const DEFAULT_MAX_CONNECTIONS: u32 = 1;
@@ -20,58 +18,53 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 1;
 /// `SAMPLE_STATIONS_SOURCE` and what `db` needs.
 #[derive(Debug, Default, clap::Args)]
 pub(crate) struct SampleStationsArgs {
-    /// `http` (the default): `API_SAMPLE_STATIONS_URL`. `db`: computed here
-    /// from `LINES_DIR` and Postgres (`DATABASE_URL`).
-    #[arg(long, env, value_enum, default_value_t = ReadSource::Http)]
-    pub sample_stations_source: ReadSource,
+    /// `db` only: computed here from `LINES_DIR` and Postgres
+    /// (`DATABASE_URL`). Release B (ingest phase 5,
+    /// docs/ingest-phase5-runbook.md) removed `http` with the api's
+    /// `/private` routes; an old value fails at startup. The next release
+    /// drops the variable.
+    #[arg(long, env, default_value = "db", value_parser = ["db"])]
+    pub sample_stations_source: String,
 
-    /// Postgres, for `db` (required then, unused otherwise). Pool size and
-    /// timeouts come from the shared `DATABASE_*` variables (`common::pg`);
-    /// the default pool is 1 (spec §6.6, role limit 2).
+    /// Postgres, as the `ldbws_ro` role (required). Pool size and timeouts
+    /// come from the shared `DATABASE_*` variables (`common::pg`); the
+    /// default pool is 1 (spec §6.6, role limit 2).
     #[arg(long, env, hide_env_values = true)]
     pub database_url: Option<common::secret::Secret>,
 
-    /// The line catalogue, for `db`: the same `lines/*.toml` the api
-    /// serves the list from, baked into the image at `/app/lines`. Read
-    /// only under `db`.
+    /// The line catalogue: the same `lines/*.toml` the api serves, baked
+    /// into the image at `/app/lines`.
     #[arg(long = "lines-dir", env = "LINES_DIR", default_value = "/app/lines")]
     pub lines_dir: String,
 
-    /// Set at startup under `db` ([`SampleStationsArgs::connect`]); `None`
-    /// means `http`. Not an argument: it holds the pool and the catalogue,
-    /// so `fetch_sample_stations` keeps the signature every caller already
-    /// uses.
+    /// Set at startup ([`SampleStationsArgs::connect`]); `None` until
+    /// then. Not an argument: it holds the pool and the catalogue.
     #[arg(skip)]
     pub direct: Option<DirectSampleStations>,
 }
 
 impl SampleStationsArgs {
-    /// `db` needs a `DATABASE_URL`.
+    /// The station list needs a `DATABASE_URL`.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.sample_stations_source == ReadSource::Db
-            && self
-                .database_url
-                .as_ref()
-                .is_none_or(common::secret::Secret::is_empty)
+        if self
+            .database_url
+            .as_ref()
+            .is_none_or(common::secret::Secret::is_empty)
         {
-            anyhow::bail!("SAMPLE_STATIONS_SOURCE=db needs DATABASE_URL");
+            anyhow::bail!("poller-ldbws needs DATABASE_URL, for the sample stations");
         }
         Ok(())
     }
 
-    /// Under `db`: loads the catalogue (an empty or broken one is a startup
-    /// error, not an empty station list), waits for Postgres (beating
-    /// `progress`), connects the pool and passes the schema gate as
-    /// `ldbws_ro`, then stores the result in [`Self::direct`]. Nothing
-    /// under `http`.
+    /// Loads the catalogue (an empty or broken one is a startup error, not
+    /// an empty station list), waits for Postgres (beating `progress`),
+    /// connects the pool and passes the schema gate as `ldbws_ro`, then
+    /// stores the result in [`Self::direct`].
     pub(crate) async fn connect(&mut self, progress: &health_http::Progress) -> anyhow::Result<()> {
-        if self.sample_stations_source != ReadSource::Db {
-            return Ok(());
-        }
         let url = self
             .database_url
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("SAMPLE_STATIONS_SOURCE=db needs DATABASE_URL"))?;
+            .ok_or_else(|| anyhow::anyhow!("poller-ldbws needs DATABASE_URL"))?;
         let catalogue = common::config::parse_lines(&self.lines_dir)?;
         anyhow::ensure!(
             !catalogue.is_empty(),
@@ -100,7 +93,7 @@ impl SampleStationsArgs {
             .await?;
         tracing::info!(
             lines = catalogue.len(),
-            "computing the sample stations from the catalogue and Postgres (SAMPLE_STATIONS_SOURCE=db)"
+            "computing the sample stations from the catalogue and Postgres"
         );
         self.direct = Some(DirectSampleStations {
             pool,
@@ -110,7 +103,7 @@ impl SampleStationsArgs {
     }
 }
 
-/// `SAMPLE_STATIONS_SOURCE=db`'s state: the pool and the catalogue.
+/// The station list's state: the pool and the catalogue.
 #[derive(Debug)]
 pub(crate) struct DirectSampleStations {
     pub pool: sqlx::PgPool,
@@ -118,14 +111,14 @@ pub(crate) struct DirectSampleStations {
 }
 
 impl DirectSampleStations {
-    /// What `GET /private/sample-stations` answers for these knobs.
+    /// The stations to sample for these knobs.
     pub(crate) async fn select(&self, selection: SampleSelection) -> anyhow::Result<Vec<String>> {
         ds_store::reads::select_sample_stations_from(&self.pool, &self.catalogue, selection).await
     }
 }
 
-/// The LEG-18 knobs as the api's query parameters carry them
-/// (`sample_stations_url`): 0 is no cap.
+/// The LEG-18 knobs (`SAMPLE_PINNED_LINES_ONLY`, `SAMPLE_MAX_STATIONS`):
+/// 0 is no cap.
 pub(crate) fn selection(pinned_lines_only: bool, max_stations: u32) -> SampleSelection {
     SampleSelection {
         pinned_lines_only,
@@ -149,14 +142,6 @@ mod tests {
             "https://example.invalid",
             "--rdm-api-key",
             "key",
-            "--internal-oauth-token-url",
-            "http://authentik.example/token",
-            "--internal-oauth-client-id",
-            "client-id",
-            "--internal-oauth-username",
-            "svc-account",
-            "--internal-oauth-password",
-            "svc-password",
         ];
         // The test environment may set DATABASE_URL.
         let no_database: &[&str] = if extra.contains(&"--database-url") {
@@ -167,19 +152,28 @@ mod tests {
         Config::try_parse_from(base.iter().chain(no_database).chain(extra)).unwrap()
     }
 
-    /// Plan 4.5: `http` by default; `db` needs a database.
+    /// Release B: `db` is the default and the only source, and it needs a
+    /// database; the removed `http` fails at startup.
     #[test]
-    fn the_source_defaults_to_http_and_db_needs_a_database_url() {
+    fn the_source_is_db_only_and_needs_a_database_url() {
         let config = parse(&[]);
-        assert_eq!(config.reads.sample_stations_source, ReadSource::Http);
+        assert_eq!(config.reads.sample_stations_source, "db");
         assert_eq!(config.reads.lines_dir, "/app/lines");
         assert!(config.reads.direct.is_none());
-        config.reads.validate().unwrap();
-        let db = parse(&["--sample-stations-source", "db"]);
-        assert!(db.reads.validate().is_err());
+        assert!(config.reads.validate().is_err());
+        assert!(
+            Config::try_parse_from([
+                "poller-ldbws",
+                "--ldbws-base-url",
+                "https://example.invalid",
+                "--rdm-api-key",
+                "key",
+                "--sample-stations-source",
+                "http",
+            ])
+            .is_err()
+        );
         let db = parse(&[
-            "--sample-stations-source",
-            "db",
             "--database-url",
             "postgres://distant_signal_ldbws_ro:pw@postgres/ds",
         ]);
@@ -187,8 +181,9 @@ mod tests {
         assert!(!format!("{db:?}").contains(":pw@"));
     }
 
-    /// The chart sets it (templates/poller-deployments.yaml passes it to
-    /// `distant-signal.internalReadsEnv`).
+    /// The chart sets `DATABASE_URL` (templates/poller-deployments.yaml);
+    /// `SAMPLE_STATIONS_SOURCE` is read for one more release so an old
+    /// `http` fails, and the chart no longer renders it.
     #[test]
     fn the_source_reads_the_chart_s_env_name() {
         use clap::CommandFactory;
@@ -210,11 +205,11 @@ mod tests {
                 .join("../../charts/distant-signal/templates/poller-deployments.yaml"),
         )
         .unwrap();
-        assert!(template.contains("\"SAMPLE_STATIONS_SOURCE\""));
+        assert!(!template.contains("SAMPLE_STATIONS_SOURCE"));
     }
 
     #[test]
-    fn the_knobs_map_onto_the_api_s_query_parameters() {
+    fn the_knobs_map_onto_the_selection() {
         assert_eq!(selection(false, 0), SampleSelection::default());
         assert_eq!(
             selection(true, 150),

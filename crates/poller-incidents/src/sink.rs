@@ -1,14 +1,13 @@
 //! Where a parsed snapshot goes (ingest architecture spec §9.1, plan 2c.2):
-//! [`IncidentSink`], with [`HttpSink`] (today's POST to the api, unchanged)
-//! and [`DbSink`] (Postgres through `ds_store::incidents`, then the
-//! `incident-text-changed` XADD from here). `INGEST_SINK` picks one at
-//! startup.
+//! [`DbSink`], Postgres through `ds_store::incidents`, then the
+//! `incident-text-changed` XADD from here. Release B (ingest phase 5)
+//! removed the HTTP sink (`POST /private/incidents`).
 //!
-//! Both write a snapshot the same way, in the same order (spec §9.4):
+//! It writes a snapshot in the order the api's handler did (spec §9.4):
 //! `apply_snapshot` (committed chunks), the XADD of the text changes (best
-//! effort), then the removal inference. Both retry a transient failure of
+//! effort), then the removal inference. It retries a transient failure of
 //! the whole snapshot within `common::poller_loop::post_retry_budget`, and
-//! return a data rejection at once.
+//! returns a data rejection at once.
 
 use std::time::Duration;
 
@@ -18,18 +17,17 @@ use common::matcher::LineMatcher;
 use ds_store::incidents::{self, IncidentSnapshotOutcome, RowHeartbeat};
 use sqlx::PgPool;
 
-/// One error vocabulary for both sinks (spec §9.1), so the retry decision
-/// is the same whichever is active. (`Busy`, the schedule publish's
-/// advisory-lock 409, has no incidents counterpart.)
+/// The sink's error vocabulary (spec §9.1), for the retry decision.
+/// (`Busy`, the schedule publish's advisory-lock 409, has no incidents
+/// counterpart.)
 #[derive(Debug)]
 pub(crate) enum SinkError {
     /// A statement timeout (SQLSTATE 57014): retried.
     Timeout(anyhow::Error),
-    /// The data itself was refused (an HTTP 400/413/422, or a class 22 or
-    /// 23 SQLSTATE): the same snapshot fails the same way, so it is not
+    /// The data itself was refused (a class 22 or 23 SQLSTATE): the same snapshot fails the same way, so it is not
     /// retried; the cycle waits for the next poll.
     Rejected(anyhow::Error),
-    /// Anything else (unreachable, a 5xx, a dropped connection): retried.
+    /// Anything else (unreachable, a dropped connection): retried.
     Transient(anyhow::Error),
 }
 
@@ -52,16 +50,8 @@ impl SinkError {
         }
     }
 
-    /// The HTTP sink's: `common::ingest::classify_failure`, as today.
-    pub(crate) fn from_http(err: anyhow::Error) -> Self {
-        match ingest::classify_failure(&err) {
-            ingest::FailureClass::Rejected => Self::Rejected(err),
-            ingest::FailureClass::Transient => Self::Transient(err),
-        }
-    }
-
     /// The error for the poll loop, whose own `classify_failure` still sees
-    /// a rejection as one (the HTTP status, or [`DataRejected`]).
+    /// a rejection as one ([`DataRejected`]).
     pub(crate) fn into_anyhow(self) -> anyhow::Error {
         match self {
             Self::Timeout(err) | Self::Rejected(err) | Self::Transient(err) => err,
@@ -76,38 +66,6 @@ impl SinkError {
         match self {
             Self::Timeout(err) | Self::Rejected(err) | Self::Transient(err) => err,
         }
-    }
-}
-
-/// Where one parsed snapshot is written.
-pub(crate) trait IncidentSink {
-    async fn publish(&self, snapshot: &IncidentSnapshot) -> Result<(), SinkError>;
-}
-
-/// Today's path: `POST /private/incidents`, retried within `budget` by
-/// `common::ingest::post_counted_retrying` exactly as before.
-pub(crate) struct HttpSink<'a> {
-    pub client: &'a reqwest::Client,
-    pub url: &'a str,
-    pub internal_oauth: &'a common::oauth_client::OAuthTokenCache,
-    pub budget: Duration,
-}
-
-impl IncidentSink for HttpSink<'_> {
-    async fn publish(&self, snapshot: &IncidentSnapshot) -> Result<(), SinkError> {
-        // An api older than this body rejects it with a 4xx, which fails
-        // just this cycle -- deploy the api first.
-        ingest::post_counted_retrying(
-            self.client,
-            self.url,
-            self.internal_oauth,
-            snapshot,
-            snapshot.incidents.len(),
-            "incidents",
-            self.budget,
-        )
-        .await
-        .map_err(SinkError::from_http)
     }
 }
 
@@ -185,14 +143,14 @@ impl<P: TextChangedPublisher> DbSink<P> {
     }
 }
 
-impl<P: TextChangedPublisher> IncidentSink for DbSink<P> {
+impl<P: TextChangedPublisher> DbSink<P> {
     /// [`DbSink::write_once`], retrying the whole snapshot on a retryable
     /// failure with `common::ingest::POST_RETRY_BACKOFF` for up to
-    /// `budget`, like the HTTP sink's POST. Safe (spec §9.4): the chunk
+    /// `budget`. Safe (spec §9.4): the chunk
     /// upserts are idempotent, inference's guard skips a retry within 120 s
     /// of a committed baseline, and "listed resets the counters" is
     /// idempotent.
-    async fn publish(&self, snapshot: &IncidentSnapshot) -> Result<(), SinkError> {
+    pub(crate) async fn publish(&self, snapshot: &IncidentSnapshot) -> Result<(), SinkError> {
         let started = tokio::time::Instant::now();
         let mut failures: u32 = 0;
         loop {
@@ -238,17 +196,9 @@ mod tests {
     }
 
     #[test]
-    fn an_http_422_is_rejected_and_keeps_its_status_for_the_poll_loop() {
-        let err = SinkError::from_http(
-            ingest::HttpStatusError {
-                prefix: "ingestion POST failed",
-                status: reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-                body: String::new(),
-                retry_after: None,
-            }
-            .into(),
-        );
-        assert!(matches!(err, SinkError::Rejected(_)));
+    fn a_rejection_stays_a_rejection_for_the_poll_loop() {
+        let err = SinkError::Rejected(DataRejected("duplicate".to_owned()).into());
+        assert!(!err.is_retryable());
         assert_eq!(
             ingest::classify_failure(&err.into_anyhow()),
             ingest::FailureClass::Rejected
@@ -257,7 +207,7 @@ mod tests {
 }
 
 /// Against a real database (and, where noted, local Redis/valkey): the DB
-/// sink against the api's write path, the publish order, and a Redis
+/// sink against the retired api's write path, the publish order, and a Redis
 /// outage. Resets `incident_feed_state`, so needs `--test-threads=1`.
 ///
 /// They also run as the narrow `incidents` role (CI's per-service step),
@@ -483,65 +433,20 @@ mod db_tests {
             .0
     }
 
-    /// What the api receives from [`HttpSink`]: the snapshot sent by POST to a
-    /// stand-in api, read back with the api's own body parser
-    /// (`ds_store::incidents::parse_snapshot`, its handler's first step).
-    async fn through_http(snapshot: &IncidentSnapshot) -> IncidentSnapshot {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/token/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "fake-jwt",
-                "expires_in": 300,
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/private/incidents"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"upserted": 0})),
-            )
-            .mount(&server)
-            .await;
-        let tokens =
-            common::oauth_client::OAuthTokenCache::new(common::oauth_client::OAuthCredentials {
-                token_url: format!("{}/token/", server.uri()),
-                client_id: "test".to_string(),
-                scope: "groups".to_string(),
-                username: "test".to_string(),
-                password: "test".to_string(),
-            });
-        let client = reqwest::Client::new();
-        let url = format!("{}/private/incidents", server.uri());
-        HttpSink {
-            client: &client,
-            url: &url,
-            internal_oauth: &tokens,
-            budget: Duration::ZERO,
-        }
-        .publish(snapshot)
-        .await
-        .expect("posted");
-        let requests = server.received_requests().await.expect("recorded");
-        let body = requests
-            .iter()
-            .find(|request| request.url.path() == "/private/incidents")
-            .expect("the snapshot was POSTed")
-            .body
-            .clone();
+    /// The snapshot as the retired api route received it: serialized as
+    /// the POST body was, read back with its body parser
+    /// (`ds_store::incidents::parse_snapshot`, the handler's first step).
+    fn through_the_wire(snapshot: &IncidentSnapshot) -> IncidentSnapshot {
+        let body = serde_json::to_vec(snapshot).expect("serialize");
         incidents::parse_snapshot(serde_json::from_slice(&body).expect("JSON"))
-            .expect("the api parses it")
+            .expect("the api parsed it")
     }
 
-    /// Both sinks give the same `incidents`, `incident_history` and
+    /// The DB sink gives the same `incidents`, `incident_history` and
     /// `affected_lines` and the same inference outcomes for a fixture
-    /// sequence (plan 2c.2). The HTTP side is the snapshot as the api
-    /// receives it, written the way its handler writes it
-    /// (`queries::upsert_incident_snapshot`: apply, publish, infer); the
-    /// api crate itself is not a dependency of this one.
+    /// sequence as the retired api route did (plan 2c.2). That side is the
+    /// snapshot as the api received it, written the way its handler wrote
+    /// it (apply, publish, infer).
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p \
                 poller-incidents sink::db_tests -- --ignored --test-threads=1`"]
@@ -574,7 +479,7 @@ mod db_tests {
         ];
 
         let mut results = Vec::new();
-        for via_http in [true, false] {
+        for via_api in [true, false] {
             reset(&pool).await;
             let matcher = LineMatcher::new(&lines);
             let sink = DbSink {
@@ -594,8 +499,8 @@ mod db_tests {
                 .await
                 .expect("backdate the baseline");
                 let snapshot = complete(batch.clone());
-                let inference = if via_http {
-                    let received = through_http(&snapshot).await;
+                let inference = if via_api {
+                    let received = through_the_wire(&snapshot);
                     let applied = incidents::apply_snapshot(
                         &pool,
                         &matcher,
@@ -626,7 +531,7 @@ mod db_tests {
             }
             results.push((outcomes, contents));
         }
-        assert_eq!(results[1], results[0], "db sink == http sink");
+        assert_eq!(results[1], results[0], "db sink == the api's write path");
         let first = &results[0].1[0];
         assert!(
             first.iter().all(|row| !row.contains("|{}|")),

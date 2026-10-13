@@ -38,26 +38,17 @@ pub(crate) struct Config {
     #[arg(long, env, default_value = "tube,dlr,overground,elizabeth-line,tram")]
     pub tfl_modes: String,
 
-    /// The `api` crate's ingestion endpoint for `TfL` line status.
-    #[arg(long, env, default_value = "http://api:8080/private/tfl-line-status")]
-    pub api_ingest_url: String,
+    /// Where each snapshot goes: `stream` only, to `ds:ingest:tfl` (ingest
+    /// plan 3c.2), which the ingest-writer applies. Release B (ingest phase
+    /// 5, docs/ingest-phase5-runbook.md) removed `http` and `http+shadow`
+    /// with the api's `/private` routes; an old value fails at startup. The
+    /// next release drops the variable.
+    #[arg(long, env = "INGEST_SINK", default_value = "stream", value_parser = ["stream"])]
+    pub ingest_sink: String,
 
-    /// Where each snapshot goes (ingest plan 3c.2): `http` (the default:
-    /// `POST` to `API_INGEST_URL`), `http+shadow` (that, plus a copy to the
-    /// `ds:ingest:tfl` stream for the writer's `shadow` mode) or `stream`
-    /// (the stream only; the ingest-writer applies it). See
-    /// `ingest_stream::snapshot`.
-    #[arg(long, env = "INGEST_SINK", default_value = "http")]
-    pub ingest_sink: ingest_stream::snapshot::SinkMode,
-
-    /// Redis for the stream sinks.
+    /// Redis for the `ds:ingest:tfl` stream (`REDIS_URL` required).
     #[command(flatten)]
     pub redis: ingest_stream::snapshot::RedisArgs,
-
-    /// Shared, non-secret `OAuth2` client-credentials config (same value
-    /// across all 9 real callers).
-    #[command(flatten)]
-    pub internal_oauth: common::oauth_client::InternalOAuthArgs,
 
     /// `TfL` publishes no recommended interval for the line-status endpoint,
     /// and offers no push, no webhook and no confirmed conditional-request
@@ -86,10 +77,8 @@ impl std::fmt::Debug for Config {
             .field("tfl_base_url", &self.tfl_base_url)
             .field("tfl_app_key", &"[REDACTED]")
             .field("tfl_modes", &self.tfl_modes)
-            .field("api_ingest_url", &self.api_ingest_url)
             .field("ingest_sink", &self.ingest_sink)
             .field("redis", &self.redis)
-            .field("internal_oauth", &self.internal_oauth)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("metrics_port", &self.metrics_port)
             .field("metrics", &self.metrics)
@@ -110,14 +99,8 @@ mod config_debug_tests {
             "poller-tfl",
             "--tfl-app-key",
             "super-secret-tfl-key",
-            "--internal-oauth-token-url",
-            "http://authentik.example/token",
-            "--internal-oauth-client-id",
-            "client-id",
-            "--internal-oauth-username",
-            "svc-account",
-            "--internal-oauth-password",
-            "svc-password",
+            "--redis-password",
+            "redis-password",
         ])
         .expect("required args should parse");
 
@@ -131,42 +114,23 @@ mod config_debug_tests {
             "the real tfl_app_key must never appear in Debug output: {debug_output}"
         );
         assert!(
-            !debug_output.contains("svc-password"),
-            "the real internal_oauth password must never appear in Debug output: {debug_output}"
+            !debug_output.contains("redis-password"),
+            "the Redis password must never appear in Debug output: {debug_output}"
         );
     }
 
-    /// Plan 3c.2: `http` by default; the stream sinks parse.
+    /// Release B: `stream` is the default and the only value; the removed
+    /// `http` and `http+shadow` fail at startup.
     #[test]
-    fn ingest_sink_defaults_to_http() {
-        use ingest_stream::snapshot::SinkMode;
-
-        let args = [
-            "poller-tfl",
-            "--tfl-app-key",
-            "k",
-            "--internal-oauth-token-url",
-            "http://authentik.example/token",
-            "--internal-oauth-client-id",
-            "client-id",
-            "--internal-oauth-username",
-            "svc-account",
-            "--internal-oauth-password",
-            "svc-password",
-        ];
+    fn ingest_sink_is_stream_only() {
+        let args = ["poller-tfl", "--tfl-app-key", "k"];
         let config = Config::try_parse_from(args).unwrap();
-        assert_eq!(config.ingest_sink, SinkMode::Http);
-        let config = Config::try_parse_from(args.iter().chain(&[
-            "--ingest-sink",
-            "stream",
-            "--redis-url",
-            "redis://redis:6379",
-            "--redis-password",
-            "redis-secret",
-        ]))
-        .unwrap();
-        assert_eq!(config.ingest_sink, SinkMode::Stream);
-        assert!(!format!("{config:?}").contains("redis-secret"));
-        assert!(Config::try_parse_from(args.iter().chain(&["--ingest-sink", "db"])).is_err());
+        assert_eq!(config.ingest_sink, "stream");
+        for removed in ["http", "http+shadow", "db"] {
+            assert!(
+                Config::try_parse_from(args.iter().chain(&["--ingest-sink", removed])).is_err(),
+                "{removed}"
+            );
+        }
     }
 }

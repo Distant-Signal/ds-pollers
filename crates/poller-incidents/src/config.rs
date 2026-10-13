@@ -1,17 +1,5 @@
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use common::secret::Secret;
-
-/// Where a snapshot goes (`INGEST_SINK`, ingest architecture spec §9.1;
-/// chart `pollers.incidents.ingest.sink`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum IngestSink {
-    /// `POST /private/incidents` on the api (today's path, the default).
-    Http,
-    /// Straight into Postgres through `ds_store::incidents`, as the
-    /// `distant_signal_incidents` role, with the text-changed XADD from
-    /// here (plan 2c.2).
-    Db,
-}
 
 /// CLI/env configuration for the `poller-incidents` service.
 ///
@@ -41,15 +29,6 @@ pub(crate) struct Config {
     #[arg(long, env)]
     pub rdm_api_key: String,
 
-    /// The `api` crate's ingestion endpoint for incidents.
-    #[arg(long, env, default_value = "http://api:8080/private/incidents")]
-    pub api_ingest_url: String,
-
-    /// Shared, non-secret `OAuth2` client-credentials config (same value
-    /// across all 9 real callers).
-    #[command(flatten)]
-    pub internal_oauth: common::oauth_client::InternalOAuthArgs,
-
     /// RSPS5050 P-03-00 Rev A §10: "Recommend every 5 minutes."
     #[arg(long, env, default_value_t = 300)]
     pub poll_interval_secs: u64,
@@ -67,25 +46,27 @@ pub(crate) struct Config {
     #[command(flatten)]
     pub health: common::service_args::HealthArgs,
 
-    /// `http` (default): POST each snapshot to `api_ingest_url`. `db`:
-    /// write it to Postgres directly (`database_url`, `lines_dir`,
-    /// `redis_url`), plan 2c.2.
-    #[arg(long, env = "INGEST_SINK", value_enum, default_value_t = IngestSink::Http)]
-    pub ingest_sink: IngestSink,
+    /// `db` only: each snapshot goes to Postgres directly (`database_url`,
+    /// `lines_dir`, `redis_url`; plan 2c.2). Release B (ingest phase 5,
+    /// docs/ingest-phase5-runbook.md) removed `http` with the api's
+    /// `/private` routes; an old value fails at startup. The next release
+    /// drops the variable.
+    #[arg(long, env = "INGEST_SINK", default_value = "db", value_parser = ["db"])]
+    pub ingest_sink: String,
 
-    /// The `distant_signal_incidents` role's connection (`db` sink only).
+    /// The `distant_signal_incidents` role's connection (required).
     /// Pool size and timeouts come from the shared `DATABASE_*` variables
     /// (`common::pg`); the default pool is 2.
     #[arg(long, env, hide_env_values = true)]
     pub database_url: Option<Secret>,
 
-    /// Directory of line-catalogue TOML files (`db` sink only): the
+    /// Directory of line-catalogue TOML files: the
     /// matcher that fills `incidents.affected_lines` is built from it at
     /// startup, as the api's is. The image carries the catalogue here.
     #[arg(long = "lines-dir", env = "LINES_DIR", default_value = "/app/lines")]
     pub lines_dir: String,
 
-    /// Redis, for the `incident-text-changed` XADD (`db` sink only). May
+    /// Redis, for the `incident-text-changed` XADD (required). May
     /// carry a password (`redis://:pw@host`).
     #[arg(long, env, hide_env_values = true)]
     pub redis_url: Option<Secret>,
@@ -101,7 +82,7 @@ pub(crate) struct Config {
     #[arg(long, env)]
     pub redis_username: Option<String>,
 
-    /// The row heartbeat (`db` sink only; plan 2c.6,
+    /// The row heartbeat (plan 2c.6,
     /// `ds_store::incidents::RowHeartbeat`). **On by default** (today's
     /// behaviour). The chart sets it, and the api's, from one value.
     #[arg(long, env = "INCIDENTS_ROW_HEARTBEAT", default_value_t = true, action = clap::ArgAction::Set)]
@@ -109,17 +90,15 @@ pub(crate) struct Config {
 }
 
 impl Config {
-    /// The `db` sink's required settings, checked once at startup.
+    /// The sink's required settings, checked once at startup.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.ingest_sink == IngestSink::Db {
-            if self.database_url.is_none() {
-                anyhow::bail!("INGEST_SINK=db needs DATABASE_URL");
-            }
-            if self.redis_url.is_none() {
-                anyhow::bail!(
-                    "INGEST_SINK=db needs REDIS_URL, for the incident-text-changed publish"
-                );
-            }
+        if self.database_url.is_none() {
+            anyhow::bail!("poller-incidents needs DATABASE_URL");
+        }
+        if self.redis_url.is_none() {
+            anyhow::bail!(
+                "poller-incidents needs REDIS_URL, for the incident-text-changed publish"
+            );
         }
         Ok(())
     }
@@ -130,8 +109,6 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("rdm_incidents_base_url", &self.rdm_incidents_base_url)
             .field("rdm_api_key", &"[REDACTED]")
-            .field("api_ingest_url", &self.api_ingest_url)
-            .field("internal_oauth", &self.internal_oauth)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("metrics_port", &self.metrics_port)
             .field("metrics", &self.metrics)
@@ -151,48 +128,42 @@ impl std::fmt::Debug for Config {
 mod tests {
     use clap::Parser;
 
-    use super::{Config, IngestSink};
+    use super::Config;
 
-    const REQUIRED: [&str; 13] = [
+    const REQUIRED: [&str; 5] = [
         "poller-incidents",
         "--rdm-incidents-base-url",
         "https://example.invalid",
         "--rdm-api-key",
         "super-secret-rdm-key",
-        "--internal-oauth-token-url",
-        "http://authentik.example/token",
-        "--internal-oauth-client-id",
-        "client-id",
-        "--internal-oauth-username",
-        "svc-account",
-        "--internal-oauth-password",
-        "svc-password",
     ];
 
     fn parse(extra: &[&str]) -> Config {
         Config::try_parse_from(REQUIRED.iter().chain(extra)).expect("args should parse")
     }
 
-    /// Off by default (plan 2c.2/2c.6): the http sink and the heartbeat.
+    /// Release B: `db` is the default and the only sink; the heartbeat is
+    /// on by default (plan 2c.6).
     #[test]
-    fn the_defaults_are_todays_behaviour() {
+    fn the_defaults_are_the_db_sink_and_the_heartbeat() {
         let config = parse(&[]);
-        assert_eq!(config.ingest_sink, IngestSink::Http);
+        assert_eq!(config.ingest_sink, "db");
         assert!(config.incidents_row_heartbeat);
         assert_eq!(config.lines_dir, "/app/lines");
-        config.validate().expect("the http sink needs nothing more");
+        assert!(
+            Config::try_parse_from(REQUIRED.iter().chain(&["--ingest-sink", "http"])).is_err(),
+            "the removed http sink fails at startup"
+        );
     }
 
     #[test]
     fn the_db_sink_needs_a_database_and_redis() {
-        let mut config = parse(&["--ingest-sink", "db"]);
+        let mut config = parse(&[]);
         // Not from the environment (a DB test run sets both).
         config.database_url = None;
         config.redis_url = None;
         assert!(config.validate().is_err());
         let config = parse(&[
-            "--ingest-sink",
-            "db",
             "--database-url",
             "postgres://u:p@h/d",
             "--redis-url",
@@ -221,10 +192,6 @@ mod tests {
         assert!(
             !debug_output.contains("super-secret-rdm-key"),
             "the real rdm_api_key must never appear in Debug output: {debug_output}"
-        );
-        assert!(
-            !debug_output.contains("svc-password"),
-            "the real internal_oauth password must never appear in Debug output: {debug_output}"
         );
         assert!(
             !debug_output.contains("super-secret-db-password")

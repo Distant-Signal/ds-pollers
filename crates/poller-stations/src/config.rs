@@ -27,30 +27,21 @@ pub(crate) struct Config {
     #[arg(long, env)]
     pub rdm_api_key: String,
 
-    /// The `api` crate's ingestion endpoint for stations. Used only with
-    /// `INGEST_SINK=http`.
-    #[arg(long, env, default_value = "http://api:8080/private/stations")]
-    pub api_ingest_url: String,
+    /// Where the parsed stations go: `db` only, straight into Postgres
+    /// (`ds_store::reference::upsert_stations`, as the `stations` role,
+    /// ingest architecture plan 2b.1), with the startup cursor from
+    /// `ingest_freshness`. Release B (ingest phase 5,
+    /// docs/ingest-phase5-runbook.md) removed `http` with the api's
+    /// `/private` routes; an old value fails at startup. The next release
+    /// drops the variable.
+    #[arg(long, env = "INGEST_SINK", default_value = "db", value_parser = ["db"])]
+    pub ingest_sink: String,
 
-    /// Where the parsed stations go (ingest architecture plan 2b.1): `http`
-    /// (the default, today's behaviour) POSTs them to `API_INGEST_URL`;
-    /// `db` writes them straight into Postgres
-    /// (`ds_store::reference::upsert_stations`, as the `stations` role) and
-    /// reads the startup cursor from `ingest_freshness`.
-    #[arg(long, env, value_enum, default_value_t = IngestSink::Http)]
-    pub ingest_sink: IngestSink,
-
-    /// Postgres, for `INGEST_SINK=db` (required then, unused otherwise).
-    /// Pool size and timeouts come from the shared `DATABASE_*` variables
-    /// (`common::pg`); the default pool is 1 (spec §6.6: one sequential
-    /// writer, role limit 2).
+    /// Postgres, as the `stations` role (required). Pool size and timeouts
+    /// come from the shared `DATABASE_*` variables (`common::pg`); the
+    /// default pool is 1 (spec §6.6: one sequential writer, role limit 2).
     #[arg(long, env, hide_env_values = true)]
-    pub database_url: Option<common::secret::Secret>,
-
-    /// Shared, non-secret `OAuth2` client-credentials config (same value
-    /// across all 9 real callers).
-    #[command(flatten)]
-    pub internal_oauth: common::oauth_client::InternalOAuthArgs,
+    pub database_url: common::secret::Secret,
 
     /// RSPS5050 P-03-00 Rev A §6: "updated overnight; Poll frequency should
     /// only be once every 24 hours."
@@ -71,24 +62,11 @@ pub(crate) struct Config {
     pub health: common::service_args::HealthArgs,
 }
 
-/// `INGEST_SINK`: see [`Config::ingest_sink`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum IngestSink {
-    #[default]
-    Http,
-    Db,
-}
-
 impl Config {
-    /// Cross-field checks clap cannot express: `db` needs a `DATABASE_URL`.
+    /// Cross-field checks clap cannot express: an empty `DATABASE_URL`.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.ingest_sink == IngestSink::Db
-            && self
-                .database_url
-                .as_ref()
-                .is_none_or(common::secret::Secret::is_empty)
-        {
-            anyhow::bail!("INGEST_SINK=db needs DATABASE_URL");
+        if self.database_url.is_empty() {
+            anyhow::bail!("DATABASE_URL must not be empty");
         }
         Ok(())
     }
@@ -99,10 +77,8 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("rdm_stations_base_url", &self.rdm_stations_base_url)
             .field("rdm_api_key", &"[REDACTED]")
-            .field("api_ingest_url", &self.api_ingest_url)
             .field("ingest_sink", &self.ingest_sink)
             .field("database_url", &self.database_url)
-            .field("internal_oauth", &self.internal_oauth)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("metrics_port", &self.metrics_port)
             .field("metrics", &self.metrics)
@@ -115,57 +91,52 @@ impl std::fmt::Debug for Config {
 mod tests {
     use clap::Parser;
 
-    use super::{Config, IngestSink};
+    use super::Config;
 
-    const REQUIRED: [&str; 13] = [
+    const REQUIRED: [&str; 7] = [
         "poller-stations",
         "--rdm-stations-base-url",
         "https://example.invalid",
         "--rdm-api-key",
         "super-secret-rdm-key",
-        "--internal-oauth-token-url",
-        "http://authentik.example/token",
-        "--internal-oauth-client-id",
-        "client-id",
-        "--internal-oauth-username",
-        "svc-account",
-        "--internal-oauth-password",
-        "svc-password",
+        "--database-url",
+        "postgres://distant_signal_stations:pw@postgres/ds",
     ];
 
     fn parse(extra: &[&str]) -> Result<Config, clap::Error> {
         Config::try_parse_from(REQUIRED.iter().chain(extra))
     }
 
-    /// The default is today's behaviour: POST to the api, no database.
+    /// Release B: `db` is the default and the only sink; the removed
+    /// `http` fails at startup, as does an empty `DATABASE_URL`.
     #[test]
-    fn the_sink_defaults_to_http_and_db_needs_a_database_url() {
-        // `--database-url ""`: the test environment may set DATABASE_URL.
-        let config = parse(&["--database-url", ""]).unwrap();
-        assert_eq!(config.ingest_sink, IngestSink::Http);
+    fn the_sink_is_db_only_and_needs_a_database_url() {
+        let config = parse(&[]).unwrap();
+        assert_eq!(config.ingest_sink, "db");
         config.validate().unwrap();
-
-        let db = parse(&["--ingest-sink", "db", "--database-url", ""]).unwrap();
-        assert_eq!(db.ingest_sink, IngestSink::Db);
-        assert!(db.validate().is_err(), "db without DATABASE_URL");
-
-        let db = parse(&[
-            "--ingest-sink",
-            "db",
-            "--database-url",
-            "postgres://distant_signal_stations:pw@postgres/ds",
-        ])
-        .unwrap();
-        db.validate().unwrap();
         assert!(
-            !format!("{db:?}").contains(":pw@"),
+            !format!("{config:?}").contains(":pw@"),
             "the database URL must not appear in Debug output"
         );
 
-        assert!(parse(&["--ingest-sink", "stream"]).is_err());
+        for removed in ["http", "stream"] {
+            assert!(parse(&["--ingest-sink", removed]).is_err(), "{removed}");
+        }
+        let empty = Config::try_parse_from([
+            "poller-stations",
+            "--rdm-stations-base-url",
+            "https://example.invalid",
+            "--rdm-api-key",
+            "k",
+            "--database-url",
+            "",
+        ])
+        .unwrap();
+        assert!(empty.validate().is_err(), "an empty DATABASE_URL");
     }
 
-    /// The chart sets these names (templates/poller-deployments.yaml).
+    /// The chart sets `DATABASE_URL` (templates/poller-deployments.yaml);
+    /// `INGEST_SINK` is read for one more release so an old `http` fails.
     #[test]
     fn the_new_settings_read_the_chart_s_env_names() {
         use clap::CommandFactory;
@@ -193,10 +164,6 @@ mod tests {
         assert!(
             !debug_output.contains("super-secret-rdm-key"),
             "the real rdm_api_key must never appear in Debug output: {debug_output}"
-        );
-        assert!(
-            !debug_output.contains("svc-password"),
-            "the real internal_oauth password must never appear in Debug output: {debug_output}"
         );
     }
 }

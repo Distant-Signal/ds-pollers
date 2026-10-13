@@ -30,6 +30,5 @@ tracing = "0.1.44"
 workspace = true
 
 [dev-dependencies]
+# The DB sink's tests: the snapshot through the retired api's JSON body.
 serde_json = "1.0.149"
-# The DB sink's tests: the HTTP sink's POST to a stand-in api.
-wiremock = "0.6"

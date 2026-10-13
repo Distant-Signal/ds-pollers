@@ -72,8 +72,9 @@ struct RdmStation {
 /// station goes into [`StationRecord::accessibility`].
 const MODELED_KEYS: [&str; 4] = ["crsCode", "name", "location", "stationOperator"];
 
-/// One station as `POSTed` to `/private/stations`: the same wire shape as
-/// `common::StationReference` (which `api` deserializes it as), but with
+/// One station as written to `stations` (and as the api's retired
+/// `/private/stations` took it): the same wire shape as
+/// `common::StationReference`, but with
 /// the passthrough `accessibility` object held as `&RawValue` slices of
 /// the fetched response body rather than as a `serde_json::Value` tree.
 /// See [`parse_stations`] for why.

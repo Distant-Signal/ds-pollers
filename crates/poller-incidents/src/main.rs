@@ -1,8 +1,6 @@
 //! `poller-incidents`: polls the RDM Knowledgebase Incidents feed on an
-//! interval and forwards parsed `IncidentMessage`s to the `api` crate's
-//! `/private/incidents` ingestion endpoint, or, with `INGEST_SINK=db`
-//! (ingest architecture plan 2c.2, off by default), writes them to Postgres
-//! itself (`sink::DbSink`).
+//! interval and writes the parsed `IncidentMessage`s to Postgres itself
+//! (`sink::DbSink`, ingest architecture plan 2c.2).
 //!
 //! Built against RSPS5050 P-03-00 Rev A, §10. That spec publishes no
 //! endpoint path, so `RDM_INCIDENTS_BASE_URL` is the full feed URL from the
@@ -17,11 +15,10 @@ use std::time::Duration;
 
 use clap::Parser;
 use common::ingest::RDM_AUTH_HEADER_NAME;
-use config::{Config, IngestSink};
+use config::Config;
 use reqwest::Client;
-use sink::IncidentSink;
 
-/// Per-request timeout for both the RDM fetch and the ingestion POST.
+/// Per-request timeout for the RDM fetch.
 /// Without this, a peer that accepts the TCP connection but never responds
 /// (unlike the connection-refused case) would hang `poll_once` forever —
 /// the process wouldn't panic, but it would also never poll again, which
@@ -46,61 +43,33 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("poller-incidents");
 
     let config = Config::parse();
-    common::metrics::ingest_sink_info(&common::metrics::value_enum_name(&config.ingest_sink));
+    common::metrics::ingest_sink_info(&config.ingest_sink);
     config.validate()?;
     let progress = health_http::spawn_liveness(&config.health);
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
-    let internal_oauth = config.internal_oauth.token_cache();
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let budget = common::poller_loop::post_retry_budget(poll_interval);
 
-    match config.ingest_sink {
-        IngestSink::Http => {
-            let sink = sink::HttpSink {
-                client: &client,
-                url: &config.api_ingest_url,
-                internal_oauth: &internal_oauth,
-                budget,
-            };
-            common::poller_loop::run_poll_loop(
-                "incidents",
-                &client,
-                &config.api_ingest_url,
-                &internal_oauth,
-                poll_interval,
-                config.metrics.metrics_enabled,
-                config.metrics_port,
-                &progress,
-                || poll_once(&client, &config, &sink),
-            )
-            .await
-        }
-        IngestSink::Db => {
-            if config.metrics.metrics_enabled {
-                common::metrics::install(config.metrics_port)?;
-            }
-            let sink = db_sink(&config, &progress, budget).await?;
-            tracing::info!(
-                row_heartbeat = config.incidents_row_heartbeat,
-                "writing incident snapshots to Postgres (INGEST_SINK=db)"
-            );
-            // Plan 4.6: the startup cursor is the freshness row, read
-            // with the same wait the HTTP loop gives the api's GET.
-            common::poller_loop::run_poll_loop_with_source(
-                "incidents",
-                common::ingest::CursorSource::db(|| {
-                    ds_store::freshness::last_incidents_fetch(&sink.pool)
-                }),
-                poll_interval,
-                // Installed above.
-                false,
-                config.metrics_port,
-                &progress,
-                || poll_once(&client, &config, &sink),
-            )
-            .await
-        }
+    if config.metrics.metrics_enabled {
+        common::metrics::install(config.metrics_port)?;
     }
+    let sink = db_sink(&config, &progress, budget).await?;
+    tracing::info!(
+        row_heartbeat = config.incidents_row_heartbeat,
+        "writing incident snapshots to Postgres"
+    );
+    // Plan 4.6: the startup cursor is the freshness row.
+    common::poller_loop::run_poll_loop_with_source(
+        "incidents",
+        common::ingest::CursorSource::db(|| ds_store::freshness::last_incidents_fetch(&sink.pool)),
+        poll_interval,
+        // Installed above.
+        false,
+        config.metrics_port,
+        &progress,
+        || poll_once(&client, &config, &sink),
+    )
+    .await
 }
 
 /// The DB sink's dependencies, in startup order: Postgres (waited for, as
@@ -115,11 +84,11 @@ async fn db_sink(
     let database_url = config
         .database_url
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("INGEST_SINK=db needs DATABASE_URL"))?;
+        .ok_or_else(|| anyhow::anyhow!("poller-incidents needs DATABASE_URL"))?;
     let redis_url = config
         .redis_url
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("INGEST_SINK=db needs REDIS_URL"))?;
+        .ok_or_else(|| anyhow::anyhow!("poller-incidents needs REDIS_URL"))?;
 
     // Before any DB work: a broken catalogue is a configuration error.
     let lines = common::config::parse_lines(&config.lines_dir)?;
@@ -174,7 +143,7 @@ async fn db_sink(
 async fn poll_once(
     client: &Client,
     config: &Config,
-    sink: &impl IncidentSink,
+    sink: &sink::DbSink<sink::RedisPublisher>,
 ) -> anyhow::Result<()> {
     let body = fetch_incidents_xml(client, config).await?;
     let parsed = schema::parse_incidents(&body)?;
