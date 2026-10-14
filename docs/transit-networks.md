@@ -22,6 +22,7 @@ Everything ships off. These are the switches, all in Ranma-Config:
 | `ingestWriter.streams.transit-metrolink` | `off` | `apply` makes the writer consume the stream. Needs `postgresql.roles.perService.writer.connect`. |
 | `pollerTransitSchedule.networks.metrolink.enabled` | `false` | Runs the producer. The chart refuses it unless the stream is `apply`. |
 | `pollerTransitSchedule.networks.metrolink.situationsEnabled` | `false` | Runs the SIRI-SX loop (line status, disruptions, notifications). |
+| `pollerTransitSchedule.networks.metrolink.timetableRefresh` | `""` | A one-shot timetable refresh: a new token makes the producer fetch and publish at start (see "Forcing a timetable refresh"). |
 | `api.transitNetworks` | `[]` | The networks the api serves. Empty: every `/public/transit` route is 404 (`/transit/rail-links` is an empty list) and the frontend hides the pages, the "Trams" nav entry and the attribution lines. |
 
 ## Before the first rollout: the grants Job
@@ -157,14 +158,44 @@ is at most 5 minutes away.
 The producer fetches the timetable when its newest commit on the stream is
 `timetableIntervalSecs` (a day) old, so **a restart alone does not
 refresh it**: the new pod reads that commit and waits out the rest of the
-day (seen in the 2026-10-14 dry run). To pick up a new BODS file sooner,
-set `pollerTransitSchedule.networks.metrolink.timetableIntervalSecs` to
-`600` for one release (the pod restarts and fetches within a minute), then
-put it back to `86400`.
+day (seen in the 2026-10-14 dry run). Within that day, an unchanged feed
+is not re-sent either ("the timetable is unchanged since the last commit;
+not re-sending it yet").
 
-A fetched feed whose content is unchanged since the last commit is not
-re-sent ("the timetable is unchanged since the last commit; not re-sending
-it yet" in the log); the daily re-send moves the timetable freshness.
+To refresh now, set a **new** refresh token in one Ranma-Config change:
+
+```yaml
+pollerTransitSchedule:
+  networks:
+    metrolink:
+      timetableRefresh: "2026-10-15"   # any new value: a date, or 1, 2, 3...
+```
+
+The env change restarts the producer. At start it compares the token with
+the `source.refresh` of the newest commit on the stream; a token no commit
+has answered makes the first cycle run at once and publish the timetable
+even if unchanged, with the token in its commit. Check:
+
+```sh
+$REDIS XREVRANGE ds:ingest:transit-metrolink + - COUNT 50 | grep -o '"refresh":"[^"]*"'
+```
+
+and the log line "timetable queued for the stream" with `refresh`. An
+unchanged feed then only moves the timetable freshness (the writer sees the
+same content); a changed one activates. The feed guard still applies: a
+refused feed publishes nothing, and the request stays unanswered until the
+next start (after the cause is fixed, restart the pod or set another
+token).
+
+**Leave the token set.** It is one-shot by design: the commit records
+which token it answered, so later restarts (a node drain, a rollout) with
+the same token change nothing. To refresh again, set a different token.
+Unsetting it (`""`) is harmless but restarts the pod for nothing. This was
+chosen over a plain on/off switch, which would refresh on every restart
+while on and so would have to be turned off again after each use (two
+changes, and a forgotten "on" means a full download on every restart).
+The token costs one optional field in the commit's `source`, which the
+writer stores with an activated version's source and otherwise ignores.
 
 ## Adding a SIRI line alias
 

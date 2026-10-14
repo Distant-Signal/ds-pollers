@@ -149,6 +149,15 @@ fn feed_version(source: Option<&str>, sha: &str) -> String {
     format!("{source}-{}", &sha[..12])
 }
 
+/// Where a commit's feed came from, for its `source`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SourceTag<'a> {
+    /// `bods-gtfs` (or the fallback's kind).
+    pub url_kind: &'a str,
+    /// The refresh request this item answers, when forced.
+    pub refresh: Option<&'a str>,
+}
+
 /// Builds the item for `model` with `rail_links`, produced at
 /// `produced_at` by `producer` for `stream`.
 pub(crate) fn build(
@@ -158,7 +167,7 @@ pub(crate) fn build(
     stream: &str,
     producer: &str,
     produced_at: DateTime<Utc>,
-    url_kind: &str,
+    tag: SourceTag<'_>,
 ) -> Result<Item> {
     let network_id = network.network_id();
     let row = network_row(network);
@@ -210,9 +219,10 @@ pub(crate) fn build(
         counts: feed_guard::counts(model),
         horizon: model.horizon,
         source: TimetableSource {
-            url_kind: url_kind.to_owned(),
+            url_kind: tag.url_kind.to_owned(),
             feed_version: model.source_feed_version.clone(),
             published_at: None,
+            refresh: tag.refresh.map(str::to_owned),
         },
     };
     let commit_schema = SchemaId::new(schema::TIMETABLE_COMMIT, 1)?;
@@ -259,9 +269,43 @@ mod tests {
             "ds:ingest:transit-metrolink",
             "poller-transit-schedule/test",
             at.parse().unwrap(),
-            "bods-gtfs",
+            SourceTag {
+                url_kind: "bods-gtfs",
+                refresh: None,
+            },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_forced_item_names_its_refresh_request_and_nothing_else_changes() {
+        let model = model();
+        let plain = build_at(&model, "2026-10-19T03:00:00Z");
+        assert_eq!(plain.commit.source.refresh, None);
+        let forced = build(
+            &NetworkConfig::load("metrolink").unwrap(),
+            &model,
+            &crate::rail_links::rail_links("metrolink").unwrap(),
+            "ds:ingest:transit-metrolink",
+            "poller-transit-schedule/test",
+            "2026-10-19T03:00:00Z".parse().unwrap(),
+            SourceTag {
+                url_kind: "bods-gtfs",
+                refresh: Some("2026-10-15"),
+            },
+        )
+        .unwrap();
+        assert_eq!(forced.commit.source.refresh.as_deref(), Some("2026-10-15"));
+        // Same content: the writer sees an unchanged feed.
+        assert_eq!(forced.commit.content_sha256, plain.commit.content_sha256);
+        assert_eq!(forced.commit.feed_version, plain.commit.feed_version);
+        let last = Envelope::decode(&forced.snapshot.parts().last().unwrap().fields).unwrap();
+        let sent: TimetableCommit = last.payload_as().unwrap();
+        assert_eq!(sent.source.refresh.as_deref(), Some("2026-10-15"));
+        // An ordinary commit carries no `refresh` key at all.
+        let last = Envelope::decode(&plain.snapshot.parts().last().unwrap().fields).unwrap();
+        let raw: serde_json::Value = last.payload_as().unwrap();
+        assert!(raw["source"].get("refresh").is_none());
     }
 
     #[test]

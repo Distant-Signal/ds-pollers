@@ -82,6 +82,16 @@ pub(crate) struct Config {
     #[arg(long, env = "FEED_MAX_DROP_FRACTION", default_value_t = 0.3, value_parser = parse_fraction)]
     pub feed_max_drop_fraction: f64,
 
+    /// A one-shot timetable refresh request (chart `timetableRefresh`;
+    /// docs/transit-networks.md). Empty (the default): none. Otherwise a
+    /// token (`2026-10-15`, `2`): at start the producer fetches and
+    /// publishes the timetable at once, even an unchanged one, unless the
+    /// newest commit on the stream already answers this token
+    /// (`source.refresh`). Change the token to ask again; it never needs
+    /// unsetting.
+    #[arg(long, env = "TRANSIT_TIMETABLE_REFRESH", default_value = "", value_parser = parse_refresh)]
+    pub timetable_refresh: String,
+
     /// Where the GTFS zip is downloaded (a zip needs a seekable file): the
     /// chart's `emptyDir` at `/work`.
     #[arg(long, env = "TRANSIT_WORK_DIR", default_value = "/work")]
@@ -128,6 +138,17 @@ fn parse_fraction(raw: &str) -> Result<f64, String> {
     }
 }
 
+fn parse_refresh(raw: &str) -> Result<String, String> {
+    if raw.is_empty() || common::transit::is_refresh_token(raw) {
+        Ok(raw.to_owned())
+    } else {
+        Err(format!(
+            "a refresh token is 1 to {} of A-Z a-z 0-9 . _ : -",
+            common::transit::MAX_REFRESH_TOKEN_LEN
+        ))
+    }
+}
+
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
@@ -142,6 +163,7 @@ impl std::fmt::Debug for Config {
             .field("situations_enabled", &self.situations_enabled)
             .field("horizon_days", &self.horizon_days)
             .field("feed_max_drop_fraction", &self.feed_max_drop_fraction)
+            .field("timetable_refresh", &self.timetable_refresh)
             .field("work_dir", &self.work_dir)
             .field("redis", &self.redis)
             .field("metrics_port", &self.metrics_port)
@@ -171,6 +193,10 @@ mod tests {
         assert_eq!(config.timetable_interval(), Duration::from_secs(86_400));
         assert_eq!(config.situations_interval(), Duration::from_secs(300));
         assert_eq!(config.work_dir, PathBuf::from("/work"));
+        assert_eq!(
+            config.timetable_refresh, "",
+            "no refresh request by default"
+        );
         assert_eq!(
             config.naptan_url_for("940"),
             "https://naptan.api.dft.gov.uk/v1/access-nodes?atcoAreaCodes=940&dataFormat=csv"
@@ -206,6 +232,23 @@ mod tests {
         assert_eq!(parse_fraction("0.3"), Ok(0.3));
         for bad in ["-0.1", "1.5", "NaN", ""] {
             assert!(parse_fraction(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_refresh_token_is_short_and_plain() {
+        for ok in ["2026-10-15", "2", "after-fix_1.0:a"] {
+            let config =
+                Config::try_parse_from(["p", "--network", "metrolink", "--timetable-refresh", ok])
+                    .unwrap();
+            assert_eq!(config.timetable_refresh, ok);
+        }
+        for bad in ["has space", "x/y", &"a".repeat(65)] {
+            assert!(
+                Config::try_parse_from(["p", "--network", "metrolink", "--timetable-refresh", bad])
+                    .is_err(),
+                "{bad}"
+            );
         }
     }
 

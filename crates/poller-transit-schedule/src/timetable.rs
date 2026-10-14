@@ -6,8 +6,10 @@
 //! 3. the feed guard against the last commit on the stream;
 //! 4. build the item (parts, then the commit) with the rail links;
 //! 5. skip it if the last commit has the same content and is under
-//!    [`SKIP_UNCHANGED_FOR`] old (a restart); else submit it.
+//!    [`SKIP_UNCHANGED_FOR`] old (a restart) and no refresh request is
+//!    pending ([`crate::refresh`]); else submit it.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::bail;
@@ -133,7 +135,7 @@ async fn enrich(ctx: &Context, model: &mut TransitModel) {
 
 /// The last commit: the newest on the stream (so it survives a restart),
 /// else the one this process sent.
-async fn baseline(ctx: &Context) -> Option<Baseline> {
+pub(crate) async fn baseline(ctx: &Context) -> Option<Baseline> {
     match ingest_stream::snapshot::newest_of_schema(
         &ctx.redis,
         &ctx.stream,
@@ -158,6 +160,25 @@ async fn baseline(ctx: &Context) -> Option<Baseline> {
         }
     }
     ctx.last_sent.lock().ok().and_then(|last| last.clone())
+}
+
+/// The timetable loop's cursor: the newest timetable commit's time, not
+/// the newest entry's (situations share the stream every 5 minutes). An
+/// unanswered refresh request ([`crate::refresh`]) reads as "never
+/// fetched", so the cycle runs at once.
+pub(crate) async fn cursor(ctx: &Context) -> anyhow::Result<Option<DateTime<Utc>>> {
+    if ctx.refresh_pending.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    Ok(
+        ingest_stream::snapshot::newest_of_schema(
+            &ctx.redis,
+            &ctx.stream,
+            schema::TIMETABLE_COMMIT,
+        )
+        .await?
+        .map(|envelope| envelope.produced_at),
+    )
 }
 
 /// One timetable cycle.
@@ -203,6 +224,9 @@ pub(crate) async fn poll_once(ctx: &Context) -> anyhow::Result<()> {
             .set(f64::from(rows));
     }
 
+    // An unanswered refresh request (crate::refresh): publish even an
+    // unchanged feed, and say which request this commit answers.
+    let forced = ctx.refresh_pending.load(Ordering::Relaxed);
     let built = item::build(
         &ctx.network,
         &model,
@@ -210,9 +234,12 @@ pub(crate) async fn poll_once(ctx: &Context) -> anyhow::Result<()> {
         &ctx.stream,
         ctx.timetable.producer_id(),
         produced_at,
-        "gtfs",
+        item::SourceTag {
+            url_kind: "gtfs",
+            refresh: forced.then_some(ctx.config.timetable_refresh.as_str()),
+        },
     )?;
-    if let Some(last) = &last {
+    if let Some(last) = last.as_ref().filter(|_| !forced) {
         let age = (produced_at - last.produced_at)
             .to_std()
             .unwrap_or_default();
@@ -231,8 +258,12 @@ pub(crate) async fn poll_once(ctx: &Context) -> anyhow::Result<()> {
         network = %ctx.network.id,
         feed_version = %built.commit.feed_version,
         parts,
+        refresh = ?built.commit.source.refresh,
         "timetable queued for the stream"
     );
+    if forced {
+        ctx.refresh_pending.store(false, Ordering::Relaxed);
+    }
     if let Ok(mut slot) = ctx.last_sent.lock() {
         *slot = Some(Baseline {
             commit: built.commit,

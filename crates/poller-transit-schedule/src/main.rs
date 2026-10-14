@@ -26,6 +26,7 @@ mod model;
 mod naptan;
 mod network;
 mod rail_links;
+mod refresh;
 mod situations;
 mod timetable;
 
@@ -62,6 +63,10 @@ pub(crate) struct Context {
     /// The last timetable this process sent: the feed guard's baseline
     /// when the stream cannot be read.
     pub last_sent: std::sync::Mutex<Option<timetable::Baseline>>,
+    /// A refresh request (`TRANSIT_TIMETABLE_REFRESH`) not yet answered on
+    /// the stream ([`refresh`]): the next timetable cycle runs at once and
+    /// publishes even an unchanged feed. Cleared once it is queued.
+    pub refresh_pending: std::sync::atomic::AtomicBool,
     /// The situations' producer, separate so a situations snapshot never
     /// supersedes an unsent timetable (spec C3).
     pub situations: SnapshotProducer,
@@ -117,9 +122,11 @@ async fn run() -> anyhow::Result<()> {
         redis,
         timetable,
         last_sent: std::sync::Mutex::new(None),
+        refresh_pending: std::sync::atomic::AtomicBool::new(false),
         situations,
         situations_etag: std::sync::Mutex::new(None),
     };
+    refresh::check_at_start(&ctx).await;
     let readiness = async {
         let mut tick = tokio::time::interval(READINESS_INTERVAL);
         loop {
@@ -133,17 +140,7 @@ async fn run() -> anyhow::Result<()> {
 
     let timetable_loop = common::poller_loop::run_poll_loop_with_cursor(
         "transit-timetable",
-        // The newest timetable commit, not the newest entry: situations
-        // share the stream every 5 minutes.
-        || async {
-            Ok(ingest_stream::snapshot::newest_of_schema(
-                &ctx.redis,
-                &ctx.stream,
-                common::transit::schema::TIMETABLE_COMMIT,
-            )
-            .await?
-            .map(|envelope| envelope.produced_at))
-        },
+        || timetable::cursor(&ctx),
         ctx.config.timetable_interval(),
         false,
         ctx.config.metrics_port,
