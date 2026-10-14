@@ -27,13 +27,18 @@ Everything ships off. These are the switches, all in Ranma-Config:
 ## Before the first rollout: the grants Job
 
 The deploy that first carries the transit tables (and every later deploy
-that adds a transit table or changes its grants) needs the chart fix that
-runs the postgres roles and grants Job as a `pre-upgrade` hook after the
-migrations. Without it the grants Job is `post-upgrade`: Helm waits for the
-rollout first, while a `Recreate` worker whose schema gate checks its
-grants (the ingest-writer's) never becomes ready without them. The upgrade
-then deadlocks until it times out. The steps below assume that fix is in;
-check the `postgres-roles` Job's `helm.sh/hook` annotation before starting.
+that adds a transit table or changes its grants, such as a new network's
+freshness sources) relies on the chart running the postgres roles setup
+Job as a `pre-upgrade` hook after the migrate Job (chart fix 41bfe34a,
+2026-10-14; docs/postgres-app-role.md, "Hook order"). Before that fix the
+Job was `post-upgrade`: Helm waited for the rollout first, while the
+ingest-writer (`Recreate`, its schema gate checking its grants on the new
+tables) never became ready without them, and the upgrade deadlocked until
+its timeout. The steps below assume the fix is deployed and
+`migrate.job.enabled` is on (without it the Job stays post-upgrade). If an
+upgrade ever stalls with the writer NotReady on `missing: ... on
+transit_*`, that is this deadlock: run the setup Job by hand, as on
+2026-10-14.
 
 ## Rollout
 
