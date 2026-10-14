@@ -1,0 +1,80 @@
+# Manchester Metrolink (transit networks spec §6.4). Compiled into
+# poller-transit-schedule with include_str! and checked at startup and in
+# its unit tests (src/network.rs).
+#
+# Sources: the BODS North West GTFS filtered to NOC METL, BODS SIRI-SX
+# (TfGM's tram situations) and NaPTAN area 940, all under the Open
+# Government Licence v3.0. The colours are Distant Signal's own display
+# choices for each line name, not TfGM's branding (DS uses no TfGM logos).
+id = "metrolink"
+name = "Manchester Metrolink"
+# Display only; NOT a SUPPORTED_MODES value (decision D4).
+mode = "tram"
+timezone = "Europe/London"
+nocs = ["METL"]
+replacement_bus_route_names = ["Replacement Bus"]
+naptan_area = "940"
+atco_prefix = "9400ZZMA"
+
+[attribution]
+licence = "OGL-UK-3.0"
+text = "Contains public sector information licensed under the Open Government Licence v3.0. Timetables and disruptions: Bus Open Data Service (Department for Transport). Stops: NaPTAN (Department for Transport)."
+
+[situations]
+participant_refs = ["TfGM"]
+vehicle_modes = ["tram"]
+operator_refs = ["METL"]
+
+# siri_line_refs: the LineRef values seen in BODS SIRI-SX on 2026-10-09
+# (BLUE, PURP, Green_Line, Navy_Line) plus the <Colour>_Line form for each
+# line. A ref with no alias is counted
+# (transit_situation_unmapped_line_refs_total) and alerts; add it here.
+
+[[lines]]
+id = "blue"
+name = "Blue Line"
+gtfs_route_names = ["Blue Line"]
+siri_line_refs = ["BLUE", "Blue_Line"]
+colour = "#1f6fb5"
+
+[[lines]]
+id = "green"
+name = "Green Line"
+gtfs_route_names = ["Green Line"]
+siri_line_refs = ["Green_Line"]
+colour = "#2e8b3e"
+
+[[lines]]
+id = "navy"
+name = "Navy Line"
+gtfs_route_names = ["Navy Line"]
+siri_line_refs = ["Navy_Line"]
+colour = "#1f3a68"
+
+[[lines]]
+id = "pink"
+name = "Pink Line"
+gtfs_route_names = ["Pink Line"]
+siri_line_refs = ["Pink_Line"]
+colour = "#d6589b"
+
+[[lines]]
+id = "purple"
+name = "Purple Line"
+gtfs_route_names = ["Purple Line"]
+siri_line_refs = ["PURP", "Purple_Line"]
+colour = "#7b4fa0"
+
+[[lines]]
+id = "red"
+name = "Red Line"
+gtfs_route_names = ["Red Line"]
+siri_line_refs = ["Red_Line"]
+colour = "#c8352f"
+
+[[lines]]
+id = "yellow"
+name = "Yellow Line"
+gtfs_route_names = ["Yellow Line"]
+siri_line_refs = ["Yellow_Line"]
+colour = "#e8b923"

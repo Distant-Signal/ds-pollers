@@ -1,0 +1,11 @@
+stop_id,crs,tiploc,kind,note
+9400ZZMAPIC,MAN,MNCRPIC,interchange,
+9400ZZMAVIC,MCV,MNCRVIC,interchange,
+9400ZZMAGMX,DGT,MNCRDGT,nearby,Deansgate-Castlefield tram stop beside Deansgate station
+9400ZZMAALT,ALT,ALTRNHM,interchange,
+9400ZZMANAV,NVR,NAVGTNR,interchange,
+9400ZZMARRS,RCD,RCHDALE,interchange,
+9400ZZMAEDY,EDY,EDIDBRY,interchange,
+9400ZZMAAUL,AHN,ASHONUL,interchange,
+9400ZZMAAIR,MIA,MNCRIAP,interchange,
+9400ZZMAECC,ECC,ECCLES,nearby,Eccles tram stop near Eccles station

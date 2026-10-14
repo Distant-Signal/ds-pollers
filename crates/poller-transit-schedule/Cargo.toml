@@ -1,0 +1,47 @@
+[package]
+name = "poller-transit-schedule"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The transit networks' producer (docs/superpowers/specs/2026-10-09-transit-
+# networks-design.md §6): one process per network, stream-only (no
+# database, no api), so no sqlx or ds-store (scripts/check-crate-deps.py).
+# Every parser crate is one the workspace already locks (spec §6.2).
+[dependencies]
+anyhow = "1.0.102"
+chrono = "0.4.44"
+clap = { version = "4.6.1", features = ["derive", "env"] }
+common = { path = "../common" }
+# GTFS's CSV files, streamed (line-catalogue-validator's version).
+csv = "1.4"
+dotenvy = "0.15.7"
+health-http = { path = "../health-http" }
+# The `ds:ingest:transit-<network>` producer.
+ingest-stream = { path = "../ingest-stream" }
+metrics = "0.24"
+# Reading the stream back (its cursor, the feed guard's baseline): the
+# version ingest-stream uses.
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+# The downloads (poller-irish-rail-gtfs' features); streamed to a file.
+reqwest = { version = "0.13.4", default-features = false, features = ["native-tls", "gzip"] }
+serde = { version = "1.0.228", features = ["derive"] }
+# `raw_value`: a timetable part's body is encoded once per chunk.
+serde_json = { version = "1.0.149", features = ["raw_value"] }
+# The timetable's content hash (the version in feed_version).
+sha2 = "0.10"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "time", "fs", "io-util"] }
+# The network files (networks/<network>.toml), as the line catalogue.
+toml = { version = "1.1.2", features = ["serde"] }
+tracing = "0.1.44"
+# The GTFS zip, read entry by entry from the downloaded file
+# (poller-irish-rail-gtfs' features: deflate only).
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+
+[lints]
+workspace = true
