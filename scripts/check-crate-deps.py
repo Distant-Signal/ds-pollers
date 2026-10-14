@@ -9,6 +9,9 @@ an HTTP client, Redis or the api itself. Its NORMAL dependency closure
 (build and dev dependencies do not count) must not contain axum*, tower*,
 hyper*, redis, reqwest, oauth2, openidconnect or api. The same holds for
 `ds-migrate`, the migrator binary (plan 1B.1), which links only ds-store.
+`poller-transit-schedule` (the transit networks' producer) writes only its
+Redis stream, so its closure must hold no sqlx, Postgres driver or
+ds-store.
 
 The closure comes from
 
@@ -51,9 +54,13 @@ NO_SERVER_STACK = (
     "openidconnect",
     "api",
 )
+# A stream-only producer holds no database credentials (transit networks
+# spec §5, D7): no Postgres driver and no ds-store.
+NO_DATABASE = (r"sqlx(-.+)?", "ds-store", r"tokio-postgres", r"postgres(-.+)?")
 FORBIDDEN: Mapping[str, Sequence[str]] = {
     "ds-store": NO_SERVER_STACK,
     "ds-migrate": NO_SERVER_STACK,
+    "poller-transit-schedule": NO_DATABASE,
 }
 
 

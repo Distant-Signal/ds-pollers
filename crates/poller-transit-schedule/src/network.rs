@@ -15,10 +15,6 @@ const FILES: &[(&str, &str)] = &[("metrolink", include_str!("../networks/metroli
 
 /// One network's config.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(
-    dead_code,
-    reason = "the GTFS, NaPTAN and SIRI-SX adapters (transit plan 2.2-2.4) read the rest"
-)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NetworkConfig {
     pub id: String,
@@ -42,10 +38,6 @@ pub(crate) struct NetworkConfig {
 
 /// Which SIRI-SX situations are this network's (spec §10.1).
 #[derive(Debug, Clone, Deserialize)]
-#[allow(
-    dead_code,
-    reason = "the GTFS, NaPTAN and SIRI-SX adapters (transit plan 2.2-2.4) read the rest"
-)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SituationFilter {
     pub participant_refs: Vec<String>,
@@ -55,10 +47,6 @@ pub(crate) struct SituationFilter {
 
 /// One line.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(
-    dead_code,
-    reason = "the GTFS, NaPTAN and SIRI-SX adapters (transit plan 2.2-2.4) read the rest"
-)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LineConfig {
     /// The local id ([`is_id`]); public id `<network>:<id>`.

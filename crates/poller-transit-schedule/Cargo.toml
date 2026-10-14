@@ -21,6 +21,8 @@ health-http = { path = "../health-http" }
 # The `ds:ingest:transit-<network>` producer.
 ingest-stream = { path = "../ingest-stream" }
 metrics = "0.24"
+# SIRI-SX, streamed (the version poller-incidents uses).
+quick-xml = "0.41.0"
 # Reading the stream back (its cursor, the feed guard's baseline): the
 # version ingest-stream uses.
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }

@@ -36,3 +36,15 @@ Rows unchanged, all columns kept: the `MET` station and `PLT` platform
 rows of 14 Metrolink stops (the ten rail interchanges of
 `reference-data/transit/metrolink-rail-links.csv`, plus Heaton Park,
 Besses o'th' Barn, Market Street and Timperley); 47 rows.
+
+## `sirisx-mini.xml`
+
+Hand-written in the shape of the BODS SIRI-SX bulk archive's
+`sirisx.xml` (`https://data.bus-data.dft.gov.uk/disruptions/download/bulk_archive`,
+inspected on 2026-10-09 and 2026-10-14): the element structure, the
+`LineRef` spellings (`BLUE`, `PURP`, `Green_Line`, `Navy_Line`) and the stop
+codes are the real ones; the situation ids, texts and URLs are invented,
+so the tests can name them. Five situations: a TfGM lift failure at a
+platform, a TfGM line suspension with an unmapped `LineRef`, a planned
+Purple Line change named only by its `OperatorRef`, a South Yorkshire
+tram situation (another participant) and a TfGM bus situation.

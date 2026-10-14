@@ -40,6 +40,7 @@ def run(fixture: str, crate: str = "ds-store") -> tuple[int, str]:
     clean = {
         "ds-store": FIXTURES / "ds-store-clean.txt",
         "ds-migrate": FIXTURES / "ds-migrate-clean.txt",
+        "poller-transit-schedule": FIXTURES / "poller-transit-schedule-clean.txt",
     }
     trees = {**clean, crate: FIXTURES / fixture}
     out = io.StringIO()
@@ -151,6 +152,24 @@ class MainTest(unittest.TestCase):
             ],
         )
         self.assertIn("-i reqwest", out)
+
+    def test_the_transit_producer_holds_no_database_crate(self) -> None:
+        """poller-transit-schedule: no sqlx, Postgres driver or ds-store."""
+        status, out = run(
+            "poller-transit-schedule-forbidden.txt", crate="poller-transit-schedule"
+        )
+        self.assertEqual(status, 1)
+        reported = sorted(
+            line.split(" contains ")[1].split(",")[0]
+            for line in out.splitlines()
+            if line.startswith("::error::poller-transit-schedule's")
+        )
+        self.assertEqual(reported, ["ds-store", "sqlx", "sqlx-core", "sqlx-postgres"])
+        # Its Redis and HTTP clients are fine (it is a stream producer).
+        status, out = run(
+            "poller-transit-schedule-clean.txt", crate="poller-transit-schedule"
+        )
+        self.assertEqual(status, 0, out)
 
     def test_a_tree_for_another_crate_is_an_error(self) -> None:
         """A tree whose root is not ds-store fails instead of passing vacuously."""

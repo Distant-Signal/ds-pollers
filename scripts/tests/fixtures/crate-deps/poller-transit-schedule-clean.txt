@@ -1,0 +1,8 @@
+poller-transit-schedule v0.1.0 (/repo/crates/poller-transit-schedule)
+anyhow v1.0.104
+common v0.1.0 (/repo/crates/common)
+csv v1.4.0
+ingest-stream v0.1.0 (/repo/crates/ingest-stream)
+redis v0.27.6
+reqwest v0.13.4
+zip v8.6.0

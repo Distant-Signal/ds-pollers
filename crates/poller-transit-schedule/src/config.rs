@@ -66,6 +66,12 @@ pub(crate) struct Config {
     #[arg(long, env = "TRANSIT_SITUATIONS_INTERVAL_SECS", default_value_t = 300)]
     pub situations_interval_secs: u64,
 
+    /// Run the situations loop. Off by default until the ingest-writer has
+    /// the `transit-situations/1` handler (transit plan batch 4): before
+    /// that an applied stream would dead-letter every snapshot.
+    #[arg(long, env = "TRANSIT_SITUATIONS_ENABLED", default_value_t = false, action = clap::ArgAction::Set)]
+    pub situations_enabled: bool,
+
     /// Days of service dates stored after today (Q8: 60).
     #[arg(long, env = "TRANSIT_HORIZON_DAYS", default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=400))]
     pub horizon_days: u32,
@@ -97,10 +103,6 @@ pub(crate) struct Config {
     pub health: common::service_args::HealthArgs,
 }
 
-#[allow(
-    dead_code,
-    reason = "the situations loop and the NaPTAN fetch (transit plan 2.3, 2.4) use the rest"
-)]
 impl Config {
     pub(crate) fn timetable_interval(&self) -> Duration {
         Duration::from_secs(self.timetable_interval_secs)
@@ -137,6 +139,7 @@ impl std::fmt::Debug for Config {
             .field("naptan_url", &self.naptan_url)
             .field("timetable_interval_secs", &self.timetable_interval_secs)
             .field("situations_interval_secs", &self.situations_interval_secs)
+            .field("situations_enabled", &self.situations_enabled)
             .field("horizon_days", &self.horizon_days)
             .field("feed_max_drop_fraction", &self.feed_max_drop_fraction)
             .field("work_dir", &self.work_dir)
@@ -203,6 +206,41 @@ mod tests {
         assert_eq!(parse_fraction("0.3"), Ok(0.3));
         for bad in ["-0.1", "1.5", "NaN", ""] {
             assert!(parse_fraction(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The chart's template sets every variable this config reads, and
+    /// nothing it does not (a renamed variable would be silently ignored).
+    #[test]
+    fn the_chart_template_sets_exactly_the_config_env() {
+        use clap::CommandFactory;
+        let template = common::manifest_dir!()
+            .join("../../charts/distant-signal/templates/poller-transit-schedule-deployment.yaml");
+        let text = std::fs::read_to_string(&template).unwrap();
+        let set: std::collections::BTreeSet<&str> = text
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("- name: "))
+            .filter(|n| n.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+            .collect();
+        let declared: std::collections::BTreeSet<String> = Config::command()
+            .get_arguments()
+            .filter_map(|arg| arg.get_env().and_then(|env| env.to_str()))
+            .map(str::to_owned)
+            .collect();
+        // REDIS_USERNAME/REDIS_PASSWORD come from redisClientAuthEnv;
+        // RUST_LOG is the logging filter, not a Config field.
+        for name in &set {
+            assert!(
+                declared.contains(*name) || *name == "RUST_LOG",
+                "the template sets {name}, which Config does not read"
+            );
+        }
+        for name in &declared {
+            assert!(
+                set.contains(name.as_str())
+                    || ["REDIS_USERNAME", "REDIS_PASSWORD"].contains(&name.as_str()),
+                "Config reads {name}, which the template never sets"
+            );
         }
     }
 }

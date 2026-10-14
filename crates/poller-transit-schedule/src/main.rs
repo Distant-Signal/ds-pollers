@@ -26,6 +26,7 @@ mod model;
 mod naptan;
 mod network;
 mod rail_links;
+mod situations;
 mod timetable;
 
 use std::time::Duration;
@@ -61,7 +62,15 @@ pub(crate) struct Context {
     /// The last timetable this process sent: the feed guard's baseline
     /// when the stream cannot be read.
     pub last_sent: std::sync::Mutex<Option<timetable::Baseline>>,
+    /// The situations' producer, separate so a situations snapshot never
+    /// supersedes an unsent timetable (spec C3).
+    pub situations: SnapshotProducer,
+    /// The SIRI-SX archive's last `ETag` (`If-None-Match`).
+    pub situations_etag: std::sync::Mutex<Option<String>>,
 }
+
+/// How often readiness re-checks the producers.
+const READINESS_INTERVAL: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -80,9 +89,22 @@ async fn run() -> anyhow::Result<()> {
         .redis
         .client("the transit stream")
         .map_err(anyhow::Error::msg)?;
-    let progress = health_http::spawn_liveness(&config.health);
+    // `/healthz` (readiness) answers 503 "stream_unavailable" while either
+    // producer's last XADD failed (spec §6.1); `/livez` is loop progress.
+    let (ready, progress) = health_http::spawn_with_progress(
+        config.health.health_bind_url.clone(),
+        "ok",
+        "stream_unavailable",
+        config.health.stall_after(),
+    );
+    ready.store(true, std::sync::atomic::Ordering::Relaxed);
     let timetable = SnapshotProducer::new(redis.clone(), &stream, COMPONENT);
     timetable.start();
+    let situations = SnapshotProducer::new(redis.clone(), &stream, COMPONENT);
+    situations.start();
+    if config.metrics_enabled {
+        common::metrics::install(config.metrics_port)?;
+    }
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(USER_AGENT)
@@ -95,9 +117,21 @@ async fn run() -> anyhow::Result<()> {
         redis,
         timetable,
         last_sent: std::sync::Mutex::new(None),
+        situations,
+        situations_etag: std::sync::Mutex::new(None),
+    };
+    let readiness = async {
+        let mut tick = tokio::time::interval(READINESS_INTERVAL);
+        loop {
+            tick.tick().await;
+            ready.store(
+                ctx.timetable.is_available() && ctx.situations.is_available(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     };
 
-    let poll = common::poller_loop::run_poll_loop_with_cursor(
+    let timetable_loop = common::poller_loop::run_poll_loop_with_cursor(
         "transit-timetable",
         // The newest timetable commit, not the newest entry: situations
         // share the stream every 5 minutes.
@@ -111,13 +145,32 @@ async fn run() -> anyhow::Result<()> {
             .map(|envelope| envelope.produced_at))
         },
         ctx.config.timetable_interval(),
-        ctx.config.metrics_enabled,
+        false,
         ctx.config.metrics_port,
         &progress,
         || timetable::poll_once(&ctx),
     );
+    let situations_loop = async {
+        if !ctx.config.situations_enabled {
+            tracing::info!("the situations loop is off (TRANSIT_SITUATIONS_ENABLED)");
+            return std::future::pending().await;
+        }
+        common::poller_loop::run_poll_loop_with_cursor(
+            "transit-situations",
+            // Poll at once at startup: the archive changes every minute.
+            || async { Ok(None) },
+            ctx.config.situations_interval(),
+            false,
+            ctx.config.metrics_port,
+            &progress,
+            || situations::poll_once(&ctx),
+        )
+        .await
+    };
     let result = tokio::select! {
-        result = poll => result,
+        result = timetable_loop => result,
+        result = situations_loop => result,
+        () = readiness => Ok(()),
         () = shutdown_signal() => {
             tracing::info!("shutting down");
             Ok(())
@@ -128,6 +181,7 @@ async fn run() -> anyhow::Result<()> {
             "an unsent timetable was dropped at shutdown; the next start sends a fresh one"
         );
     }
+    let _ = ctx.situations.shutdown(SHUTDOWN_GRACE).await;
     result
 }
 

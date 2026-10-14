@@ -8,6 +8,7 @@
 //! costs bounded time and the parse streams, never holding a whole file.
 
 pub(crate) mod gtfs;
+pub(crate) mod sirisx;
 
 use std::io::Read;
 use std::path::Path;
