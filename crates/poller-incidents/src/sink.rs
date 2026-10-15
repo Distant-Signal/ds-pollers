@@ -195,6 +195,74 @@ mod tests {
         assert!(err.is_retryable());
     }
 
+    /// A Postgres error carrying a SQLSTATE, as `sqlx` surfaces one.
+    #[derive(Debug)]
+    struct FakeDbError(&'static str);
+
+    impl std::fmt::Display for FakeDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SQLSTATE {}", self.0)
+        }
+    }
+
+    impl std::error::Error for FakeDbError {}
+
+    impl sqlx::error::DatabaseError for FakeDbError {
+        fn message(&self) -> &'static str {
+            "duplicate key value violates unique constraint"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::UniqueViolation
+        }
+    }
+
+    fn db_error(code: &'static str) -> anyhow::Error {
+        anyhow::Error::from(sqlx::Error::Database(Box::new(FakeDbError(code))))
+            .context("writing the incidents snapshot")
+    }
+
+    /// The real `from_db` path: a class 23 SQLSTATE becomes a rejection
+    /// the poll loop's `classify_failure` also reads as one (it attaches
+    /// `DataRejected` as a context layer, which `classify_failure` missed
+    /// before, so the poll loop retried a refused snapshot on its
+    /// transient backoff instead of waiting the full interval).
+    #[test]
+    fn a_data_error_from_the_db_is_a_rejection_for_the_poll_loop() {
+        let err = SinkError::from_db(db_error("23505"));
+        assert!(matches!(err, SinkError::Rejected(_)));
+        assert!(!err.is_retryable());
+        let err = err.into_anyhow();
+        assert_eq!(
+            ingest::classify_failure(&err),
+            ingest::FailureClass::Rejected
+        );
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("data rejected"), "{rendered}");
+        assert!(rendered.contains("SQLSTATE 23505"), "{rendered}");
+    }
+
+    #[test]
+    fn a_statement_timeout_from_the_db_is_retried() {
+        let err = SinkError::from_db(db_error("57014"));
+        assert!(matches!(err, SinkError::Timeout(_)));
+        assert_eq!(
+            ingest::classify_failure(&err.into_anyhow()),
+            ingest::FailureClass::Transient
+        );
+    }
+
     #[test]
     fn a_rejection_stays_a_rejection_for_the_poll_loop() {
         let err = SinkError::Rejected(DataRejected("duplicate".to_owned()).into());

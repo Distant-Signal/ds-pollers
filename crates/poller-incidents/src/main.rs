@@ -100,23 +100,10 @@ async fn db_sink(
     );
     let matcher = common::matcher::LineMatcher::new(&lines);
 
-    common::startup::retry_until_ready(
-        "Postgres",
-        common::startup::CONNECT_BACKOFF,
-        Some(progress),
-        || async {
-            use sqlx::Connection;
-            sqlx::PgConnection::connect(database_url.expose())
-                .await?
-                .close()
-                .await
-        },
-    )
-    .await;
     // The db_pool_* series at 0 (the recorder is installed above).
     ds_store::pool::register_metrics();
     let pool = ds_store::pool::PoolSettings::from_env(APPLICATION_NAME, DEFAULT_MAX_CONNECTIONS)?
-        .connect(database_url.expose())
+        .connect_until_ready(database_url.expose(), Some(progress))
         .await?;
     ds_store::schema::wait_for_schema(&pool, ds_store::schema::DbRole::Incidents, Some(progress))
         .await?;
