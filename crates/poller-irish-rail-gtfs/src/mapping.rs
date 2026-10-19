@@ -299,7 +299,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let options = zip::write::SimpleFileOptions::default();
             for (name, contents) in &files {
                 zip.start_file(*name, options).unwrap();
                 zip.write_all(contents.as_bytes()).unwrap();

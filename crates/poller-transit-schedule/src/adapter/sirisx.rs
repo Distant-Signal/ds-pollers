@@ -102,8 +102,14 @@ pub(crate) fn parse_archive<R: Read + Seek>(
 ) -> Result<Situations, FeedError> {
     let mut archive =
         zip::ZipArchive::new(reader).map_err(|err| malformed(format!("zip: {err}")))?;
-    let name = (0..archive.len())
-        .filter_map(|i| archive.name_for_index(i).map(str::to_owned))
+    // zip 9 decodes entry names on access; as with zip 8's eager decode in
+    // `ZipArchive::new`, an undecodable name rejects the whole archive.
+    let name = archive
+        .file_names()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| malformed(format!("zip: {err}")))?
+        .into_iter()
+        .map(std::borrow::Cow::into_owned)
         .find(|n| {
             std::path::Path::new(n)
                 .extension()
@@ -464,7 +470,7 @@ mod tests {
         {
             use std::io::Write;
             let mut w = zip::ZipWriter::new(Cursor::new(&mut zip_bytes));
-            w.start_file("sirisx.xml", zip::write::FileOptions::<'_, ()>::default())
+            w.start_file("sirisx.xml", zip::write::SimpleFileOptions::default())
                 .unwrap();
             w.write_all(FIXTURE.as_bytes()).unwrap();
             w.finish().unwrap();

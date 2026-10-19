@@ -39,7 +39,7 @@ toml = { version = "1.1.2", features = ["serde"] }
 tracing = "0.1.44"
 # The GTFS zip, read entry by entry from the downloaded file
 # (poller-irish-rail-gtfs' features: deflate only).
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"
