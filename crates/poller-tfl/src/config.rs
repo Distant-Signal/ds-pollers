@@ -57,6 +57,24 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 300)]
     pub poll_interval_secs: u64,
 
+    /// The daily Tube, DLR and tram stops job
+    /// (docs/superpowers/specs/2026-10-20-tfl-stop-lookup-design.md §1),
+    /// published as `tfl-stops/1` on `ds:ingest:tfl-stops`. Off by default:
+    /// turn it on once the ingest-writer applies that stream
+    /// (`ingestWriter.streams.tfl-stops: apply`).
+    #[arg(long, env, default_value_t = false, action = clap::ArgAction::Set)]
+    pub tfl_stops_enabled: bool,
+
+    /// Seconds between stops runs. `TfL`'s stop list changes a few times a
+    /// year; a day is plenty.
+    #[arg(long, env, default_value_t = 86_400)]
+    pub tfl_stops_interval_secs: u64,
+
+    /// The stops feed guard: a run whose stop count fell by more than this
+    /// fraction of the last published snapshot's is refused.
+    #[arg(long, env, default_value_t = 0.2)]
+    pub tfl_stops_max_drop_fraction: f64,
+
     /// Port for this poller's Prometheus `/metrics` endpoint. Stays a
     /// plain field, not part of `MetricsArgs` -- its default differs per
     /// crate and `docker-compose.yml` relies on the code default.
@@ -80,6 +98,12 @@ impl std::fmt::Debug for Config {
             .field("ingest_sink", &self.ingest_sink)
             .field("redis", &self.redis)
             .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("tfl_stops_enabled", &self.tfl_stops_enabled)
+            .field("tfl_stops_interval_secs", &self.tfl_stops_interval_secs)
+            .field(
+                "tfl_stops_max_drop_fraction",
+                &self.tfl_stops_max_drop_fraction,
+            )
             .field("metrics_port", &self.metrics_port)
             .field("metrics", &self.metrics)
             .field("health", &self.health)
@@ -117,6 +141,17 @@ mod config_debug_tests {
             !debug_output.contains("redis-password"),
             "the Redis password must never appear in Debug output: {debug_output}"
         );
+    }
+
+    #[test]
+    fn the_stops_job_is_off_by_default() {
+        let args = ["poller-tfl", "--tfl-app-key", "k"];
+        let config = Config::try_parse_from(args).unwrap();
+        assert!(!config.tfl_stops_enabled);
+        assert_eq!(config.tfl_stops_interval_secs, 86_400);
+        let on =
+            Config::try_parse_from(args.iter().chain(&["--tfl-stops-enabled", "true"])).unwrap();
+        assert!(on.tfl_stops_enabled);
     }
 
     /// Release B: `stream` is the default and the only value; the removed
