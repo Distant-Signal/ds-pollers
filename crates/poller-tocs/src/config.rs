@@ -28,14 +28,6 @@ pub(crate) struct Config {
     #[arg(long, env)]
     pub rdm_api_key: String,
 
-    /// Where each snapshot goes: `stream` only, to `ds:ingest:reference`
-    /// (ingest plan 3c.2, decision D8), which the ingest-writer applies.
-    /// Release B (ingest phase 5, docs/ingest-phase5-runbook.md) removed
-    /// `http` and `http+shadow` with the api's `/private` routes; an old
-    /// value fails at startup. The next release drops the variable.
-    #[arg(long, env = "INGEST_SINK", default_value = "stream", value_parser = ["stream"])]
-    pub ingest_sink: String,
-
     /// Redis for the `ds:ingest:reference` stream (`REDIS_URL` required).
     #[command(flatten)]
     pub redis: ingest_stream::snapshot::RedisArgs,
@@ -63,7 +55,6 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("rdm_tocs_base_url", &self.rdm_tocs_base_url)
             .field("rdm_api_key", &"[REDACTED]")
-            .field("ingest_sink", &self.ingest_sink)
             .field("redis", &self.redis)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("metrics_port", &self.metrics_port)
@@ -105,26 +96,5 @@ mod tests {
             !debug_output.contains("redis-password"),
             "the Redis password must never appear in Debug output: {debug_output}"
         );
-    }
-
-    /// Release B: `stream` is the default and the only value; the removed
-    /// `http` and `http+shadow` fail at startup.
-    #[test]
-    fn ingest_sink_is_stream_only() {
-        let args = [
-            "poller-tocs",
-            "--rdm-tocs-base-url",
-            "https://example.invalid",
-            "--rdm-api-key",
-            "k",
-        ];
-        let config = Config::try_parse_from(args).unwrap();
-        assert_eq!(config.ingest_sink, "stream");
-        for removed in ["http", "http+shadow"] {
-            assert!(
-                Config::try_parse_from(args.iter().chain(&["--ingest-sink", removed])).is_err(),
-                "{removed}"
-            );
-        }
     }
 }

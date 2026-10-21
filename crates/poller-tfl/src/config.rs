@@ -38,14 +38,6 @@ pub(crate) struct Config {
     #[arg(long, env, default_value = "tube,dlr,overground,elizabeth-line,tram")]
     pub tfl_modes: String,
 
-    /// Where each snapshot goes: `stream` only, to `ds:ingest:tfl` (ingest
-    /// plan 3c.2), which the ingest-writer applies. Release B (ingest phase
-    /// 5, docs/ingest-phase5-runbook.md) removed `http` and `http+shadow`
-    /// with the api's `/private` routes; an old value fails at startup. The
-    /// next release drops the variable.
-    #[arg(long, env = "INGEST_SINK", default_value = "stream", value_parser = ["stream"])]
-    pub ingest_sink: String,
-
     /// Redis for the `ds:ingest:tfl` stream (`REDIS_URL` required).
     #[command(flatten)]
     pub redis: ingest_stream::snapshot::RedisArgs,
@@ -95,7 +87,6 @@ impl std::fmt::Debug for Config {
             .field("tfl_base_url", &self.tfl_base_url)
             .field("tfl_app_key", &"[REDACTED]")
             .field("tfl_modes", &self.tfl_modes)
-            .field("ingest_sink", &self.ingest_sink)
             .field("redis", &self.redis)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("tfl_stops_enabled", &self.tfl_stops_enabled)
@@ -152,20 +143,5 @@ mod config_debug_tests {
         let on =
             Config::try_parse_from(args.iter().chain(&["--tfl-stops-enabled", "true"])).unwrap();
         assert!(on.tfl_stops_enabled);
-    }
-
-    /// Release B: `stream` is the default and the only value; the removed
-    /// `http` and `http+shadow` fail at startup.
-    #[test]
-    fn ingest_sink_is_stream_only() {
-        let args = ["poller-tfl", "--tfl-app-key", "k"];
-        let config = Config::try_parse_from(args).unwrap();
-        assert_eq!(config.ingest_sink, "stream");
-        for removed in ["http", "http+shadow", "db"] {
-            assert!(
-                Config::try_parse_from(args.iter().chain(&["--ingest-sink", removed])).is_err(),
-                "{removed}"
-            );
-        }
     }
 }

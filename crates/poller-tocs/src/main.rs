@@ -39,7 +39,6 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("poller-tocs");
 
     let config = Config::parse();
-    common::metrics::ingest_sink_info(&config.ingest_sink);
     let progress = health_http::spawn_liveness(&config.health);
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
@@ -64,7 +63,7 @@ async fn run() -> anyhow::Result<()> {
 fn stream_sink(config: &Config) -> anyhow::Result<SnapshotStream> {
     let client = config
         .redis
-        .client("INGEST_SINK=stream")
+        .client("the ingest stream")
         .map_err(anyhow::Error::msg)?;
     tracing::info!("producing TOC snapshots to ds:ingest:reference");
     Ok(SnapshotStream::spawn(

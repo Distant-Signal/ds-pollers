@@ -213,12 +213,11 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("poller-irish-rail-gtfs");
 
     let config = Config::parse();
-    common::metrics::ingest_sink_info(&config.ingest_sink);
     let progress = health_http::spawn_liveness(&config.health);
     let client = build_client()?;
     let redis = config
         .redis
-        .client("INGEST_SINK=stream")
+        .client("the ingest stream")
         .map_err(anyhow::Error::msg)?;
     let sinks = Sinks {
         stations: SnapshotStream::spawn(

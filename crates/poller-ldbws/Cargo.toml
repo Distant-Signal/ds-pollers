@@ -12,10 +12,10 @@ chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 common = { path = "../common" }
 dotenvy = "0.15.7"
-# SAMPLE_STATIONS_SOURCE=db (ingest architecture plan 4.5): the selection,
+# The sample-station read (ingest architecture plan 4.5): the selection,
 # the views' readers, the pool and the schema gate.
 ds-store = { path = "../ds-store" }
-# INGEST_SINK=http+shadow|stream (ingest architecture plan 3a.7): the
+# The stream sink (ingest architecture plan 3a.7): the
 # station-samples stream producer, and its Redis client. Both already in
 # the tree; ingest-stream is DB-free.
 ingest-stream = { path = "../ingest-stream" }

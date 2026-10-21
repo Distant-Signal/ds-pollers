@@ -35,12 +35,6 @@ pub(crate) struct Config {
     )]
     pub irish_rail_base_url: String,
 
-    /// Where snapshots go: `stream` is the only sink (ingest plan 3c.2,
-    /// decision D8: the island-of-Ireland pollers keep no HTTP path). Kept
-    /// so `INGEST_SINK` is uniform across the stream producers.
-    #[arg(long, env = "INGEST_SINK", default_value = "stream", value_parser = ["stream"])]
-    pub ingest_sink: String,
-
     /// Redis for the `ds:ingest:ioi-live` stream. Its `Debug`
     /// redacts the credentials.
     #[command(flatten)]
@@ -117,21 +111,16 @@ mod tests {
         vec!["poller-irish-rail-live"]
     }
 
-    /// Plan 3c.2 (D8): `stream` is the default and the only sink, and the
-    /// Redis password never reaches `Debug`.
+    /// The Redis password never reaches `Debug`.
     #[test]
-    fn ingest_sink_is_stream_only() {
+    fn the_redis_password_never_reaches_debug() {
         let config = Config::try_parse_from([
             "poller-irish-rail-live",
             "--redis-password",
             "super-secret-password",
         ])
         .unwrap();
-        assert_eq!(config.ingest_sink, "stream");
         assert!(!format!("{config:?}").contains("super-secret-password"));
-        assert!(
-            Config::try_parse_from(["poller-irish-rail-live", "--ingest-sink", "http"]).is_err()
-        );
     }
 
     #[test]

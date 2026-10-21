@@ -20,7 +20,7 @@ use sqlx::PgPool;
 
 use crate::schema::StationRecord;
 
-/// `INGEST_SINK=db`: straight into Postgres, as the `stations` role.
+/// The sink: straight into Postgres, as the `stations` role.
 pub(crate) struct DbSink {
     pub pool: PgPool,
     /// How long one `publish` may retry a transient failure

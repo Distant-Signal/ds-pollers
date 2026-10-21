@@ -25,12 +25,6 @@ pub(crate) struct Config {
     )]
     pub gtfs_url: String,
 
-    /// Where snapshots go: `stream` is the only sink (decision D8: the
-    /// island-of-Ireland pollers keep no HTTP path). Kept so `INGEST_SINK`
-    /// is uniform across the stream producers.
-    #[arg(long, env = "INGEST_SINK", default_value = "stream", value_parser = ["stream"])]
-    pub ingest_sink: String,
-
     /// Redis for the `ds:ingest:ioi-gtfs` stream.
     #[command(flatten)]
     pub redis: ingest_stream::snapshot::RedisArgs,
@@ -79,7 +73,6 @@ impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
             .field("gtfs_url", &self.gtfs_url)
-            .field("ingest_sink", &self.ingest_sink)
             .field("redis", &self.redis)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("metrics_port", &self.metrics_port)
@@ -111,16 +104,6 @@ mod config_debug_tests {
         assert!(
             !debug_output.contains("super-secret-password"),
             "the Redis password must never appear in Debug output: {debug_output}"
-        );
-    }
-
-    /// Plan 3c.2 (D8): `stream` is the default and the only sink.
-    #[test]
-    fn ingest_sink_is_stream_only() {
-        let config = Config::try_parse_from(["poller-irish-rail-gtfs"]).unwrap();
-        assert_eq!(config.ingest_sink, "stream");
-        assert!(
-            Config::try_parse_from(["poller-irish-rail-gtfs", "--ingest-sink", "http"]).is_err()
         );
     }
 }

@@ -85,7 +85,6 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("poller-tfl");
 
     let config = Config::parse();
-    common::metrics::ingest_sink_info(&config.ingest_sink);
     let progress = health_http::spawn_liveness(&config.health);
     // `clap` treats a present-but-empty env var as a supplied value, so an
     // orchestrator (e.g. `docker-compose.yml`'s `TFL_APP_KEY: ${TFL_APP_KEY}`)
@@ -261,7 +260,7 @@ async fn last_published_count(sink: &StopsSink) -> anyhow::Result<Option<usize>>
 fn stream_sink(config: &Config) -> anyhow::Result<SnapshotStream> {
     let client = config
         .redis
-        .client("INGEST_SINK=stream")
+        .client("the ingest stream")
         .map_err(anyhow::Error::msg)?;
     tracing::info!("producing TfL snapshots to ds:ingest:tfl");
     Ok(SnapshotStream::spawn(

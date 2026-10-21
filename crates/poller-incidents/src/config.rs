@@ -46,14 +46,6 @@ pub(crate) struct Config {
     #[command(flatten)]
     pub health: common::service_args::HealthArgs,
 
-    /// `db` only: each snapshot goes to Postgres directly (`database_url`,
-    /// `lines_dir`, `redis_url`; plan 2c.2). Release B (ingest phase 5,
-    /// docs/ingest-phase5-runbook.md) removed `http` with the api's
-    /// `/private` routes; an old value fails at startup. The next release
-    /// drops the variable.
-    #[arg(long, env = "INGEST_SINK", default_value = "db", value_parser = ["db"])]
-    pub ingest_sink: String,
-
     /// The `distant_signal_incidents` role's connection (required).
     /// Pool size and timeouts come from the shared `DATABASE_*` variables
     /// (`common::pg`); the default pool is 2.
@@ -113,7 +105,6 @@ impl std::fmt::Debug for Config {
             .field("metrics_port", &self.metrics_port)
             .field("metrics", &self.metrics)
             .field("health", &self.health)
-            .field("ingest_sink", &self.ingest_sink)
             .field("database_url", &self.database_url)
             .field("lines_dir", &self.lines_dir)
             .field("redis_url", &self.redis_url)
@@ -142,18 +133,12 @@ mod tests {
         Config::try_parse_from(REQUIRED.iter().chain(extra)).expect("args should parse")
     }
 
-    /// Release B: `db` is the default and the only sink; the heartbeat is
-    /// on by default (plan 2c.6).
+    /// The heartbeat is on by default (plan 2c.6).
     #[test]
-    fn the_defaults_are_the_db_sink_and_the_heartbeat() {
+    fn the_defaults_are_the_heartbeat_and_the_lines_dir() {
         let config = parse(&[]);
-        assert_eq!(config.ingest_sink, "db");
         assert!(config.incidents_row_heartbeat);
         assert_eq!(config.lines_dir, "/app/lines");
-        assert!(
-            Config::try_parse_from(REQUIRED.iter().chain(&["--ingest-sink", "http"])).is_err(),
-            "the removed http sink fails at startup"
-        );
     }
 
     #[test]

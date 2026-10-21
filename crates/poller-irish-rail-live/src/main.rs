@@ -82,12 +82,11 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("poller-irish-rail-live");
 
     let config = Config::parse();
-    common::metrics::ingest_sink_info(&config.ingest_sink);
     let progress = health_http::spawn_liveness(&config.health);
     let client = build_client()?;
     let redis = config
         .redis
-        .client("INGEST_SINK=stream")
+        .client("the ingest stream")
         .map_err(anyhow::Error::msg)?;
     let samples = SnapshotStream::spawn(
         redis,
@@ -278,7 +277,6 @@ mod tests {
     fn test_config(base_url: String) -> Config {
         Config {
             irish_rail_base_url: base_url,
-            ingest_sink: "stream".to_string(),
             redis: ingest_stream::snapshot::RedisArgs {
                 redis_url: None,
                 redis_password: None,

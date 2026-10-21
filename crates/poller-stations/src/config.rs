@@ -27,16 +27,6 @@ pub(crate) struct Config {
     #[arg(long, env)]
     pub rdm_api_key: String,
 
-    /// Where the parsed stations go: `db` only, straight into Postgres
-    /// (`ds_store::reference::upsert_stations`, as the `stations` role,
-    /// ingest architecture plan 2b.1), with the startup cursor from
-    /// `ingest_freshness`. Release B (ingest phase 5,
-    /// docs/ingest-phase5-runbook.md) removed `http` with the api's
-    /// `/private` routes; an old value fails at startup. The next release
-    /// drops the variable.
-    #[arg(long, env = "INGEST_SINK", default_value = "db", value_parser = ["db"])]
-    pub ingest_sink: String,
-
     /// Postgres, as the `stations` role (required). Pool size and timeouts
     /// come from the shared `DATABASE_*` variables (`common::pg`); the
     /// default pool is 1 (spec §6.6: one sequential writer, role limit 2).
@@ -77,7 +67,6 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("rdm_stations_base_url", &self.rdm_stations_base_url)
             .field("rdm_api_key", &"[REDACTED]")
-            .field("ingest_sink", &self.ingest_sink)
             .field("database_url", &self.database_url)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("metrics_port", &self.metrics_port)
@@ -107,21 +96,16 @@ mod tests {
         Config::try_parse_from(REQUIRED.iter().chain(extra))
     }
 
-    /// Release B: `db` is the default and the only sink; the removed
-    /// `http` fails at startup, as does an empty `DATABASE_URL`.
+    /// An empty `DATABASE_URL` fails at startup, and the URL never reaches
+    /// `Debug`.
     #[test]
-    fn the_sink_is_db_only_and_needs_a_database_url() {
+    fn the_sink_needs_a_database_url() {
         let config = parse(&[]).unwrap();
-        assert_eq!(config.ingest_sink, "db");
         config.validate().unwrap();
         assert!(
             !format!("{config:?}").contains(":pw@"),
             "the database URL must not appear in Debug output"
         );
-
-        for removed in ["http", "stream"] {
-            assert!(parse(&["--ingest-sink", removed]).is_err(), "{removed}");
-        }
         let empty = Config::try_parse_from([
             "poller-stations",
             "--rdm-stations-base-url",
@@ -135,8 +119,8 @@ mod tests {
         assert!(empty.validate().is_err(), "an empty DATABASE_URL");
     }
 
-    /// The chart sets `DATABASE_URL` (templates/poller-deployments.yaml);
-    /// `INGEST_SINK` is read for one more release so an old `http` fails.
+    /// The chart sets `DATABASE_URL` (templates/poller-deployments.yaml).
+    /// Release D (ingest phase 5, Q8) removed `INGEST_SINK`.
     #[test]
     fn the_new_settings_read_the_chart_s_env_names() {
         use clap::CommandFactory;
@@ -148,8 +132,13 @@ mod tests {
                 .and_then(|arg| arg.get_env())
                 .map(|env| env.to_string_lossy().into_owned())
         };
-        assert_eq!(env("ingest_sink").as_deref(), Some("INGEST_SINK"));
         assert_eq!(env("database_url").as_deref(), Some("DATABASE_URL"));
+        assert!(
+            command
+                .get_arguments()
+                .all(|arg| arg.get_env().is_none_or(|env| env != "INGEST_SINK")),
+            "INGEST_SINK was removed in release D"
+        );
     }
 
     #[test]

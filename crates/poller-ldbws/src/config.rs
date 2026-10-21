@@ -53,8 +53,8 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 10)]
     pub num_rows: u32,
 
-    /// Where the samples go (`INGEST_SINK`, ingest architecture plan 3a.7)
-    /// and the Redis they are `XADD`ed to. See `sink.rs`.
+    /// The Redis the samples are `XADD`ed to (ingest architecture plan
+    /// 3a.7). See `sink.rs`.
     #[command(flatten)]
     pub ingest: IngestArgs,
 
@@ -101,24 +101,24 @@ pub(crate) struct Config {
     #[command(flatten)]
     pub health: common::service_args::HealthArgs,
 
-    /// `SAMPLE_STATIONS_SOURCE`, `DATABASE_URL` and `LINES_DIR` (ingest
-    /// architecture plan 4.5): see `sample_source.rs`.
+    /// `DATABASE_URL` and `LINES_DIR` (ingest architecture plan 4.5): see
+    /// `sample_source.rs`.
     #[command(flatten)]
     pub reads: crate::sample_source::SampleStationsArgs,
 }
 
-/// `INGEST_SINK` and its Redis (ingest architecture plan 3a.7, spec §13.1).
+/// The station-samples stream's Redis (ingest architecture plan 3a.7, spec
+/// §13.1). Each cycle's samples are `XADD`ed to
+/// `ds:ingest:station-samples`, keeping the latest unsent snapshot while
+/// Redis is down, and the startup cursor is read from the stream. Release
+/// D (ingest phase 5) removed the `INGEST_SINK` switch (`stream` only since
+/// release B).
 #[derive(clap::Args, Clone, Debug, Default)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "clap derives each env var from the field name, so the prefix is part of the interface"
+)]
 pub(crate) struct IngestArgs {
-    /// `stream` only: XADD each cycle's samples to
-    /// `ds:ingest:station-samples`, keeping the latest unsent snapshot
-    /// while Redis is down, and read the startup cursor from the stream.
-    /// Release B (ingest phase 5, docs/ingest-phase5-runbook.md) removed
-    /// `http` and `http+shadow` with the api's `/private` routes; an old
-    /// value fails at startup. The next release drops the variable.
-    #[arg(long, env, default_value = "stream", value_parser = ["stream"])]
-    pub ingest_sink: String,
-
     /// Redis for the stream (required).
     #[arg(long, env)]
     pub redis_url: Option<String>,
@@ -219,35 +219,17 @@ mod config_debug_tests {
         assert_eq!(config.hourly_request_budget, 0);
         assert!(!config.sample_pinned_lines_only);
         assert_eq!(config.sample_max_stations, 0);
-        // Release B: `stream` is the only sink.
-        assert_eq!(config.ingest.ingest_sink, "stream");
     }
 
-    /// The stream needs `REDIS_URL`; the removed `http` and `http+shadow`
-    /// fail at startup.
+    /// The stream needs `REDIS_URL`.
     #[test]
-    fn the_stream_sink_needs_redis_and_http_is_gone() {
+    fn the_stream_sink_needs_redis() {
         use super::IngestArgs;
 
         let mut args = IngestArgs::default();
         assert!(args.redis_client().is_err());
         args.redis_url = Some("redis://redis:6379".to_owned());
         assert!(args.redis_client().is_ok());
-        for removed in ["http", "http+shadow"] {
-            assert!(
-                Config::try_parse_from([
-                    "poller-ldbws",
-                    "--ldbws-base-url",
-                    "https://example.invalid",
-                    "--rdm-api-key",
-                    "key",
-                    "--ingest-sink",
-                    removed,
-                ])
-                .is_err(),
-                "{removed}"
-            );
-        }
     }
 }
 

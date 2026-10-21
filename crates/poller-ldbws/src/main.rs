@@ -106,11 +106,6 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("poller-ldbws");
 
     let mut config = Config::parse();
-    common::metrics::ingest_sink_info(&config.ingest.ingest_sink);
-    common::metrics::internal_reads_source_info(
-        "sample_stations",
-        &config.reads.sample_stations_source,
-    );
     config.reads.validate()?;
     let progress = health_http::spawn_liveness(&config.health);
     // Ingest plan 4.5: the catalogue, Postgres and the schema gate before

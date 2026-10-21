@@ -15,17 +15,10 @@ const APPLICATION_NAME: &str = "distant-signal-poller-ldbws";
 /// Spec §6.6: pool 1, role limit 2. One read per cycle.
 const DEFAULT_MAX_CONNECTIONS: u32 = 1;
 
-/// `SAMPLE_STATIONS_SOURCE` and what `db` needs.
+/// What the station-list read needs. Release D (ingest phase 5) removed the
+/// `SAMPLE_STATIONS_SOURCE` switch (`db` only since release B).
 #[derive(Debug, Default, clap::Args)]
 pub(crate) struct SampleStationsArgs {
-    /// `db` only: computed here from `LINES_DIR` and Postgres
-    /// (`DATABASE_URL`). Release B (ingest phase 5,
-    /// docs/ingest-phase5-runbook.md) removed `http` with the api's
-    /// `/private` routes; an old value fails at startup. The next release
-    /// drops the variable.
-    #[arg(long, env, default_value = "db", value_parser = ["db"])]
-    pub sample_stations_source: String,
-
     /// Postgres, as the `ldbws_ro` role (required). Pool size and timeouts
     /// come from the shared `DATABASE_*` variables (`common::pg`); the
     /// default pool is 1 (spec §6.6, role limit 2).
@@ -139,27 +132,13 @@ mod tests {
         Config::try_parse_from(base.iter().chain(no_database).chain(extra)).unwrap()
     }
 
-    /// Release B: `db` is the default and the only source, and it needs a
-    /// database; the removed `http` fails at startup.
+    /// The read needs a database.
     #[test]
-    fn the_source_is_db_only_and_needs_a_database_url() {
+    fn the_read_needs_a_database_url() {
         let config = parse(&[]);
-        assert_eq!(config.reads.sample_stations_source, "db");
         assert_eq!(config.reads.lines_dir, "/app/lines");
         assert!(config.reads.direct.is_none());
         assert!(config.reads.validate().is_err());
-        assert!(
-            Config::try_parse_from([
-                "poller-ldbws",
-                "--ldbws-base-url",
-                "https://example.invalid",
-                "--rdm-api-key",
-                "key",
-                "--sample-stations-source",
-                "http",
-            ])
-            .is_err()
-        );
         let db = parse(&[
             "--database-url",
             "postgres://distant_signal_ldbws_ro:pw@postgres/ds",
@@ -168,11 +147,11 @@ mod tests {
         assert!(!format!("{db:?}").contains(":pw@"));
     }
 
-    /// The chart sets `DATABASE_URL` (templates/poller-deployments.yaml);
-    /// `SAMPLE_STATIONS_SOURCE` is read for one more release so an old
-    /// `http` fails, and the chart no longer renders it.
+    /// The chart sets `DATABASE_URL` (templates/poller-deployments.yaml).
+    /// Release D (ingest phase 5, Q8) removed `SAMPLE_STATIONS_SOURCE` and
+    /// `INGEST_SINK`: nothing reads them and the chart renders neither.
     #[test]
-    fn the_source_reads_the_chart_s_env_name() {
+    fn the_read_uses_the_chart_s_env_name() {
         use clap::CommandFactory;
         let command = Config::command();
         let env = |id: &str| {
@@ -182,17 +161,24 @@ mod tests {
                 .and_then(|arg| arg.get_env())
                 .map(|env| env.to_string_lossy().into_owned())
         };
-        assert_eq!(
-            env("sample_stations_source").as_deref(),
-            Some("SAMPLE_STATIONS_SOURCE")
-        );
         assert_eq!(env("database_url").as_deref(), Some("DATABASE_URL"));
+        for arg in command.get_arguments() {
+            let name = arg.get_env().map(|env| env.to_string_lossy().into_owned());
+            assert!(
+                !matches!(
+                    name.as_deref(),
+                    Some("INGEST_SINK" | "SAMPLE_STATIONS_SOURCE")
+                ),
+                "{name:?} was removed in release D"
+            );
+        }
         let template = std::fs::read_to_string(
             common::manifest_dir!()
                 .join("../../charts/distant-signal/templates/poller-deployments.yaml"),
         )
         .unwrap();
         assert!(!template.contains("SAMPLE_STATIONS_SOURCE"));
+        assert!(!template.contains("INGEST_SINK"));
     }
 
     #[test]

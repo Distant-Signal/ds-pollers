@@ -3,7 +3,7 @@
 //! per-service step, as the narrow read-only `ldbws_ro` role itself (plan
 //! 4.7), whose only grants are SELECT on the views
 //! `ingest_sample_station_pins` and `ingest_custom_line_stations`. Proves
-//! the schema gate and the `SAMPLE_STATIONS_SOURCE=db` queries against
+//! the schema gate and the sample-station queries against
 //! exactly those grants. Read-only: no fixtures.
 
 use std::time::Duration;
