@@ -23,6 +23,10 @@
 //! to sample (the line catalogue and Postgres, `sample_source.rs`), then
 //! makes one LDBWS call *per station* each cycle — there is no
 //! bulk/multi-station LDBWS operation.
+//!
+//! A second, optional lane (`tracked_stops.rs`, DS-127) polls the boards of
+//! tracked trains' own stops, narrowed to each train's booked time, with
+//! its own request cap; its boards ride the same snapshot.
 
 mod budget;
 mod config;
@@ -31,6 +35,7 @@ mod rotation;
 mod sample_source;
 mod schema;
 mod sink;
+mod tracked_stops;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -40,12 +45,13 @@ use budget::{BudgetLimit, RequestBudget};
 use chrono::Utc;
 use clap::Parser;
 use common::ingest::{self, RDM_AUTH_HEADER_NAME};
-use common::{StationDeparture, StationSample};
+use common::{StationDeparture, StationSample, TrackedStopBoard};
 use config::Config;
 use platform_history::PlatformHistory;
 use reqwest::{Client, StatusCode};
 use rotation::Rotation;
 use sink::SampleSink;
+use tracked_stops::Cadence;
 
 /// Per-request timeout — see the other three pollers' identical rationale.
 /// 30s is comfortably short relative to the 60s default poll interval.
@@ -148,6 +154,15 @@ async fn run() -> anyhow::Result<()> {
     // The last station list, so a cycle keeps sampling LDBWS while
     // Postgres cannot serve a fresh one.
     let held = Rc::new(RefCell::new(HeldState::default()));
+    // The tracked-stop lane's re-poll pacing (DS-127).
+    let cadence = Rc::new(RefCell::new(Cadence::default()));
+    if config.tracked_stop_poll_enabled {
+        tracing::info!(
+            max_requests_per_cycle = config.tracked_stop_max_requests_per_cycle,
+            "tracked-stop board lane enabled"
+        );
+    }
+    register_tracked_stop_metrics();
 
     // Plan 3a.7: the samples go to `ds:ingest:station-samples` (`sink.rs`),
     // which is also the startup cursor. The producer's latest-only buffer
@@ -168,6 +183,7 @@ async fn run() -> anyhow::Result<()> {
             let rotation = Rc::clone(&rotation);
             let budget = Rc::clone(&budget);
             let held = Rc::clone(&held);
+            let cadence = Rc::clone(&cadence);
             let progress = &progress;
             let sink = &sink;
             let client = &client;
@@ -182,6 +198,7 @@ async fn run() -> anyhow::Result<()> {
                     config.poll_interval_secs,
                 ));
                 let mut held_state = std::mem::take(&mut *held.borrow_mut());
+                let mut cadence_state = std::mem::take(&mut *cadence.borrow_mut());
                 let result = poll_once(
                     client,
                     config,
@@ -190,6 +207,7 @@ async fn run() -> anyhow::Result<()> {
                         rotation: &mut rotation_state,
                         request_budget: &mut budget_state,
                         held: &mut held_state,
+                        cadence: &mut cadence_state,
                     },
                     &ingest::API_STARTUP_WAIT,
                     Some(progress),
@@ -200,6 +218,7 @@ async fn run() -> anyhow::Result<()> {
                 *rotation.borrow_mut() = rotation_state;
                 *budget.borrow_mut() = budget_state;
                 *held.borrow_mut() = held_state;
+                *cadence.borrow_mut() = cadence_state;
                 result
             }
         },
@@ -243,6 +262,8 @@ struct CycleState<'a> {
     rotation: &'a mut Rotation,
     request_budget: &'a mut RequestBudget,
     held: &'a mut HeldState,
+    /// The tracked-stop lane's pacing (`tracked_stops.rs`).
+    cadence: &'a mut Cadence,
 }
 
 /// One cycle: sample as many stations as the budgets allow, then publish
@@ -304,7 +325,14 @@ async fn poll_once(
     if sampled == 0 {
         tracing::warn!("no station samples collected this cycle");
     }
-    let result = deliver_cycle(config, sink, samples, now).await;
+    // The tracked-stop lane, after the rotation and within its own budget
+    // (DS-127). Its boards ride the same snapshot.
+    let tracked = if config.tracked_stop_poll_enabled {
+        sample_tracked_stops(client, config, state.cadence, state.platform_history).await
+    } else {
+        Vec::new()
+    };
+    let result = deliver_cycle(config, sink, samples, &tracked, now).await;
     let progressed = match &result {
         Ok(delivered) => {
             rotation.advance(&polled, completed);
@@ -343,9 +371,10 @@ async fn deliver_cycle(
     config: &Config,
     sink: &SampleSink,
     samples: Vec<StationSample>,
+    tracked: &[TrackedStopBoard],
     now: std::time::Instant,
 ) -> anyhow::Result<Vec<(String, std::time::Instant)>> {
-    if samples.is_empty() {
+    if samples.is_empty() && tracked.is_empty() {
         return Ok(Vec::new());
     }
     let delivered: Vec<(String, std::time::Instant)> = samples
@@ -354,6 +383,7 @@ async fn deliver_cycle(
         .collect();
     sink.deliver(
         &samples,
+        tracked,
         common::poller_loop::post_retry_budget(Duration::from_secs(config.poll_interval_secs)),
     )
     .await
@@ -692,6 +722,147 @@ async fn sample_all_stations(
     }
 }
 
+/// `ldbws_tracked_stop_polls_total{outcome}`: tracked-stop board requests,
+/// `ok` or `error`.
+const TRACKED_STOP_POLLS_METRIC: &str = "ldbws_tracked_stop_polls_total";
+/// `ldbws_tracked_stop_skipped_total`: stops due a poll that the lane's
+/// per-cycle cap or time budget left for the next cycle.
+const TRACKED_STOP_SKIPPED_METRIC: &str = "ldbws_tracked_stop_skipped_total";
+/// `ldbws_tracked_stop_targets`: tracked stops within the lane's horizon at
+/// the last cycle.
+const TRACKED_STOP_TARGETS_METRIC: &str = "ldbws_tracked_stop_targets";
+
+/// Every tracked-stop series at 0, so `rate()` works before the first poll.
+fn register_tracked_stop_metrics() {
+    for outcome in ["ok", "error"] {
+        metrics::counter!(
+            common::metrics::metric_name(TRACKED_STOP_POLLS_METRIC),
+            "outcome" => outcome
+        )
+        .increment(0);
+    }
+    metrics::counter!(common::metrics::metric_name(TRACKED_STOP_SKIPPED_METRIC)).increment(0);
+    metrics::gauge!(common::metrics::metric_name(TRACKED_STOP_TARGETS_METRIC)).set(0.0);
+}
+
+/// The tracked-stop lane (`tracked_stops.rs`): reads the stops in the
+/// horizon, then polls the ones due, soonest first, up to the per-cycle
+/// cap and [`tracked_stops::LANE_TIME_BUDGET`]. A failed read or request is
+/// logged and skipped; the lane never fails the cycle.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a gauge takes f64; the target count stays far below 2^52"
+)]
+async fn sample_tracked_stops(
+    client: &Client,
+    config: &Config,
+    cadence: &mut Cadence,
+    platform_history: &mut PlatformHistory,
+) -> Vec<TrackedStopBoard> {
+    let Some(direct) = &config.reads.direct else {
+        return Vec::new();
+    };
+    let now = Utc::now();
+    let targets = match ds_store::reads::tracked_stop_targets::tracked_stop_targets(
+        &direct.pool,
+        now,
+        tracked_stops::BEHIND,
+        tracked_stops::HORIZON,
+    )
+    .await
+    {
+        Ok(targets) => targets,
+        Err(err) => {
+            tracing::warn!(error = ?err, "could not read the tracked stops; skipping the lane");
+            return Vec::new();
+        }
+    };
+    metrics::gauge!(common::metrics::metric_name(TRACKED_STOP_TARGETS_METRIC))
+        .set(targets.len() as f64);
+    cadence.prune(now);
+    let due = cadence.due(&targets, now);
+    let cap = usize::try_from(config.tracked_stop_max_requests_per_cycle).unwrap_or(usize::MAX);
+    let mut boards = Vec::new();
+    let mut attempted = 0usize;
+    {
+        let work = async {
+            for target in due.iter().take(cap) {
+                attempted += 1;
+                let (offset, window) = tracked_stops::window(target.departs_at, Utc::now());
+                match fetch_board_window(client, config, &target.crs, offset, window).await {
+                    Ok(mut departures) => {
+                        platform_history.apply(&target.crs, &mut departures);
+                        let polled_at = Utc::now();
+                        cadence.polled(target, polled_at);
+                        boards.push(TrackedStopBoard {
+                            train_uid: target.train_uid.clone(),
+                            service_date: target.service_date,
+                            crs: target.crs.clone(),
+                            polled_at,
+                            departures,
+                        });
+                        metrics::counter!(
+                            common::metrics::metric_name(TRACKED_STOP_POLLS_METRIC),
+                            "outcome" => "ok"
+                        )
+                        .increment(1);
+                    }
+                    Err(err) => {
+                        // Paced like a success, so one bad stop cannot take
+                        // the whole cap every cycle.
+                        cadence.polled(target, Utc::now());
+                        tracing::warn!(crs = %target.crs, error = ?err, "tracked-stop board poll failed");
+                        metrics::counter!(
+                            common::metrics::metric_name(TRACKED_STOP_POLLS_METRIC),
+                            "outcome" => "error"
+                        )
+                        .increment(1);
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep(tracked_stops::LANE_TIME_BUDGET) => {
+                tracing::debug!("tracked-stop lane time budget reached");
+            }
+            () = work => {}
+        }
+    }
+    let skipped = due.len().saturating_sub(attempted);
+    metrics::counter!(common::metrics::metric_name(TRACKED_STOP_SKIPPED_METRIC))
+        .increment(u64::try_from(skipped).unwrap_or(u64::MAX));
+    boards
+}
+
+/// One `GetDepBoardWithDetails` call for a window of `crs`'s board:
+/// `timeOffset` and `timeWindow` in minutes from now (the tracked-stop
+/// lane). One attempt, no `numRows` fallback: the window is narrow, and a
+/// failed stop is simply polled again next time.
+async fn fetch_board_window(
+    client: &Client,
+    config: &Config,
+    crs: &str,
+    time_offset: i64,
+    time_window: i64,
+) -> anyhow::Result<Vec<StationDeparture>> {
+    let url = format!(
+        "{}/GetDepBoardWithDetails/{crs}?numRows={}&timeOffset={time_offset}&timeWindow={time_window}",
+        config.ldbws_base_url, config.num_rows
+    );
+    let response = client
+        .get(&url)
+        .header(RDM_AUTH_HEADER_NAME, &config.rdm_api_key)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("LDBWS window board for {crs} failed: {status} {body}");
+    }
+    schema::parse_departures(&response.text().await?)
+}
+
 /// The deduplicated CRS list to sample, computed from the line catalogue
 /// and Postgres (`sample_source`, plan 4.5), with the LEG-18 knobs.
 async fn fetch_sample_stations(config: &Config) -> anyhow::Result<Vec<String>> {
@@ -1018,6 +1189,8 @@ mod tests {
             hourly_request_budget: 0,
             sample_pinned_lines_only: false,
             sample_max_stations: 0,
+            tracked_stop_poll_enabled: false,
+            tracked_stop_max_requests_per_cycle: 20,
             metrics_port: 9091,
             metrics: common::service_args::MetricsArgs {
                 metrics_enabled: false,
@@ -1060,6 +1233,65 @@ mod tests {
         );
         // wiremock's `.expect(1)` (asserted on Drop) is the real assertion
         // that only one request was made.
+    }
+
+    /// The tracked-stop lane's request (DS-127): the stop's board, narrowed
+    /// with `timeOffset`/`timeWindow`.
+    #[tokio::test]
+    async fn a_window_board_asks_for_the_offset_and_window() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/GetDepBoardWithDetails/YRK"))
+            .and(query_param("numRows", "10"))
+            .and(query_param("timeOffset", "55"))
+            .and(query_param("timeWindow", "15"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ONE_SERVICE_BODY))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = test_config(server.uri(), 10);
+        let departures = fetch_board_window(&Client::new(), &config, "YRK", 55, 15)
+            .await
+            .expect("a window board");
+        assert_eq!(departures.len(), 1);
+    }
+
+    /// A failed window board is an error for that stop, never retried.
+    #[tokio::test]
+    async fn a_failed_window_board_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/GetDepBoardWithDetails/YRK"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = test_config(server.uri(), 10);
+        assert!(
+            fetch_board_window(&Client::new(), &config, "YRK", 5, 15)
+                .await
+                .is_err()
+        );
+    }
+
+    /// Without a database the lane has nothing to read and polls nothing.
+    #[tokio::test]
+    async fn the_tracked_stop_lane_without_a_database_polls_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ONE_SERVICE_BODY))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let config = test_config(server.uri(), 10);
+        let boards = sample_tracked_stops(
+            &Client::new(),
+            &config,
+            &mut Cadence::default(),
+            &mut PlatformHistory::new(),
+        )
+        .await;
+        assert!(boards.is_empty());
     }
 
     #[tokio::test]
@@ -1725,6 +1957,7 @@ mod tests {
                     rotation: &mut self.rotation,
                     request_budget: &mut self.budget,
                     held: &mut self.held,
+                    cadence: &mut Cadence::default(),
                 },
                 &TEST_LIST_WAIT,
                 None,

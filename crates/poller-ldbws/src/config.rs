@@ -88,6 +88,20 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 0)]
     pub sample_max_stations: u32,
 
+    /// The tracked-stop lane (DS-127, `tracked_stops.rs`): also poll the
+    /// boards of tracked trains' own stops, narrowed to each train's booked
+    /// time. Off by default: it adds requests (up to the cap below a
+    /// cycle).
+    #[arg(long, env, default_value_t = false)]
+    pub tracked_stop_poll_enabled: bool,
+
+    /// The tracked-stop lane's own budget: at most this many requests a
+    /// cycle, soonest departure first; the rest wait for the next cycle.
+    /// Separate from `HOURLY_REQUEST_BUDGET`, which caps the station
+    /// rotation.
+    #[arg(long, env, default_value_t = 20)]
+    pub tracked_stop_max_requests_per_cycle: u32,
+
     /// Port for this poller's Prometheus `/metrics` endpoint. Stays a
     /// plain field, not part of `MetricsArgs` -- its default differs per
     /// crate and `docker-compose.yml` relies on the code default.
@@ -162,6 +176,11 @@ impl std::fmt::Debug for Config {
             .field("hourly_request_budget", &self.hourly_request_budget)
             .field("sample_pinned_lines_only", &self.sample_pinned_lines_only)
             .field("sample_max_stations", &self.sample_max_stations)
+            .field("tracked_stop_poll_enabled", &self.tracked_stop_poll_enabled)
+            .field(
+                "tracked_stop_max_requests_per_cycle",
+                &self.tracked_stop_max_requests_per_cycle,
+            )
             .field("metrics_port", &self.metrics_port)
             .field("metrics", &self.metrics)
             .field("health", &self.health)
@@ -219,6 +238,8 @@ mod config_debug_tests {
         assert_eq!(config.hourly_request_budget, 0);
         assert!(!config.sample_pinned_lines_only);
         assert_eq!(config.sample_max_stations, 0);
+        assert!(!config.tracked_stop_poll_enabled);
+        assert_eq!(config.tracked_stop_max_requests_per_cycle, 20);
     }
 
     /// The stream needs `REDIS_URL`.
@@ -246,6 +267,8 @@ mod chart_env_wiring_tests {
         "HOURLY_REQUEST_BUDGET",
         "SAMPLE_PINNED_LINES_ONLY",
         "SAMPLE_MAX_STATIONS",
+        "TRACKED_STOP_POLL_ENABLED",
+        "TRACKED_STOP_MAX_REQUESTS_PER_CYCLE",
     ];
 
     #[test]

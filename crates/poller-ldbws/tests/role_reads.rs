@@ -2,7 +2,8 @@
 //! role `DATABASE_URL` is: CI runs it as the superuser and, in the
 //! per-service step, as the narrow read-only `ldbws_ro` role itself (plan
 //! 4.7), whose only grants are SELECT on the views
-//! `ingest_sample_station_pins` and `ingest_custom_line_stations`. Proves
+//! `ingest_sample_station_pins`, `ingest_custom_line_stations` and
+//! `ingest_tracked_stop_targets` (DS-127). Proves
 //! the schema gate and the sample-station queries against
 //! exactly those grants. Read-only: no fixtures.
 
@@ -41,4 +42,20 @@ async fn the_sample_station_reads_run_as_the_role() {
     ds_store::reads::select_sample_stations_from(&pool, &[], selection)
         .await
         .expect("SELECT on the two views");
+}
+
+/// The tracked-stop lane's read (DS-127): SELECT on the view
+/// `ingest_tracked_stop_targets` only.
+#[tokio::test]
+#[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
+async fn the_tracked_stop_targets_read_runs_as_the_role() {
+    let pool = pool().await;
+    ds_store::reads::tracked_stop_targets::tracked_stop_targets(
+        &pool,
+        chrono::Utc::now(),
+        chrono::Duration::minutes(10),
+        chrono::Duration::hours(2),
+    )
+    .await
+    .expect("SELECT on ingest_tracked_stop_targets");
 }

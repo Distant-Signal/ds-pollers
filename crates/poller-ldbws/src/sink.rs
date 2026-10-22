@@ -22,8 +22,8 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use common::StationSample;
 use common::ingest::DataRejected;
+use common::{StationSample, TrackedStopBoard};
 use ingest_stream::SchemaId;
 use ingest_stream::envelope::EnvelopeError;
 use ingest_stream::snapshot::{ROWS_PER_PART, Snapshot, SnapshotProducer};
@@ -60,13 +60,15 @@ impl SampleSink {
         Ok(self.stream.cursor().await?)
     }
 
-    /// Delivers one cycle's samples, waiting up to `budget` for the XADD.
+    /// Delivers one cycle's samples and tracked-stop boards, waiting up to
+    /// `budget` for the XADD.
     pub(crate) async fn deliver(
         &self,
         samples: &[StationSample],
+        tracked: &[TrackedStopBoard],
         budget: Duration,
     ) -> anyhow::Result<()> {
-        let snapshot = match encode(&self.stream, samples) {
+        let snapshot = match encode(&self.stream, samples, tracked) {
             Ok(snapshot) => snapshot,
             // The same samples would fail the same way: not a transient
             // failure.
@@ -88,11 +90,23 @@ impl SampleSink {
     }
 }
 
-/// One cycle's samples as a `station-samples/1` snapshot.
-fn encode(stream: &SnapshotProducer, samples: &[StationSample]) -> Result<Snapshot, EnvelopeError> {
+/// The schema of a tracked-stop boards part (DS-127).
+fn tracked_schema() -> SchemaId {
+    #[expect(clippy::expect_used, reason = "a constant, valid schema id")]
+    SchemaId::new(common::TRACKED_STOP_BOARDS_SCHEMA, 1).expect("valid schema id")
+}
+
+/// One cycle's samples as a `station-samples/1` snapshot, plus its
+/// tracked-stop boards as `tracked-stop-boards/1` parts.
+fn encode(
+    stream: &SnapshotProducer,
+    samples: &[StationSample],
+    tracked: &[TrackedStopBoard],
+) -> Result<Snapshot, EnvelopeError> {
     let produced_at = samples
         .iter()
         .map(|sample| sample.polled_at)
+        .chain(tracked.iter().map(|board| board.polled_at))
         .max()
         .unwrap_or_else(Utc::now);
     let mut snapshot = Snapshot::new();
@@ -102,6 +116,14 @@ fn encode(stream: &SnapshotProducer, samples: &[StationSample]) -> Result<Snapsh
         stream.producer_id(),
         produced_at,
         samples,
+        ROWS_PER_PART,
+    )?;
+    snapshot.add(
+        stream.stream(),
+        &tracked_schema(),
+        stream.producer_id(),
+        produced_at,
+        tracked,
         ROWS_PER_PART,
     )?;
     Ok(snapshot)
@@ -136,13 +158,45 @@ mod tests {
     }
 
     #[test]
+    fn tracked_stop_boards_ride_the_same_snapshot_as_their_own_schema() {
+        let sink = stream_sink("redis://127.0.0.1:1", "unused");
+        let t0: DateTime<Utc> = "2026-10-08T12:00:00Z".parse().unwrap();
+        let tracked = [TrackedStopBoard {
+            train_uid: "W12345".to_owned(),
+            service_date: "2026-10-08".parse().unwrap(),
+            crs: "YRK".to_owned(),
+            polled_at: t0 + TimeDelta::seconds(90),
+            departures: Vec::new(),
+        }];
+        let snapshot = encode(&sink.stream, &[sample("ZQA", t0)], &tracked).unwrap();
+        assert_eq!(
+            snapshot.rows(),
+            [
+                ("station-samples".to_owned(), 1),
+                ("tracked-stop-boards".to_owned(), 1)
+            ]
+        );
+        let parts: Vec<Envelope> = snapshot
+            .parts()
+            .iter()
+            .map(|part| Envelope::decode(&part.fields).unwrap())
+            .collect();
+        // The cycle's newest poll is the snapshot's time, either lane's.
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.produced_at == t0 + TimeDelta::seconds(90))
+        );
+    }
+
+    #[test]
     fn a_cycle_is_one_snapshot_in_parts_of_100_stations_at_its_newest_polled_at() {
         let sink = stream_sink("redis://127.0.0.1:1", "unused");
         let t0: DateTime<Utc> = "2026-10-08T12:00:00Z".parse().unwrap();
         let samples: Vec<StationSample> = (0..250)
             .map(|i| sample(&format!("Z{i:02}"), t0 + TimeDelta::seconds(i)))
             .collect();
-        let snapshot = encode(&sink.stream, &samples).unwrap();
+        let snapshot = encode(&sink.stream, &samples, &[]).unwrap();
         assert_eq!(snapshot.parts().len(), 3);
         assert_eq!(snapshot.rows(), [("station-samples".to_owned(), 250)]);
         let parts: Vec<Envelope> = snapshot
@@ -171,7 +225,11 @@ mod tests {
     async fn redis_down_fails_the_cycle_transiently_and_holds_the_snapshot() {
         let sink = stream_sink("redis://127.0.0.1:1", "ds:ingest:station-samples");
         let err = sink
-            .deliver(&[sample("ZQA", Utc::now())], Duration::from_millis(300))
+            .deliver(
+                &[sample("ZQA", Utc::now())],
+                &[],
+                Duration::from_millis(300),
+            )
             .await
             .unwrap_err();
         assert_eq!(
@@ -209,6 +267,7 @@ mod tests {
         );
         sink.deliver(
             &[sample("ZQA", t1), sample("ZQB", t1)],
+            &[],
             Duration::from_secs(5),
         )
         .await
@@ -216,7 +275,7 @@ mod tests {
         assert_eq!(sink.last_fetched().await.unwrap(), Some(t1));
 
         let t2 = t1 + TimeDelta::minutes(1);
-        sink.deliver(&[sample("ZQA", t2)], Duration::from_secs(5))
+        sink.deliver(&[sample("ZQA", t2)], &[], Duration::from_secs(5))
             .await
             .unwrap();
         assert_eq!(sink.last_fetched().await.unwrap(), Some(t2));
