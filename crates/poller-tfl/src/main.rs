@@ -15,11 +15,17 @@
 //! `ds:ingest:tfl-stops` for the untracked-leg stop lookup
 //! (docs/superpowers/specs/2026-10-20-tfl-stop-lookup-design.md).
 //!
+//! With `TFL_ROUTES_ENABLED` it also runs a daily route-sequences job
+//! ([`routes`], DS-151): each of those lines' routes in stop order,
+//! published as `tfl-line-routes/1` on the same stream, which the
+//! planner's Tube access legs measure rides along.
+//!
 //! There is no historical endpoint on `TfL`'s side. Everything this app can
 //! ever show for "the Victoria line last Tuesday" is what this poller
 //! wrote into `line_status_history` at the time.
 
 mod config;
+mod routes;
 mod schema;
 mod stops;
 
@@ -98,9 +104,23 @@ async fn run() -> anyhow::Result<()> {
     let stream = stream_sink(&config)?;
 
     let stops = if config.tfl_stops_enabled {
-        Some(stops_sink(&config)?)
+        Some(daily_sink(
+            &config,
+            common::tfl_stops::SCHEMA,
+            "TFL_STOPS_ENABLED",
+        )?)
     } else {
         tracing::info!("the stops job is off (TFL_STOPS_ENABLED)");
+        None
+    };
+    let routes = if config.tfl_routes_enabled {
+        Some(daily_sink(
+            &config,
+            common::tfl_routes::SCHEMA,
+            "TFL_ROUTES_ENABLED",
+        )?)
+    } else {
+        tracing::info!("the route-sequences job is off (TFL_ROUTES_ENABLED)");
         None
     };
 
@@ -132,33 +152,49 @@ async fn run() -> anyhow::Result<()> {
         )
         .await
     };
+    let routes_loop = async {
+        let Some(routes) = &routes else {
+            return std::future::pending().await;
+        };
+        common::poller_loop::run_poll_loop_with_cursor(
+            "tfl-routes",
+            || async { Ok(routes.stream.last_produced_at().await?) },
+            Duration::from_secs(config.tfl_stops_interval_secs),
+            false,
+            config.metrics_port,
+            &progress,
+            || routes_once(&client, &config, routes),
+        )
+        .await
+    };
     tokio::select! {
         result = status_loop => result,
         result = stops_loop => result,
+        result = routes_loop => result,
     }
 }
 
-/// The stops job's producer on `ds:ingest:tfl-stops`, and the Redis
+/// A daily job's producer on `ds:ingest:tfl-stops` (the stops job's
+/// `tfl-stops/1` or the routes job's `tfl-line-routes/1`), and the Redis
 /// client its feed guard reads the last snapshot back with.
-struct StopsSink {
+struct DailySink {
     stream: SnapshotStream,
     redis: redis::Client,
 }
 
-/// The `ds:ingest:tfl-stops` producer: one part per snapshot (a few
-/// hundred stops, well under the 512 KiB part cap after gzip), so the
-/// writer replaces `tfl_stops` from one entry.
-fn stops_sink(config: &Config) -> anyhow::Result<StopsSink> {
-    let redis = config
-        .redis
-        .client("TFL_STOPS_ENABLED")
-        .map_err(anyhow::Error::msg)?;
-    tracing::info!("producing TfL stops snapshots to ds:ingest:tfl-stops");
-    Ok(StopsSink {
+/// A `ds:ingest:tfl-stops` producer of `schema` (version 1): one part per
+/// snapshot (a few hundred stops, or about 80 routes, well under the 512
+/// KiB part cap after gzip), so the writer replaces its table from one
+/// entry. Each job has its own producer, so neither supersedes the other's
+/// unsent snapshot.
+fn daily_sink(config: &Config, schema: &str, why: &str) -> anyhow::Result<DailySink> {
+    let redis = config.redis.client(why).map_err(anyhow::Error::msg)?;
+    tracing::info!("producing TfL {schema} snapshots to ds:ingest:tfl-stops");
+    Ok(DailySink {
         stream: SnapshotStream::spawn(
             redis.clone(),
             ingest_stream::streams::TFL_STOPS,
-            ingest_stream::SchemaId::new(common::tfl_stops::SCHEMA, 1)?,
+            ingest_stream::SchemaId::new(schema, 1)?,
             "poller-tfl",
             usize::MAX,
         ),
@@ -172,7 +208,7 @@ const STOPS_CALL_GAP: Duration = Duration::from_millis(250);
 
 /// One stops run (spec §1): every page of Tube, DLR and tram stop points,
 /// then their hubs, through the feed guard, published as one snapshot.
-async fn stops_once(client: &Client, config: &Config, sink: &StopsSink) -> anyhow::Result<()> {
+async fn stops_once(client: &Client, config: &Config, sink: &DailySink) -> anyhow::Result<()> {
     let fetched_at = Utc::now();
     let base = config.tfl_base_url.trim_end_matches('/');
     let modes = common::tfl_stops::MODES.join(",");
@@ -208,7 +244,7 @@ async fn stops_once(client: &Client, config: &Config, sink: &StopsSink) -> anyho
     stops::apply_hubs(&mut found, &hubs);
     let rows: Vec<common::tfl_stops::TflStop> = found.into_values().collect();
 
-    let baseline = last_published_count(sink).await?;
+    let baseline = last_published_count(sink, common::tfl_stops::SCHEMA).await?;
     if let Err(refusal) = stops::check(rows.len(), baseline, config.tfl_stops_max_drop_fraction) {
         metrics::counter!(
             common::metrics::metric_name("tfl_stops_refused_total"),
@@ -239,15 +275,76 @@ async fn stops_once(client: &Client, config: &Config, sink: &StopsSink) -> anyho
     Ok(())
 }
 
-/// The stop count of the last snapshot on the stream (the feed guard's
-/// baseline), `None` when there is none.
-async fn last_published_count(sink: &StopsSink) -> anyhow::Result<Option<usize>> {
-    let Some(envelope) = ingest_stream::snapshot::newest_of_schema(
-        &sink.redis,
-        sink.stream.stream(),
-        common::tfl_stops::SCHEMA,
+/// One route-sequences run (DS-151): the Tube, DLR and tram lines, then
+/// each line's routes in both directions, through the feed guard (on the
+/// route count), published as one snapshot. A line with no route at all
+/// fails the run: the snapshot replaces every line's routes.
+async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyhow::Result<()> {
+    let fetched_at = Utc::now();
+    let base = config.tfl_base_url.trim_end_matches('/');
+    let modes = common::tfl_stops::MODES.join(",");
+    let body = fetch_json(
+        client,
+        &format!("{base}/Line/Mode/{modes}"),
+        config,
+        "lines",
     )
-    .await?
+    .await?;
+    let lines = routes::parse_lines(&body)?;
+    let mut found = Vec::new();
+    let mut invalid = 0;
+    for line in &lines {
+        let mut of_line = 0;
+        for direction in common::tfl_routes::DIRECTIONS {
+            tokio::time::sleep(STOPS_CALL_GAP).await;
+            // `parse_lines` kept only lower-case slugs: safe in a path.
+            let url = format!("{base}/Line/{line}/Route/Sequence/{direction}");
+            let body = fetch_json(client, &url, config, "route-sequence").await?;
+            let parsed = routes::parse_sequence(line, direction, &body)?;
+            invalid += parsed.invalid;
+            of_line += parsed.routes.len();
+            found.extend(parsed.routes);
+        }
+        if of_line == 0 {
+            anyhow::bail!(
+                "TfL returned no routes for the {line} line; refusing a partial snapshot"
+            );
+        }
+    }
+    let rows = routes::dedup(found);
+
+    let baseline = last_published_count(sink, common::tfl_routes::SCHEMA).await?;
+    if let Err(refusal) = stops::check(rows.len(), baseline, config.tfl_stops_max_drop_fraction) {
+        metrics::counter!(
+            common::metrics::metric_name("tfl_routes_refused_total"),
+            "reason" => refusal.reason()
+        )
+        .increment(1);
+        anyhow::bail!("refusing the TfL route sequences: {refusal}");
+    }
+    tracing::info!(
+        lines = lines.len(),
+        routes = rows.len(),
+        invalid,
+        "parsed TfL route sequences"
+    );
+    sink.stream.publish(&rows, fetched_at).await?;
+    #[expect(clippy::cast_precision_loss, reason = "about a hundred routes")]
+    metrics::gauge!(common::metrics::metric_name("tfl_routes_published")).set(rows.len() as f64);
+    #[expect(clippy::cast_precision_loss, reason = "a Unix timestamp in seconds")]
+    metrics::gauge!(common::metrics::metric_name(
+        "tfl_routes_last_success_timestamp_seconds"
+    ))
+    .set(fetched_at.timestamp() as f64);
+    Ok(())
+}
+
+/// The row count of the last `schema` snapshot on the stream (the feed
+/// guard's baseline), `None` when there is none.
+async fn last_published_count(sink: &DailySink, schema: &str) -> anyhow::Result<Option<usize>> {
+    let Some(envelope) =
+        ingest_stream::snapshot::newest_of_schema(&sink.redis, sink.stream.stream(), schema)
+            .await?
     else {
         return Ok(None);
     };

@@ -67,6 +67,14 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 0.2)]
     pub tfl_stops_max_drop_fraction: f64,
 
+    /// The daily route-sequences job (DS-151): each Tube, DLR and tram
+    /// line's routes in stop order, published as `tfl-line-routes/1` on
+    /// `ds:ingest:tfl-stops`, at the stops job's interval and under its
+    /// drop fraction (of the route count). Off by default: turn it on once
+    /// the ingest-writer that applies that schema is deployed.
+    #[arg(long, env, default_value_t = false, action = clap::ArgAction::Set)]
+    pub tfl_routes_enabled: bool,
+
     /// Port for this poller's Prometheus `/metrics` endpoint. Stays a
     /// plain field, not part of `MetricsArgs` -- its default differs per
     /// crate and `docker-compose.yml` relies on the code default.
@@ -95,6 +103,7 @@ impl std::fmt::Debug for Config {
                 "tfl_stops_max_drop_fraction",
                 &self.tfl_stops_max_drop_fraction,
             )
+            .field("tfl_routes_enabled", &self.tfl_routes_enabled)
             .field("metrics_port", &self.metrics_port)
             .field("metrics", &self.metrics)
             .field("health", &self.health)
@@ -139,7 +148,11 @@ mod config_debug_tests {
         let args = ["poller-tfl", "--tfl-app-key", "k"];
         let config = Config::try_parse_from(args).unwrap();
         assert!(!config.tfl_stops_enabled);
+        assert!(!config.tfl_routes_enabled);
         assert_eq!(config.tfl_stops_interval_secs, 86_400);
+        let routes =
+            Config::try_parse_from(args.iter().chain(&["--tfl-routes-enabled", "true"])).unwrap();
+        assert!(routes.tfl_routes_enabled);
         let on =
             Config::try_parse_from(args.iter().chain(&["--tfl-stops-enabled", "true"])).unwrap();
         assert!(on.tfl_stops_enabled);

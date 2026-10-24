@@ -284,7 +284,8 @@ pub(crate) fn apply_hubs(stops: &mut BTreeMap<String, TflStop>, hubs: &BTreeMap<
 }
 
 /// Why the feed guard refused a snapshot: the `reason` of
-/// `distant_signal_tfl_stops_refused_total`.
+/// `distant_signal_tfl_stops_refused_total`, and of the routes job's
+/// `distant_signal_tfl_routes_refused_total`, whose count is of routes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refusal {
     Empty,
@@ -303,12 +304,9 @@ impl Refusal {
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Empty => f.write_str("TfL returned no Tube, DLR or tram stops"),
+            Self::Empty => f.write_str("TfL returned none"),
             Self::SharpDrop { was, now } => {
-                write!(
-                    f,
-                    "the stop count fell from {was} to {now}, past the drop limit"
-                )
+                write!(f, "the count fell from {was} to {now}, past the drop limit")
             }
         }
     }
