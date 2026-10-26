@@ -4,11 +4,12 @@ use std::time::Duration;
 use clap::Parser;
 
 /// CLI/env configuration for `poller-transit-schedule` (transit spec §6,
-/// §13.1): one process per network. Every URL is a public, key-free BODS
-/// or `NaPTAN` download (spec §3), so each has a working default.
+/// §13.1): one process per network. Every URL but TNDS's is a public,
+/// key-free BODS or `NaPTAN` download (spec §3), so each has a working
+/// default; TNDS needs a Traveline login (NET design §5).
 ///
-/// Does not derive `Debug`: the hand impl keeps the Redis credentials
-/// redacted (`RedisArgs`).
+/// Does not derive `Debug`: the hand impl keeps the Redis and TNDS
+/// credentials redacted (`RedisArgs`, `txc_password`).
 #[derive(Parser)]
 #[command(name = "poller-transit-schedule")]
 pub(crate) struct Config {
@@ -17,9 +18,10 @@ pub(crate) struct Config {
     #[arg(long, env = "TRANSIT_NETWORK")]
     pub network: String,
 
-    /// The timetable source adapter. Only `gtfs` is built (`TransXChange`,
-    /// for Nottingham NET, is later work, D6).
-    #[arg(long, env = "TRANSIT_ADAPTER", default_value = "gtfs", value_parser = ["gtfs"])]
+    /// The timetable source adapter: `gtfs` (Metrolink) or `txc`
+    /// (`TransXChange`, Nottingham NET). Must be the network file's
+    /// `adapter`; anything else refuses to start.
+    #[arg(long, env = "TRANSIT_ADAPTER", default_value = "gtfs", value_parser = ["gtfs", "txc"])]
     pub adapter: String,
 
     /// The GTFS zip: the BODS North West region (OGL), filtered to the
@@ -35,6 +37,34 @@ pub(crate) struct Config {
     /// 123 MB on 2026-10-09).
     #[arg(long, env = "TRANSIT_GTFS_MAX_BYTES", default_value_t = 400 * 1024 * 1024)]
     pub gtfs_max_bytes: u64,
+
+    /// The `TransXChange` zip (`TRANSIT_ADAPTER=txc`): the Traveline
+    /// National Dataset's East Midlands region over FTP (OGL; a login), or
+    /// any `https://` zip of TXC documents.
+    #[arg(
+        long,
+        env = "TRANSIT_TXC_URL",
+        default_value = "ftp://ftp.tnds.co.uk/EM.zip"
+    )]
+    pub txc_url: String,
+
+    /// The TXC download's byte cap (400 MiB).
+    #[arg(long, env = "TRANSIT_TXC_MAX_BYTES", default_value_t = 400 * 1024 * 1024)]
+    pub txc_max_bytes: u64,
+
+    /// The FTP login for an `ftp://` TXC URL (TNDS): from the chart's
+    /// `txcCredentials` Secret. Required with an `ftp://` URL.
+    #[arg(long, env = "TRANSIT_TXC_USERNAME", default_value = "")]
+    pub txc_username: String,
+
+    /// Its password (never logged).
+    #[arg(
+        long,
+        env = "TRANSIT_TXC_PASSWORD",
+        default_value = "",
+        hide_env_values = true
+    )]
+    pub txc_password: String,
 
     /// The BODS SIRI-SX bulk archive (a 302 to a signed URL).
     #[arg(
@@ -126,6 +156,45 @@ impl Config {
     pub(crate) fn naptan_url_for(&self, area: &str) -> String {
         self.naptan_url.replace("{area}", area)
     }
+
+    /// Whether the TXC source is TNDS-style FTP (and so needs the login).
+    pub(crate) fn txc_over_ftp(&self) -> bool {
+        self.txc_url.starts_with("ftp://")
+    }
+
+    /// The checks that need the network file (NET design §5, §6): the
+    /// adapter is the file's, an `ftp://` TXC URL has its login, and the
+    /// situations loop runs only for a network with a SIRI-SX participant.
+    pub(crate) fn check_against(
+        &self,
+        network: &crate::network::NetworkConfig,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.adapter == network.adapter.as_str(),
+            "TRANSIT_ADAPTER is {:?} but networks/{}.toml is written for {:?}",
+            self.adapter,
+            network.id,
+            network.adapter.as_str()
+        );
+        if self.adapter == "txc" {
+            anyhow::ensure!(
+                self.txc_url.starts_with("ftp://") || self.txc_url.starts_with("https://"),
+                "TRANSIT_TXC_URL must be ftp:// or https://"
+            );
+            anyhow::ensure!(
+                !self.txc_over_ftp() || !self.txc_username.is_empty(),
+                "TRANSIT_TXC_USERNAME (and TRANSIT_TXC_PASSWORD) are required for an ftp:// \
+                 TRANSIT_TXC_URL: the chart's txcCredentials.existingSecret"
+            );
+        }
+        anyhow::ensure!(
+            !self.situations_enabled || !network.situations.participant_refs.is_empty(),
+            "TRANSIT_SITUATIONS_ENABLED is on but networks/{}.toml names no SIRI-SX \
+             participant: no source publishes its disruptions",
+            network.id
+        );
+        Ok(())
+    }
 }
 
 /// A fraction in `0.0..=1.0`.
@@ -156,6 +225,17 @@ impl std::fmt::Debug for Config {
             .field("adapter", &self.adapter)
             .field("gtfs_url", &self.gtfs_url)
             .field("gtfs_max_bytes", &self.gtfs_max_bytes)
+            .field("txc_url", &self.txc_url)
+            .field("txc_max_bytes", &self.txc_max_bytes)
+            .field("txc_username", &self.txc_username)
+            .field(
+                "txc_password",
+                &if self.txc_password.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
             .field("situations_url", &self.situations_url)
             .field("naptan_url", &self.naptan_url)
             .field("timetable_interval_secs", &self.timetable_interval_secs)
@@ -204,11 +284,14 @@ mod tests {
     }
 
     #[test]
-    fn a_network_is_required_and_only_gtfs_is_built() {
+    fn a_network_is_required_and_the_adapter_is_gtfs_or_txc() {
         assert!(Config::try_parse_from(["p"]).is_err());
         assert!(
-            Config::try_parse_from(["p", "--network", "metrolink", "--adapter", "txc"]).is_err()
+            Config::try_parse_from(["p", "--network", "metrolink", "--adapter", "netex"]).is_err()
         );
+        let txc = Config::try_parse_from(["p", "--network", "net", "--adapter", "txc"]).unwrap();
+        assert_eq!(txc.txc_url, "ftp://ftp.tnds.co.uk/EM.zip");
+        assert_eq!(txc.txc_max_bytes, 419_430_400);
         assert!(
             Config::try_parse_from(["p", "--network", "metrolink", "--horizon-days", "0"]).is_err()
         );
@@ -222,9 +305,72 @@ mod tests {
             "metrolink",
             "--redis-password",
             "super-secret-password",
+            "--txc-password",
+            "tnds-secret-password",
         ])
         .unwrap();
-        assert!(!format!("{config:?}").contains("super-secret-password"));
+        let text = format!("{config:?}");
+        assert!(!text.contains("super-secret-password"));
+        assert!(!text.contains("tnds-secret-password"), "{text}");
+    }
+
+    #[test]
+    fn the_network_file_decides_the_adapter_login_and_situations() {
+        use crate::network::NetworkConfig;
+        let net = NetworkConfig::load("net").unwrap();
+        let metrolink = NetworkConfig::load("metrolink").unwrap();
+        let parse = |args: &[&str]| {
+            Config::try_parse_from(["p", "--network", "net"].iter().chain(args)).unwrap()
+        };
+        // NET: txc, with the TNDS login.
+        let ok = parse(&[
+            "--adapter",
+            "txc",
+            "--txc-username",
+            "u",
+            "--txc-password",
+            "p",
+        ]);
+        ok.check_against(&net).unwrap();
+        // The wrong adapter for the file.
+        assert!(parse(&[]).check_against(&net).is_err());
+        assert!(ok.check_against(&metrolink).is_err());
+        // ftp:// without a login; https:// needs none.
+        assert!(parse(&["--adapter", "txc"]).check_against(&net).is_err());
+        parse(&[
+            "--adapter",
+            "txc",
+            "--txc-url",
+            "https://example.org/em.zip",
+        ])
+        .check_against(&net)
+        .unwrap();
+        assert!(
+            parse(&["--adapter", "txc", "--txc-url", "http://example.org/em.zip"])
+                .check_against(&net)
+                .is_err()
+        );
+        // No SIRI-SX participant publishes NET: its situations loop refuses.
+        let situations = parse(&[
+            "--adapter",
+            "txc",
+            "--txc-username",
+            "u",
+            "--situations-enabled",
+            "true",
+        ]);
+        let err = situations.check_against(&net).unwrap_err();
+        assert!(err.to_string().contains("participant"), "{err}");
+        // Metrolink is unchanged.
+        let metrolink_config = Config::try_parse_from([
+            "p",
+            "--network",
+            "metrolink",
+            "--situations-enabled",
+            "true",
+        ])
+        .unwrap();
+        metrolink_config.check_against(&metrolink).unwrap();
     }
 
     #[test]

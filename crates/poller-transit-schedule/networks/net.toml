@@ -1,0 +1,57 @@
+# Nottingham Express Transit (docs/superpowers/specs/2026-10-24-
+# nottingham-net-design.md). Compiled into poller-transit-schedule with
+# include_str! and checked at startup and in its unit tests
+# (src/network.rs).
+#
+# Sources: NET is in no BODS feed (measured 2026-10-24), so the timetable
+# is the Traveline National Dataset (TNDS) East Midlands TransXChange,
+# filtered to NOC NEXT, and the stops NaPTAN area 940, both under the Open
+# Government Licence v3.0. The colours are Distant Signal's own display
+# choices for each line, not NET's branding (DS uses no NET logos).
+id = "net"
+name = "Nottingham Express Transit"
+# Display only; NOT a SUPPORTED_MODES value (transit spec D4).
+mode = "tram"
+timezone = "Europe/London"
+adapter = "txc"
+nocs = ["NEXT"]
+replacement_bus_route_names = []
+naptan_area = "940"
+atco_prefix = "9400ZZNO"
+# NaPTAN names NET's stops "Basford Tram Stop" (no ShortCommonName) and
+# indicates platforms "NET NE-bound".
+stop_name_suffixes = [" Tram Stop"]
+indicator_prefixes = ["NET "]
+
+[attribution]
+licence = "OGL-UK-3.0"
+text = "Contains public sector information licensed under the Open Government Licence v3.0. Timetables: Traveline National Dataset (Traveline Information Ltd). Stops: NaPTAN (Department for Transport)."
+
+# No BODS SIRI-SX participant publishes NET's disruptions (2026-10-24), so
+# participant_refs is empty and the producer refuses to run the situations
+# loop for NET. Should one appear, add it here and resize the stream's
+# budget first (NET design §11).
+[situations]
+participant_refs = []
+vehicle_modes = ["tram"]
+operator_refs = ["NEXT"]
+
+# txc_line_names and siri_line_refs are NOT observed values: TNDS needs a
+# login (never downloaded while writing this) and no NET situation has
+# been published. They are the likely spellings of each line's name. A
+# TNDS LineName with no alias refuses the feed (unmapped_route) and names
+# it: add it to txc_line_names and release.
+
+[[lines]]
+id = "1"
+name = "Line 1"
+txc_line_names = ["1", "L1", "Line 1"]
+siri_line_refs = ["1", "L1", "NET1", "Line_1"]
+colour = "#0f7b5f"
+
+[[lines]]
+id = "2"
+name = "Line 2"
+txc_line_names = ["2", "L2", "Line 2"]
+siri_line_refs = ["2", "L2", "NET2", "Line_2"]
+colour = "#b8447a"

@@ -11,7 +11,33 @@ use serde::Deserialize;
 
 /// Every network file, by id. Must list exactly `common::transit::NETWORKS`
 /// (a unit test checks it), which the writer's stream pinning reads.
-const FILES: &[(&str, &str)] = &[("metrolink", include_str!("../networks/metrolink.toml"))];
+const FILES: &[(&str, &str)] = &[
+    ("metrolink", include_str!("../networks/metrolink.toml")),
+    ("net", include_str!("../networks/net.toml")),
+];
+
+/// The timetable source adapter a network's file is written for
+/// (`TRANSIT_ADAPTER` must match it).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AdapterKind {
+    /// GTFS (`adapter::gtfs`): BODS, Metrolink.
+    #[default]
+    Gtfs,
+    /// `TransXChange` (`adapter::txc`): TNDS, Nottingham NET.
+    Txc,
+}
+
+impl AdapterKind {
+    /// The `TRANSIT_ADAPTER` value, and the `source` label of
+    /// `transit_feed_fetch_total`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Gtfs => "gtfs",
+            Self::Txc => "txc",
+        }
+    }
+}
 
 /// One network's config.
 #[derive(Debug, Clone, Deserialize)]
@@ -22,15 +48,28 @@ pub(crate) struct NetworkConfig {
     /// Display only (`tram`); not a `SUPPORTED_MODES` value (D4).
     pub mode: String,
     pub timezone: String,
-    /// The GTFS `agency_noc` values whose routes are this network.
+    /// The source adapter this file's line names are for (`gtfs` when
+    /// absent).
+    #[serde(default)]
+    pub adapter: AdapterKind,
+    /// The National Operator Codes whose routes are this network: GTFS
+    /// `agency_noc`, TXC `NationalOperatorCode` (or `OperatorCode`).
     pub nocs: Vec<String>,
-    /// GTFS `route_short_name`s whose trips are replacement buses (Q3:
-    /// on boards, labelled as buses; in no line).
+    /// Route names (GTFS `route_short_name`, TXC `LineName`) whose trips
+    /// are replacement buses (Q3: on boards, labelled as buses; in no
+    /// line).
     pub replacement_bus_route_names: Vec<String>,
     /// The `NaPTAN` `atcoAreaCodes` value of the network's stops.
     pub naptan_area: String,
     /// The ATCO code prefix of every station and platform.
     pub atco_prefix: String,
+    /// Suffixes removed from stop names and headsigns, after the
+    /// ` (<name>)` one (`NaPTAN` names NET's stops `Basford Tram Stop`).
+    #[serde(default)]
+    pub stop_name_suffixes: Vec<String>,
+    /// Prefixes removed from `NaPTAN` platform indicators (`NET NE-bound`).
+    #[serde(default)]
+    pub indicator_prefixes: Vec<String>,
     pub attribution: TransitAttribution,
     pub situations: SituationFilter,
     pub lines: Vec<LineConfig>,
@@ -52,10 +91,16 @@ pub(crate) struct LineConfig {
     /// The local id ([`is_id`]); public id `<network>:<id>`.
     pub id: String,
     pub name: String,
-    /// The GTFS `route_short_name`s that are this line. A route of the
-    /// network matching no line and no replacement-bus name refuses the
-    /// feed (`unmapped_route`): a new line is a config change.
+    /// The GTFS `route_short_name`s that are this line (a `gtfs`
+    /// network). A route of the network matching no line and no
+    /// replacement-bus name refuses the feed (`unmapped_route`): a new line
+    /// is a config change.
+    #[serde(default)]
     pub gtfs_route_names: Vec<String>,
+    /// The TXC `LineName`s that are this line (a `txc` network), refused
+    /// in the same way when unmapped.
+    #[serde(default)]
+    pub txc_line_names: Vec<String>,
     /// The SIRI-SX `LineRef` aliases of this line.
     pub siri_line_refs: Vec<String>,
     /// Display colour, `#rrggbb`.
@@ -116,6 +161,13 @@ impl NetworkConfig {
             self.atco_prefix
         );
         ensure!(!self.lines.is_empty(), "no line");
+        for affix in self
+            .stop_name_suffixes
+            .iter()
+            .chain(&self.indicator_prefixes)
+        {
+            ensure!(!affix.trim().is_empty(), "an empty name suffix or prefix");
+        }
         let mut ids = BTreeSet::new();
         let mut routes: BTreeSet<&str> = self
             .replacement_bus_route_names
@@ -126,15 +178,21 @@ impl NetworkConfig {
         for line in &self.lines {
             ensure!(is_id(&line.id), "line id {:?} is not [a-z0-9-]+", line.id);
             ensure!(ids.insert(line.id.as_str()), "line {:?} twice", line.id);
+            let (names, other, kind) = match self.adapter {
+                AdapterKind::Gtfs => (&line.gtfs_route_names, &line.txc_line_names, "GTFS route"),
+                AdapterKind::Txc => (&line.txc_line_names, &line.gtfs_route_names, "TXC line"),
+            };
+            ensure!(!names.is_empty(), "line {:?} has no {kind} name", line.id);
             ensure!(
-                !line.gtfs_route_names.is_empty(),
-                "line {:?} has no GTFS route name",
-                line.id
+                other.is_empty(),
+                "line {:?} has names for the other adapter (this file is {})",
+                line.id,
+                self.adapter.as_str()
             );
-            for route in &line.gtfs_route_names {
+            for route in names {
                 ensure!(
                     routes.insert(route.as_str()),
-                    "GTFS route name {route:?} claimed twice"
+                    "{kind} name {route:?} claimed twice"
                 );
             }
             for siri in &line.siri_line_refs {
@@ -148,6 +206,51 @@ impl NetworkConfig {
             );
         }
         Ok(())
+    }
+
+    /// The source route names (GTFS `route_short_name` or TXC `LineName`)
+    /// of `line`, for this network's adapter.
+    pub(crate) fn route_names<'a>(&self, line: &'a LineConfig) -> &'a [String] {
+        match self.adapter {
+            AdapterKind::Gtfs => &line.gtfs_route_names,
+            AdapterKind::Txc => &line.txc_line_names,
+        }
+    }
+
+    /// The index of the line `route_name` is, if any.
+    pub(crate) fn line_for_route(&self, route_name: &str) -> Option<usize> {
+        self.lines
+            .iter()
+            .position(|l| self.route_names(l).iter().any(|n| n == route_name))
+    }
+
+    /// A stop name or headsign without the ` (<network name>)` suffix
+    /// (BODS's GTFS) or any of `stop_name_suffixes` (`NaPTAN`'s
+    /// ` Tram Stop`). A name that is only a suffix is kept.
+    pub(crate) fn clean_stop_name(&self, name: &str) -> String {
+        let mut out = crate::adapter::gtfs::clean_name(name, &self.name);
+        for suffix in &self.stop_name_suffixes {
+            if let Some(rest) = out.strip_suffix(suffix.as_str())
+                && !rest.trim().is_empty()
+            {
+                out = rest.trim_end().to_owned();
+            }
+        }
+        out
+    }
+
+    /// A `NaPTAN` platform indicator without any of `indicator_prefixes`
+    /// (`NET NE-bound` to `NE-bound`).
+    pub(crate) fn clean_indicator(&self, indicator: &str) -> String {
+        let trimmed = indicator.trim();
+        for prefix in &self.indicator_prefixes {
+            if let Some(rest) = trimmed.strip_prefix(prefix.as_str())
+                && !rest.trim().is_empty()
+            {
+                return rest.trim().to_owned();
+            }
+        }
+        trimmed.to_owned()
     }
 }
 
@@ -182,8 +285,61 @@ mod tests {
     }
 
     #[test]
+    fn net_is_a_txc_network_of_two_lines() {
+        let config = NetworkConfig::load("net").unwrap();
+        assert_eq!(config.adapter, AdapterKind::Txc);
+        assert_eq!(config.nocs, ["NEXT"]);
+        assert_eq!(config.atco_prefix, "9400ZZNO");
+        let ids: Vec<&str> = config.lines.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(ids, ["1", "2"]);
+        assert_eq!(config.line_for_route("1"), Some(0));
+        assert_eq!(config.line_for_route("Line 2"), Some(1));
+        assert_eq!(config.line_for_route("3"), None);
+        // No SIRI-SX participant publishes NET (NET design §2.3).
+        assert!(config.situations.participant_refs.is_empty());
+        assert_eq!(config.clean_stop_name("Basford Tram Stop"), "Basford");
+        assert_eq!(config.clean_stop_name("Tram Stop"), "Tram Stop");
+        assert_eq!(config.clean_indicator("NET NE-bound"), "NE-bound");
+        assert_eq!(config.clean_indicator("Platform 2"), "Platform 2");
+        assert!(
+            config
+                .attribution
+                .text
+                .contains("Traveline National Dataset")
+        );
+    }
+
+    #[test]
+    fn metrolink_keeps_its_gtfs_names_and_suffix() {
+        let config = metrolink();
+        assert_eq!(config.adapter, AdapterKind::Gtfs);
+        assert_eq!(config.line_for_route("Blue Line"), Some(0));
+        assert_eq!(
+            config.clean_stop_name("Piccadilly (Manchester Metrolink)"),
+            "Piccadilly"
+        );
+        assert_eq!(config.clean_indicator(" To Ashton "), "To Ashton");
+    }
+
+    #[test]
+    fn names_for_the_other_adapter_are_refused() {
+        let mut gtfs = metrolink();
+        gtfs.lines[0].txc_line_names = vec!["1".into()];
+        assert!(gtfs.validate("metrolink").is_err());
+        let mut txc = NetworkConfig::load("net").unwrap();
+        txc.lines[0].txc_line_names.clear();
+        assert!(txc.validate("net").is_err());
+        let mut twice = NetworkConfig::load("net").unwrap();
+        twice.lines[1].txc_line_names = vec!["1".into()];
+        assert!(twice.validate("net").is_err());
+        let mut empty = NetworkConfig::load("net").unwrap();
+        empty.stop_name_suffixes = vec![" ".into()];
+        assert!(empty.validate("net").is_err());
+    }
+
+    #[test]
     fn an_unknown_network_refuses_to_start() {
-        let err = NetworkConfig::load("net").unwrap_err();
+        let err = NetworkConfig::load("supertram").unwrap_err();
         assert!(
             format!("{err:#}").contains("unknown transit network"),
             "{err:#}"

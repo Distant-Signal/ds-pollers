@@ -1,7 +1,7 @@
 //! The timetable loop (transit spec §6.1-6.3), one cycle a day:
 //!
-//! 1. download the network's GTFS to the work dir and parse it on the
-//!    blocking pool ([`fetch_model`]);
+//! 1. download the network's GTFS or `TransXChange` zip to the work dir
+//!    and parse it on the blocking pool ([`fetch_model`]);
 //! 2. apply the `NaPTAN` names (a failure is counted, never fatal);
 //! 3. the feed guard against the last commit on the stream;
 //! 4. build the item (parts, then the commit) with the rail links;
@@ -19,8 +19,10 @@ use common::transit::{TimetableCommit, schema};
 
 use crate::Context;
 use crate::adapter::gtfs::{self, GtfsOptions};
-use crate::adapter::{FeedError, download_to_file};
+use crate::adapter::txc::{self, TxcOptions};
+use crate::adapter::{FeedError, download_to_file, ftp};
 use crate::model::TransitModel;
+use crate::network::AdapterKind;
 use crate::{feed_guard, item, naptan, rail_links};
 
 /// `transit_feed_refused_total{network, reason}`.
@@ -62,35 +64,74 @@ fn fetched(ctx: &Context, source: &'static str, outcome: &'static str) {
     .increment(1);
 }
 
-/// Downloads and parses the network's GTFS.
+/// Downloads the network's timetable zip to `path`: GTFS over HTTPS, or
+/// `TransXChange` over HTTPS or (TNDS) FTP with the login. The bytes.
+async fn download(ctx: &Context, path: &std::path::Path) -> Result<u64, FeedError> {
+    let config = &ctx.config;
+    match ctx.network.adapter {
+        AdapterKind::Gtfs => {
+            download_to_file(&ctx.client, &config.gtfs_url, path, config.gtfs_max_bytes).await
+        }
+        AdapterKind::Txc if config.txc_over_ftp() => {
+            let login = ftp::Login {
+                user: config.txc_username.clone(),
+                password: config.txc_password.clone(),
+            };
+            ftp::download_to_file(
+                &config.txc_url,
+                &login,
+                path,
+                config.txc_max_bytes,
+                crate::REQUEST_TIMEOUT,
+            )
+            .await
+        }
+        AdapterKind::Txc => {
+            download_to_file(&ctx.client, &config.txc_url, path, config.txc_max_bytes).await
+        }
+    }
+}
+
+/// Downloads and parses the network's timetable with its adapter.
 pub(crate) async fn fetch_model(ctx: &Context) -> Result<TransitModel, FeedError> {
     let path = ctx.config.work_dir.join("feed.zip");
-    let bytes = download_to_file(
-        &ctx.client,
-        &ctx.config.gtfs_url,
-        &path,
-        ctx.config.gtfs_max_bytes,
-    )
-    .await?;
+    let adapter = ctx.network.adapter;
+    let bytes = download(ctx, &path).await?;
     #[expect(
         clippy::cast_precision_loss,
         reason = "a byte count far below 2^53"
     )]
-    metrics::gauge!(metric_name(FEED_BYTES), "network" => ctx.network.id.clone(), "source" => "gtfs")
+    metrics::gauge!(metric_name(FEED_BYTES), "network" => ctx.network.id.clone(), "source" => adapter.as_str())
         .set(bytes as f64);
     let today = common::transit::service_date(Utc::now());
-    let options = GtfsOptions {
-        today,
-        horizon_days: ctx.config.horizon_days,
-        max_entry_bytes: gtfs::MAX_ENTRY_BYTES,
-    };
+    let horizon_days = ctx.config.horizon_days;
     let network = ctx.network.clone();
     let parse_path = path.clone();
     let started = std::time::Instant::now();
     let parsed = tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&parse_path)
             .map_err(|err| FeedError::Io(format!("opening {}: {err}", parse_path.display())))?;
-        gtfs::parse(std::io::BufReader::new(file), &network, &options)
+        let reader = std::io::BufReader::new(file);
+        match adapter {
+            AdapterKind::Gtfs => gtfs::parse(
+                reader,
+                &network,
+                &GtfsOptions {
+                    today,
+                    horizon_days,
+                    max_entry_bytes: gtfs::MAX_ENTRY_BYTES,
+                },
+            ),
+            AdapterKind::Txc => txc::parse(
+                reader,
+                &network,
+                &TxcOptions {
+                    today,
+                    horizon_days,
+                    max_entry_bytes: txc::MAX_ENTRY_BYTES,
+                },
+            ),
+        }
     })
     .await
     .map_err(|err| FeedError::Io(format!("the parse task failed: {err}")))?;
@@ -122,7 +163,7 @@ async fn enrich(ctx: &Context, model: &mut TransitModel) {
     match nodes {
         Ok(nodes) => {
             fetched(ctx, "naptan", "ok");
-            let changed = naptan::apply(model, &nodes, &ctx.network.name);
+            let changed = naptan::apply(model, &nodes, &ctx.network);
             tracing::info!(network = %ctx.network.id, changed, "applied NaPTAN names");
         }
         Err(err) => {
@@ -186,11 +227,11 @@ pub(crate) async fn poll_once(ctx: &Context) -> anyhow::Result<()> {
     let produced_at = Utc::now();
     let mut model = match fetch_model(ctx).await {
         Ok(model) => {
-            fetched(ctx, "gtfs", "ok");
+            fetched(ctx, ctx.network.adapter.as_str(), "ok");
             model
         }
         Err(err) => {
-            fetched(ctx, "gtfs", "error");
+            fetched(ctx, ctx.network.adapter.as_str(), "error");
             count(ctx, FEED_REFUSED, [("reason", err.reason())]);
             return Err(err.into());
         }
@@ -235,7 +276,7 @@ pub(crate) async fn poll_once(ctx: &Context) -> anyhow::Result<()> {
         ctx.timetable.producer_id(),
         produced_at,
         item::SourceTag {
-            url_kind: "gtfs",
+            url_kind: ctx.network.adapter.as_str(),
             refresh: forced.then_some(ctx.config.timetable_refresh.as_str()),
         },
     )?;

@@ -9,7 +9,8 @@
 //! unsent older one, so a situations snapshot must not supersede an unsent
 //! timetable):
 //!
-//! - **timetable** (daily): the source adapter (GTFS), `NaPTAN` names and the
+//! - **timetable** (daily): the source adapter (GTFS, or `TransXChange`
+//!   for NET), `NaPTAN` names and the
 //!   rail links, as `transit-timetable/1` parts plus one
 //!   `transit-timetable-commit/1`, one item (plan tasks 2.2, 2.3);
 //! - **situations** (every 5 minutes): SIRI-SX as `transit-situations/1`
@@ -43,7 +44,8 @@ const COMPONENT: &str = "poller-transit-schedule";
 /// How long shutdown waits for an unsent snapshot.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// One whole download (the North West GTFS was 159 MB on 2026-10-14).
+/// One whole download (the North West GTFS was 159 MB on 2026-10-14), over
+/// HTTPS or (TNDS) FTP.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// The `User-Agent` of every request: honest and identifying (LEG-21).
@@ -88,6 +90,7 @@ async fn run() -> anyhow::Result<()> {
 
     let config = Config::parse();
     let network = NetworkConfig::load(&config.network)?;
+    config.check_against(&network)?;
     let stream = ingest_stream::streams::transit(&network.id);
     tracing::info!(network = %network.network_id(), %stream, ?config, "starting");
     let redis = config

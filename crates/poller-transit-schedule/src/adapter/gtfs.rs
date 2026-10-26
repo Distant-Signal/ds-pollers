@@ -245,11 +245,7 @@ pub(crate) fn parse<R: Read + Seek>(
             .any(|n| n == name)
         {
             RouteKind::ReplacementBus
-        } else if let Some(line) = network
-            .lines
-            .iter()
-            .position(|l| l.gtfs_route_names.iter().any(|n| n == name))
-        {
+        } else if let Some(line) = network.line_for_route(name) {
             RouteKind::Line(line)
         } else {
             return Err(FeedError::UnmappedRoute(name.to_owned()));
@@ -274,11 +270,8 @@ pub(crate) fn parse<R: Read + Seek>(
             "1" => Direction::Inbound,
             _ => Direction::Outbound,
         };
-        let headsign = Some(clean_name(
-            field(rec, cols.get("trip_headsign")),
-            &network.name,
-        ))
-        .filter(|h| !h.is_empty());
+        let headsign = Some(network.clean_stop_name(field(rec, cols.get("trip_headsign"))))
+            .filter(|h| !h.is_empty());
         trip_index.insert(trip_id.clone(), trips.len());
         trip_ids.push(trip_id);
         trips.push(TripInfo {
@@ -321,7 +314,7 @@ pub(crate) fn parse<R: Read + Seek>(
 
     // 4. Stops.
     let used: BTreeSet<&str> = stop_names.iter().map(String::as_str).collect();
-    let stops = read_stops(&mut archive, cap, &used, &network.name)?;
+    let stops = read_stops(&mut archive, cap, &used, network)?;
 
     // 5. Service dates.
     let from = options
@@ -346,7 +339,7 @@ pub(crate) fn parse<R: Read + Seek>(
 
     // 6, 7.
     let (patterns, trip_rows) = fold(network, &trips, &trip_ids, &mut calls, &stop_names)?;
-    let lines = line_orders(network, &patterns, &trip_rows, &stops);
+    let lines = line_orders(network, &patterns, &trip_rows, |stop| stops.station(stop));
     Ok(TransitModel {
         lines,
         stops: stops.into_rows(),
@@ -388,7 +381,7 @@ fn read_stops<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     cap: u64,
     used: &BTreeSet<&str>,
-    network_name: &str,
+    network: &NetworkConfig,
 ) -> Result<Stops, FeedError> {
     struct Row {
         name: String,
@@ -459,7 +452,7 @@ fn read_stops<R: Read + Seek>(
                     stop_id: station.clone(),
                     kind: StopKind::Station,
                     parent_stop_id: None,
-                    name: clean_name(&parent.unwrap_or(platform).name, network_name),
+                    name: network.clean_stop_name(&parent.unwrap_or(platform).name),
                     indicator: None,
                     lat: parent.and_then(|p| p.lat).or(platform.lat),
                     lon: parent.and_then(|p| p.lon).or(platform.lon),
@@ -472,7 +465,7 @@ fn read_stops<R: Read + Seek>(
                 stop_id: id.clone(),
                 kind: StopKind::Platform,
                 parent_stop_id: station.clone(),
-                name: clean_name(&platform.name, network_name),
+                name: network.clean_stop_name(&platform.name),
                 indicator: None,
                 lat: platform.lat,
                 lon: platform.lon,
@@ -668,11 +661,13 @@ fn fold(
 /// Each configured line, with its station order per direction (spec §6.2
 /// step 10): the longest pattern's stations, then each other pattern's
 /// missing stations inserted after the station they follow there.
-fn line_orders(
+/// `station` gives a call's station (itself when it has none). Shared by
+/// every adapter.
+pub(crate) fn line_orders(
     network: &NetworkConfig,
     patterns: &[TransitPattern],
     trips: &[TransitTrip],
-    stops: &Stops,
+    station: impl Fn(&str) -> String,
 ) -> Vec<TransitLine> {
     let mut lines = Vec::with_capacity(network.lines.len());
     for (n, line) in network.lines.iter().enumerate() {
@@ -684,7 +679,7 @@ fn line_orders(
                 .map(|p| {
                     let mut seq: Vec<String> = Vec::new();
                     for call in &p.stops {
-                        let station = stops.station(&call.stop_id);
+                        let station = station(&call.stop_id);
                         if seq.last() != Some(&station) {
                             seq.push(station);
                         }

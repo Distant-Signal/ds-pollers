@@ -1,14 +1,16 @@
 //! Source adapters (transit spec §6.2): each turns a network's published
-//! timetable into a [`crate::model::TransitModel`]. Only GTFS is built
-//! ([`gtfs`]); `TransXChange` (Nottingham NET, D6) would produce the same
-//! model.
+//! timetable into a [`crate::model::TransitModel`]: GTFS ([`gtfs`],
+//! Metrolink from BODS) and `TransXChange` ([`txc`], Nottingham NET from
+//! TNDS, fetched over FTP by [`ftp`]; NET design §4, §5).
 //!
 //! Upstream data is untrusted (spec §13.5): every download is capped, and
 //! every zip entry is read through a cap ([`CappedReader`]), so a zip bomb
 //! costs bounded time and the parse streams, never holding a whole file.
 
+pub(crate) mod ftp;
 pub(crate) mod gtfs;
 pub(crate) mod sirisx;
+pub(crate) mod txc;
 
 use std::io::Read;
 use std::path::Path;
