@@ -25,7 +25,7 @@ metrics = "0.24"
 quick-xml = "0.41.0"
 # Reading the stream back (its cursor, the feed guard's baseline): the
 # version ingest-stream uses.
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.8", features = ["tokio-comp", "connection-manager"] }
 # The downloads (poller-irish-rail-gtfs' features); streamed to a file.
 reqwest = { version = "0.13.4", default-features = false, features = ["native-tls", "gzip"] }
 serde = { version = "1.0.228", features = ["derive"] }

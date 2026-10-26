@@ -19,7 +19,7 @@ ds-store = { path = "../ds-store" }
 dotenvy = "0.15.7"
 metrics = "0.24"
 quick-xml = { version = "0.41.0", features = ["serialize"] }
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.8", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls", "gzip"] }
 serde = { version = "1.0.228", features = ["derive"] }
 sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "tls-native-tls"] }
