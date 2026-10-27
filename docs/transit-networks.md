@@ -122,6 +122,91 @@ Each step is its own Ranma-Config change. Wait for each to settle.
    Secret key removed.
 4. To remove the data too, see "Turning a network off for good".
 
+## Trip planning
+
+`/Trips/plan` can ride a network's trams anywhere in a journey (rail into
+Piccadilly, the tram to Victoria, rail on). Design:
+[the transit trip planning spec](superpowers/specs/2026-10-24-transit-trip-planning-design.md);
+code: `crates/api/src/data/transit_planning.rs`. Off by default:
+
+| Value | Default | What it does |
+| --- | --- | --- |
+| `api.tripPlanTransitNetworks` (`API_TRIP_PLAN_TRANSIT_NETWORKS`) | `[]` | The networks whose trams join the planner's day graph. Empty: the graph, its cache key and every response are as before. Only `metrolink` (the chart and the api refuse anything else). |
+| `api.tripPlanTransitChangeMinutes` (`TRIP_PLAN_TRANSIT_CHANGE_MINUTES`) | `2` | Extra minutes on the tram side of a rail-to-tram or tram-to-rail change (0-15). |
+
+With the list set, a request plans with trams only when it sends
+`transit=true` or names a tram stop (`9400ZZMAPIC`) as its origin or
+destination; any other request gets a byte-identical response. The
+frontend sends `transit=true` from phase M3 on, and offers Metrolink stops
+as ends only for networks `/public/transit/networks` marks `tripPlanning`,
+so `api.transitNetworks` must list the network too.
+
+Deploy notes: no migration, no grant change (the api role already reads
+`transit_*`, `stations` and `line_status`). The api restarts for the new
+values. Each cached date grows by the network's day (about 6 MB for a
+Metrolink weekday); the cache keeps 2.
+
+### Measuring before the rollout (phase M4)
+
+Run on a copy of production, never on production: a local Postgres
+restored from a recent backup, or a fresh clone. Build the api in release
+mode (`cargo build --release -p api`) and, with the same environment both
+times except the switch:
+
+```sh
+# 1. Off.
+API_TRIP_PLAN_TRANSIT_NETWORKS= ./target/release/api &
+uv run scripts/measure-transit-trip-planning.py measure \
+  --api http://127.0.0.1:8080 --date <a weekday within the feed's horizon> \
+  --label off --out off.json --pid $!
+kill %1
+
+# 2. On (a fresh process, so the RSS is comparable).
+API_TRIP_PLAN_TRANSIT_NETWORKS=metrolink ./target/release/api &
+uv run scripts/measure-transit-trip-planning.py measure \
+  --api http://127.0.0.1:8080 --date <the same weekday> \
+  --label on --transit --out on.json --pid $!
+kill %1
+
+# 3. The budget (spec §10): RSS at most +25 MB, searches at most +10%,
+#    and every response without transit=true byte-identical.
+uv run scripts/measure-transit-trip-planning.py compare off.json on.json
+```
+
+Also look at `api_trip_plan_transit_connections{network="metrolink"}` on
+the api's metrics port (about 27,600 on a weekday, spec §3.1) and the
+`options` worst case against `api.tripPlanMaxOptionsSearchSize`. Put only
+the figures in the PR or the card, never feed rows or responses. The
+in-repo benchmark on hand-made data is
+`cargo test --release -p api --test transit_planning_budget -- --ignored --nocapture --test-threads=1`.
+
+### Rollout (Metrolink)
+
+1. Merge M1 and M2 (dark). The list is empty, so nothing changes; the
+   golden test pins that.
+2. With the measurement above within budget, set
+   `api.tripPlanTransitNetworks: [metrolink]` in Ranma-Config (and keep
+   `api.transitNetworks: [metrolink]`). The api restarts. No client opts in
+   yet, so nothing visible changes.
+3. Check, read-only:
+   - `api_trip_plan_graph_cache_total{result="miss"}`: once per date, and
+     once more after a new tram feed activates (the cache key moves);
+   - `api_trip_plan_transit_connections{network="metrolink"}` about 27k on
+     a weekday;
+   - `api_trip_plan_transit_networks_skipped_total` flat on dates inside
+     the horizon (`reason` `outside_horizon` is expected past 60 days,
+     `no_service_day` on a feed gap, `error` never);
+   - the api's RSS within the budget.
+
+   Then make one request by hand with `transit=true` (rail into
+   Piccadilly, the tram to Victoria):
+   `/Trips/plan?origin=SPT&destination=LDS&date=<today>&departAfter=08:00&transit=true`.
+4. Merge M3 (the frontend sends `transit=true`). After a day of use with
+   no errors, Metrolink trams are in public plans.
+5. **Rollback:** `api.tripPlanTransitNetworks: []`. The api restarts with
+   the old graph and every response is as before. Saved untracked tram
+   legs stay valid (plain untracked legs).
+
 ## Nottingham Express Transit (net)
 
 NET is in no BODS feed (measured 2026-10-24, NET design §2), so its
