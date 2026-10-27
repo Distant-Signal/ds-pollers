@@ -45,12 +45,14 @@ use budget::{BudgetLimit, RequestBudget};
 use chrono::Utc;
 use clap::Parser;
 use common::ingest::{self, RDM_AUTH_HEADER_NAME};
-use common::{StationDeparture, StationSample, TrackedStopBoard};
+use common::{
+    StationArrival, StationDeparture, StationSample, TrackedStopArrivalBoard, TrackedStopBoard,
+};
 use config::Config;
 use platform_history::PlatformHistory;
 use reqwest::{Client, StatusCode};
 use rotation::Rotation;
-use sink::SampleSink;
+use sink::{SampleSink, TrackedBoards};
 use tracked_stops::Cadence;
 
 /// Per-request timeout — see the other three pollers' identical rationale.
@@ -154,14 +156,11 @@ async fn run() -> anyhow::Result<()> {
     // The last station list, so a cycle keeps sampling LDBWS while
     // Postgres cannot serve a fresh one.
     let held = Rc::new(RefCell::new(HeldState::default()));
-    // The tracked-stop lane's re-poll pacing (DS-127).
+    // The tracked-stop lane's re-poll pacing (DS-127), and its arrivals
+    // sub-lane's (DS-152).
     let cadence = Rc::new(RefCell::new(Cadence::default()));
-    if config.tracked_stop_poll_enabled {
-        tracing::info!(
-            max_requests_per_cycle = config.tracked_stop_max_requests_per_cycle,
-            "tracked-stop board lane enabled"
-        );
-    }
+    let arrivals_cadence = Rc::new(RefCell::new(Cadence::default()));
+    check_tracked_stop_lanes(&config)?;
     register_tracked_stop_metrics();
 
     // Plan 3a.7: the samples go to `ds:ingest:station-samples` (`sink.rs`),
@@ -184,6 +183,7 @@ async fn run() -> anyhow::Result<()> {
             let budget = Rc::clone(&budget);
             let held = Rc::clone(&held);
             let cadence = Rc::clone(&cadence);
+            let arrivals_cadence = Rc::clone(&arrivals_cadence);
             let progress = &progress;
             let sink = &sink;
             let client = &client;
@@ -199,6 +199,8 @@ async fn run() -> anyhow::Result<()> {
                 ));
                 let mut held_state = std::mem::take(&mut *held.borrow_mut());
                 let mut cadence_state = std::mem::take(&mut *cadence.borrow_mut());
+                let mut arrivals_cadence_state =
+                    std::mem::take(&mut *arrivals_cadence.borrow_mut());
                 let result = poll_once(
                     client,
                     config,
@@ -208,6 +210,7 @@ async fn run() -> anyhow::Result<()> {
                         request_budget: &mut budget_state,
                         held: &mut held_state,
                         cadence: &mut cadence_state,
+                        arrivals_cadence: &mut arrivals_cadence_state,
                     },
                     &ingest::API_STARTUP_WAIT,
                     Some(progress),
@@ -219,11 +222,43 @@ async fn run() -> anyhow::Result<()> {
                 *budget.borrow_mut() = budget_state;
                 *held.borrow_mut() = held_state;
                 *cadence.borrow_mut() = cadence_state;
+                *arrivals_cadence.borrow_mut() = arrivals_cadence_state;
                 result
             }
         },
     )
     .await
+}
+
+/// Logs which tracked-stop lanes are on, and refuses to start the arrivals
+/// sub-lane (DS-152) without its Secret's URL and consumer key: every
+/// request would fail.
+fn check_tracked_stop_lanes(config: &Config) -> anyhow::Result<()> {
+    if config.tracked_stop_poll_enabled {
+        tracing::info!(
+            max_requests_per_cycle = config.tracked_stop_max_requests_per_cycle,
+            "tracked-stop board lane enabled"
+        );
+    }
+    if config.tracked_stop_arrivals_enabled {
+        anyhow::ensure!(
+            config
+                .ldbws_arrivals_url
+                .as_deref()
+                .is_some_and(|url| !url.trim().is_empty())
+                && config
+                    .ldbws_arrivals_consumer_key
+                    .as_ref()
+                    .is_some_and(|key| !key.is_empty()),
+            "TRACKED_STOP_ARRIVALS_ENABLED needs LDBWS_ARRIVALS_URL and \
+             LDBWS_ARRIVALS_CONSUMER_KEY (the arrivals product's Secret)"
+        );
+        tracing::info!(
+            max_requests_per_cycle = config.tracked_stop_arrivals_max_requests_per_cycle,
+            "tracked-stop arrival board lane enabled"
+        );
+    }
+    Ok(())
 }
 
 /// How `common::poller_loop` retries around this poller (2026-10-08).
@@ -264,6 +299,8 @@ struct CycleState<'a> {
     held: &'a mut HeldState,
     /// The tracked-stop lane's pacing (`tracked_stops.rs`).
     cadence: &'a mut Cadence,
+    /// Its arrivals sub-lane's pacing (DS-152).
+    arrivals_cadence: &'a mut Cadence,
 }
 
 /// One cycle: sample as many stations as the budgets allow, then publish
@@ -327,10 +364,20 @@ async fn poll_once(
     }
     // The tracked-stop lane, after the rotation and within its own budget
     // (DS-127). Its boards ride the same snapshot.
-    let tracked = if config.tracked_stop_poll_enabled {
+    let departures = if config.tracked_stop_poll_enabled {
         sample_tracked_stops(client, config, state.cadence, state.platform_history).await
     } else {
         Vec::new()
+    };
+    // Its arrivals sub-lane (DS-152), within its own budget.
+    let arrivals = if config.tracked_stop_arrivals_enabled {
+        sample_tracked_arrivals(client, config, state.arrivals_cadence).await
+    } else {
+        Vec::new()
+    };
+    let tracked = TrackedBoards {
+        departures,
+        arrivals,
     };
     let result = deliver_cycle(config, sink, samples, &tracked, now).await;
     let progressed = match &result {
@@ -371,7 +418,7 @@ async fn deliver_cycle(
     config: &Config,
     sink: &SampleSink,
     samples: Vec<StationSample>,
-    tracked: &[TrackedStopBoard],
+    tracked: &TrackedBoards,
     now: std::time::Instant,
 ) -> anyhow::Result<Vec<(String, std::time::Instant)>> {
     if samples.is_empty() && tracked.is_empty() {
@@ -743,6 +790,21 @@ fn register_tracked_stop_metrics() {
     }
     metrics::counter!(common::metrics::metric_name(TRACKED_STOP_SKIPPED_METRIC)).increment(0);
     metrics::gauge!(common::metrics::metric_name(TRACKED_STOP_TARGETS_METRIC)).set(0.0);
+    for outcome in ["ok", "error"] {
+        metrics::counter!(
+            common::metrics::metric_name(TRACKED_STOP_ARRIVAL_POLLS_METRIC),
+            "outcome" => outcome
+        )
+        .increment(0);
+    }
+    metrics::counter!(common::metrics::metric_name(
+        TRACKED_STOP_ARRIVAL_SKIPPED_METRIC
+    ))
+    .increment(0);
+    metrics::gauge!(common::metrics::metric_name(
+        TRACKED_STOP_ARRIVAL_TARGETS_METRIC
+    ))
+    .set(0.0);
 }
 
 /// The tracked-stop lane (`tracked_stops.rs`): reads the stops in the
@@ -823,7 +885,7 @@ async fn sample_tracked_stops(
         };
         tokio::select! {
             biased;
-            () = tokio::time::sleep(tracked_stops::LANE_TIME_BUDGET) => {
+            () = tokio::time::sleep(tracked_stops::departures_time_budget(config.tracked_stop_arrivals_enabled)) => {
                 tracing::debug!("tracked-stop lane time budget reached");
             }
             () = work => {}
@@ -833,6 +895,161 @@ async fn sample_tracked_stops(
     metrics::counter!(common::metrics::metric_name(TRACKED_STOP_SKIPPED_METRIC))
         .increment(u64::try_from(skipped).unwrap_or(u64::MAX));
     boards
+}
+
+/// `ldbws_tracked_stop_arrival_polls_total{outcome}`: arrival board
+/// requests of the arrivals sub-lane (DS-152), `ok` or `error`.
+const TRACKED_STOP_ARRIVAL_POLLS_METRIC: &str = "ldbws_tracked_stop_arrival_polls_total";
+/// `ldbws_tracked_stop_arrival_skipped_total`: alighting stops due a poll
+/// that the sub-lane's cap or time budget left for the next cycle.
+const TRACKED_STOP_ARRIVAL_SKIPPED_METRIC: &str = "ldbws_tracked_stop_arrival_skipped_total";
+/// `ldbws_tracked_stop_arrival_targets`: alighting stops within the
+/// horizon at the last cycle.
+const TRACKED_STOP_ARRIVAL_TARGETS_METRIC: &str = "ldbws_tracked_stop_arrival_targets";
+
+/// The arrivals sub-lane (`tracked_stops.rs`, DS-152): reads the alighting
+/// stops in the horizon, then polls the arrivals product for the ones due,
+/// soonest arrival first, up to its own cap and
+/// [`tracked_stops::ARRIVALS_TIME_BUDGET`]. A failed read or request is
+/// logged and skipped; the sub-lane never fails the cycle.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a gauge takes f64; the target count stays far below 2^52"
+)]
+async fn sample_tracked_arrivals(
+    client: &Client,
+    config: &Config,
+    cadence: &mut Cadence,
+) -> Vec<TrackedStopArrivalBoard> {
+    let (Some(direct), Some(url), Some(key)) = (
+        &config.reads.direct,
+        config.ldbws_arrivals_url.as_deref(),
+        config.ldbws_arrivals_consumer_key.as_ref(),
+    ) else {
+        return Vec::new();
+    };
+    let now = Utc::now();
+    let targets = match ds_store::reads::tracked_stop_arrival_targets::tracked_stop_arrival_targets(
+        &direct.pool,
+        now,
+        tracked_stops::BEHIND,
+        tracked_stops::HORIZON,
+    )
+    .await
+    {
+        Ok(targets) => targets,
+        Err(err) => {
+            tracing::warn!(error = ?err, "could not read the tracked alighting stops; skipping the arrivals lane");
+            return Vec::new();
+        }
+    };
+    metrics::gauge!(common::metrics::metric_name(
+        TRACKED_STOP_ARRIVAL_TARGETS_METRIC
+    ))
+    .set(targets.len() as f64);
+    let targets: Vec<_> = targets
+        .iter()
+        .map(tracked_stops::arrival_as_target)
+        .collect();
+    cadence.prune(now);
+    let due = cadence.due(&targets, now);
+    let cap =
+        usize::try_from(config.tracked_stop_arrivals_max_requests_per_cycle).unwrap_or(usize::MAX);
+    let mut boards = Vec::new();
+    let mut attempted = 0usize;
+    {
+        let work = async {
+            for target in due.iter().take(cap) {
+                attempted += 1;
+                let (offset, window) = tracked_stops::window(target.departs_at, Utc::now());
+                let request = ArrivalsRequest {
+                    url,
+                    key: key.expose(),
+                    num_rows: config.num_rows,
+                };
+                match fetch_arrivals_window(client, &request, &target.crs, offset, window).await {
+                    Ok(arrivals) => {
+                        let polled_at = Utc::now();
+                        cadence.polled(target, polled_at);
+                        boards.push(TrackedStopArrivalBoard {
+                            train_uid: target.train_uid.clone(),
+                            service_date: target.service_date,
+                            crs: target.crs.clone(),
+                            polled_at,
+                            arrivals,
+                        });
+                        metrics::counter!(
+                            common::metrics::metric_name(TRACKED_STOP_ARRIVAL_POLLS_METRIC),
+                            "outcome" => "ok"
+                        )
+                        .increment(1);
+                    }
+                    Err(err) => {
+                        // Paced like a success, so one bad stop cannot take
+                        // the whole cap every cycle.
+                        cadence.polled(target, Utc::now());
+                        tracing::warn!(crs = %target.crs, error = ?err, "tracked-stop arrival board poll failed");
+                        metrics::counter!(
+                            common::metrics::metric_name(TRACKED_STOP_ARRIVAL_POLLS_METRIC),
+                            "outcome" => "error"
+                        )
+                        .increment(1);
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep(tracked_stops::ARRIVALS_TIME_BUDGET) => {
+                tracing::debug!("tracked-stop arrivals lane time budget reached");
+            }
+            () = work => {}
+        }
+    }
+    let skipped = due.len().saturating_sub(attempted);
+    metrics::counter!(common::metrics::metric_name(
+        TRACKED_STOP_ARRIVAL_SKIPPED_METRIC
+    ))
+    .increment(u64::try_from(skipped).unwrap_or(u64::MAX));
+    boards
+}
+
+/// Where and how to ask the arrivals product (DS-152): the Secret's `url`
+/// and consumer key, and the departure boards' `numRows`.
+struct ArrivalsRequest<'a> {
+    url: &'a str,
+    key: &'a str,
+    num_rows: u32,
+}
+
+/// One `GetArrBoardWithDetails` call for a window of `crs`'s arrival board
+/// (`timeOffset`/`timeWindow` in minutes from now), authenticated with the
+/// arrivals product's consumer key as `x-apikey`. One attempt: a failed
+/// stop is polled again next time.
+async fn fetch_arrivals_window(
+    client: &Client,
+    request: &ArrivalsRequest<'_>,
+    crs: &str,
+    time_offset: i64,
+    time_window: i64,
+) -> anyhow::Result<Vec<StationArrival>> {
+    let url = tracked_stops::arrivals_url(request.url, crs);
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let url = format!(
+        "{url}{separator}numRows={}&timeOffset={time_offset}&timeWindow={time_window}",
+        request.num_rows
+    );
+    let response = client
+        .get(&url)
+        .header(RDM_AUTH_HEADER_NAME, request.key)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("LDBWS arrival board for {crs} failed: {status} {body}");
+    }
+    schema::parse_arrivals(&response.text().await?)
 }
 
 /// One `GetDepBoardWithDetails` call for a window of `crs`'s board:
@@ -1191,6 +1408,11 @@ mod tests {
             sample_max_stations: 0,
             tracked_stop_poll_enabled: false,
             tracked_stop_max_requests_per_cycle: 20,
+            tracked_stop_arrivals_enabled: false,
+            tracked_stop_arrivals_max_requests_per_cycle: 10,
+            ldbws_arrivals_url: None,
+            ldbws_arrivals_consumer_key: None,
+            ldbws_arrivals_consumer_secret: None,
             metrics_port: 9091,
             metrics: common::service_args::MetricsArgs {
                 metrics_enabled: false,
@@ -1272,6 +1494,58 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// The arrivals sub-lane's request (DS-152): the arrivals product's
+    /// URL, narrowed with `timeOffset`/`timeWindow`, with its own key.
+    #[tokio::test]
+    async fn an_arrival_board_asks_the_arrivals_product_with_its_own_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/LDBWS/api/20220120/GetArrBoardWithDetails/LDS"))
+            .and(query_param("numRows", "10"))
+            .and(query_param("timeOffset", "40"))
+            .and(query_param("timeWindow", "15"))
+            .and(wiremock::matchers::header(
+                RDM_AUTH_HEADER_NAME,
+                "fake-arrivals-key",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"trainServices":[{"serviceID":"svc-a","operatorCode":"NT","sta":"10:30","eta":"On time","platform":"4","isCancelled":false,"rsid":"NT123400"}]}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let base = format!("{}/LDBWS/api/20220120", server.uri());
+        let request = ArrivalsRequest {
+            url: &base,
+            key: "fake-arrivals-key",
+            num_rows: 10,
+        };
+        let arrivals = fetch_arrivals_window(&Client::new(), &request, "LDS", 40, 15)
+            .await
+            .expect("an arrival board");
+        assert_eq!(arrivals.len(), 1);
+        assert_eq!(arrivals[0].platform.as_deref(), Some("4"));
+    }
+
+    /// Without a database (or the arrivals Secret) the sub-lane polls
+    /// nothing.
+    #[tokio::test]
+    async fn the_arrivals_lane_without_a_database_polls_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut config = test_config(server.uri(), 10);
+        config.tracked_stop_arrivals_enabled = true;
+        config.ldbws_arrivals_url = Some(server.uri());
+        config.ldbws_arrivals_consumer_key = Some("fake-arrivals-key".into());
+        let boards =
+            sample_tracked_arrivals(&Client::new(), &config, &mut Cadence::default()).await;
+        assert!(boards.is_empty());
     }
 
     /// Without a database the lane has nothing to read and polls nothing.
@@ -1958,6 +2232,7 @@ mod tests {
                     request_budget: &mut self.budget,
                     held: &mut self.held,
                     cadence: &mut Cadence::default(),
+                    arrivals_cadence: &mut Cadence::default(),
                 },
                 &TEST_LIST_WAIT,
                 None,

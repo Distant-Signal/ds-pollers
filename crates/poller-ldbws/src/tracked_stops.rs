@@ -22,6 +22,19 @@
 //! - **Output**: one `tracked-stop-boards/1` row per stop polled, in the
 //!   same snapshot as the cycle's station samples.
 //!
+//! **Arrivals (DS-152).** Departure boards never list a call where the train
+//! terminates or only sets down, which is usually the user's destination.
+//! With `TRACKED_STOP_ARRIVALS_ENABLED`, the lane also asks the LDBWS
+//! arrivals product (`GetArrBoardWithDetails`, its own RDM subscription:
+//! [`arrivals_url`]) for each alighting stop with a booked arrival
+//! ([`ingest_tracked_stop_arrival_targets`]), with the same horizon,
+//! cadence and window (around the booked arrival), its own [`Cadence`],
+//! its own cap (`TRACKED_STOP_ARRIVALS_MAX_REQUESTS_PER_CYCLE`) and
+//! [`ARRIVALS_TIME_BUDGET`]. Output: `tracked-stop-arrival-boards/1` rows in
+//! the same snapshot.
+//!
+//! [`ingest_tracked_stop_arrival_targets`]: ds_store::reads::tracked_stop_arrival_targets
+//!
 //! [`ingest_tracked_stop_targets`]: ds_store::reads::tracked_stop_targets
 
 use std::collections::HashMap;
@@ -50,8 +63,64 @@ const WINDOW_MINUTES: i64 = 15;
 /// LDBWS's `timeOffset` range, in minutes.
 const MAX_OFFSET: i64 = 119;
 const MIN_OFFSET: i64 = -120;
-/// The lane's own share of the cycle's time.
+/// The tracked-stop lanes' share of the cycle's time, both together: the
+/// station rotation has 45 s of the 60 s interval, so the two lanes get 10
+/// s and the cycle ends with 5 s to spare.
 pub(crate) const LANE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// The arrivals sub-lane's part of [`LANE_TIME_BUDGET`] (DS-152), taken
+/// from the departure lane only while the sub-lane is on.
+pub(crate) const ARRIVALS_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The departure lane's time budget: all of [`LANE_TIME_BUDGET`], less
+/// [`ARRIVALS_TIME_BUDGET`] while the arrivals sub-lane is on, so the two
+/// lanes and the 45 s rotation never take the whole 60 s interval.
+pub(crate) fn departures_time_budget(arrivals_enabled: bool) -> std::time::Duration {
+    if arrivals_enabled {
+        LANE_TIME_BUDGET.saturating_sub(ARRIVALS_TIME_BUDGET)
+    } else {
+        LANE_TIME_BUDGET
+    }
+}
+
+/// An arrival target as a [`TrackedStopTarget`] whose `departs_at` is the
+/// booked arrival, so the arrivals sub-lane can reuse [`Cadence`] and
+/// [`window`] as they are (with its own `Cadence`).
+pub(crate) fn arrival_as_target(
+    target: &ds_store::reads::tracked_stop_arrival_targets::TrackedStopArrivalTarget,
+) -> TrackedStopTarget {
+    TrackedStopTarget {
+        train_uid: target.train_uid.clone(),
+        service_date: target.service_date,
+        crs: target.crs.clone(),
+        departs_at: target.arrives_at,
+    }
+}
+
+/// The arrivals product's request URL for `crs`, from the Secret's `url`
+/// (`LDBWS_ARRIVALS_URL`), without the query string:
+///
+/// - a `{crs}` placeholder is replaced by the station;
+/// - else a URL whose last path segment starts with `Get` names the
+///   operation already (`.../GetArrBoardWithDetails`): `/{crs}` is
+///   appended;
+/// - else it is the product's base (`.../LDBWS/api/20220120`):
+///   `/GetArrBoardWithDetails/{crs}` is appended.
+///
+/// A trailing `/` is ignored. `crs` must already be a well-formed code (the
+/// lane only polls those).
+pub(crate) fn arrivals_url(base: &str, crs: &str) -> String {
+    let base = base.trim();
+    if base.contains("{crs}") {
+        return base.replace("{crs}", crs);
+    }
+    let base = base.trim_end_matches('/');
+    let last_segment = base.rsplit('/').next().unwrap_or_default();
+    if last_segment.starts_with("Get") {
+        format!("{base}/{crs}")
+    } else {
+        format!("{base}/GetArrBoardWithDetails/{crs}")
+    }
+}
 
 type StopKey = (String, NaiveDate, String);
 
@@ -183,11 +252,57 @@ mod tests {
     }
 
     #[test]
+    fn the_arrivals_url_follows_the_secret_s_shape() {
+        let base = "https://arrivals.example.invalid/LDBWS/api/20220120";
+        assert_eq!(
+            arrivals_url(base, "LDS"),
+            format!("{base}/GetArrBoardWithDetails/LDS")
+        );
+        assert_eq!(
+            arrivals_url(&format!("{base}/"), "LDS"),
+            format!("{base}/GetArrBoardWithDetails/LDS")
+        );
+        assert_eq!(
+            arrivals_url(&format!("{base}/GetArrivalBoard"), "LDS"),
+            format!("{base}/GetArrivalBoard/LDS")
+        );
+        assert_eq!(
+            arrivals_url(&format!("{base}/GetArrBoardWithDetails/{{crs}}"), "LDS"),
+            format!("{base}/GetArrBoardWithDetails/LDS")
+        );
+    }
+
+    #[test]
+    fn an_arrival_target_is_paced_by_its_booked_arrival() {
+        let arrival = ds_store::reads::tracked_stop_arrival_targets::TrackedStopArrivalTarget {
+            train_uid: "A".to_string(),
+            service_date: NaiveDate::from_ymd_opt(2099, 7, 10).expect("date"),
+            crs: "LDS".to_string(),
+            arrives_at: at(45),
+        };
+        let target = arrival_as_target(&arrival);
+        assert_eq!(target.departs_at, at(45));
+        assert_eq!(Cadence::default().due(&[target], at(0)).len(), 1);
+    }
+
+    #[test]
     fn the_window_opens_five_minutes_before_the_booked_time() {
         assert_eq!(window(at(60), at(0)), (55, 15));
         assert_eq!(window(at(3), at(0)), (-2, 15));
         // Clamped to LDBWS's range.
         assert_eq!(window(at(200), at(0)), (119, 15));
         assert_eq!(window(at(-200), at(0)), (-120, 15));
+    }
+
+    #[test]
+    fn the_two_lanes_share_one_ten_second_budget() {
+        assert_eq!(
+            departures_time_budget(false),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            departures_time_budget(true) + ARRIVALS_TIME_BUDGET,
+            LANE_TIME_BUDGET
+        );
     }
 }

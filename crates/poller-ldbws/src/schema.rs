@@ -246,6 +246,72 @@ pub(crate) fn parse_departures(json: &str) -> Result<Vec<StationDeparture>> {
         .collect())
 }
 
+/// One `trainServices` item of an RDM arrival board
+/// (`GetArrBoardWithDetails`, DS-152): the departure board's service item
+/// with `sta`/`eta` instead of `std`/`etd`, and `previousCallingPoints`
+/// instead of `subsequentCallingPoints` (not kept: the api matches a row by
+/// RSID and time, `api::data::stop_board`).
+#[derive(Debug, Deserialize)]
+struct RdmArrivalItem {
+    #[serde(rename = "serviceID")]
+    service_id: String,
+    #[serde(default, rename = "operatorCode")]
+    operator_code: Option<String>,
+    #[serde(default)]
+    origin: Vec<RdmServiceLocation>,
+    #[serde(default)]
+    sta: Option<String>,
+    #[serde(default)]
+    eta: Option<String>,
+    #[serde(default, rename = "isCancelled")]
+    is_cancelled: bool,
+    #[serde(default)]
+    platform: Option<String>,
+    #[serde(default)]
+    rsid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RdmArrivalBoard {
+    #[serde(default, rename = "trainServices")]
+    train_services: Vec<RdmArrivalItem>,
+}
+
+/// Maps one RDM `GetArrBoardWithDetails` JSON body into
+/// `common::StationArrival`s (DS-152). A row with no `sta` (a service that
+/// only departs from here) is left out: it is not an arrival. Blank strings
+/// are stored as absent.
+pub(crate) fn parse_arrivals(json: &str) -> Result<Vec<common::StationArrival>> {
+    fn non_blank(value: Option<&str>) -> Option<String> {
+        value
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    }
+    let board: RdmArrivalBoard = serde_json::from_str(json)?;
+    Ok(board
+        .train_services
+        .into_iter()
+        .filter_map(|service| {
+            let scheduled = non_blank(service.sta.as_deref())?;
+            Some(common::StationArrival {
+                service_id: service.service_id,
+                operator: service.operator_code.unwrap_or_default(),
+                origin_crs: service
+                    .origin
+                    .first()
+                    .and_then(|o| non_blank(Some(&o.crs)))
+                    .map(|crs| crs.to_ascii_uppercase()),
+                scheduled,
+                estimated: non_blank(service.eta.as_deref()).unwrap_or_default(),
+                is_cancelled: service.is_cancelled,
+                platform: non_blank(service.platform.as_deref()),
+                rsid: non_blank(service.rsid.as_deref()),
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,5 +673,88 @@ mod tests {
         assert_eq!(stored["rsid"], "GW123500");
         let back: StationDeparture = serde_json::from_value(stored).unwrap();
         assert_eq!(back.calling_points, departures[1].calling_points);
+    }
+
+    /// An arrival board in the shape of the RDM `GetArrBoardWithDetails`
+    /// schema (made-up services).
+    const ARRIVALS_JSON: &str = r#"
+        {
+            "generatedAt": "2026-10-26T10:00:00Z",
+            "locationName": "Leeds",
+            "crs": "LDS",
+            "trainServices": [
+                {
+                    "serviceID": "1234567LEEDS___",
+                    "operator": "Northern",
+                    "operatorCode": "NT",
+                    "origin": [{"locationName": "York", "crs": "YRK"}],
+                    "destination": [{"locationName": "Leeds", "crs": "LDS"}],
+                    "sta": "10:30",
+                    "eta": "10:34",
+                    "platform": "12",
+                    "isCancelled": false,
+                    "rsid": "NT123400",
+                    "previousCallingPoints": [
+                        {"callingPoint": [{"locationName": "York", "crs": "YRK", "st": "10:00", "at": "On time"}]}
+                    ]
+                },
+                {
+                    "serviceID": "7654321LEEDS___",
+                    "operatorCode": "TP",
+                    "origin": [{"locationName": "Hull", "crs": "HUL"}],
+                    "sta": "10:41",
+                    "eta": "Cancelled",
+                    "platform": null,
+                    "isCancelled": true
+                },
+                {
+                    "serviceID": "1111111LEEDS___",
+                    "operatorCode": "NT",
+                    "std": "10:45",
+                    "etd": "On time"
+                }
+            ]
+        }
+    "#;
+
+    #[test]
+    fn parses_an_arrival_board() {
+        let arrivals = parse_arrivals(ARRIVALS_JSON).expect("arrivals parse");
+        assert_eq!(
+            arrivals,
+            vec![
+                common::StationArrival {
+                    service_id: "1234567LEEDS___".to_string(),
+                    operator: "NT".to_string(),
+                    origin_crs: Some("YRK".to_string()),
+                    scheduled: "10:30".to_string(),
+                    estimated: "10:34".to_string(),
+                    is_cancelled: false,
+                    platform: Some("12".to_string()),
+                    rsid: Some("NT123400".to_string()),
+                },
+                common::StationArrival {
+                    service_id: "7654321LEEDS___".to_string(),
+                    operator: "TP".to_string(),
+                    origin_crs: Some("HUL".to_string()),
+                    scheduled: "10:41".to_string(),
+                    estimated: "Cancelled".to_string(),
+                    is_cancelled: true,
+                    platform: None,
+                    rsid: None,
+                },
+            ],
+            "a row with no sta is a departure, not an arrival"
+        );
+    }
+
+    #[test]
+    fn an_empty_arrival_board_parses_to_nothing() {
+        assert!(
+            parse_arrivals(r#"{"crs": "LDS"}"#)
+                .expect("parse")
+                .is_empty()
+        );
+        assert!(parse_arrivals("not json").is_err());
     }
 }

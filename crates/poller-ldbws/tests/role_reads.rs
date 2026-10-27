@@ -3,7 +3,8 @@
 //! per-service step, as the narrow read-only `ldbws_ro` role itself (plan
 //! 4.7), whose only grants are SELECT on the views
 //! `ingest_sample_station_pins`, `ingest_custom_line_stations` and
-//! `ingest_tracked_stop_targets` (DS-127). Proves
+//! `ingest_tracked_stop_targets` (DS-127) and
+//! `ingest_tracked_stop_arrival_targets` (DS-152). Proves
 //! the schema gate and the sample-station queries against
 //! exactly those grants. Read-only: no fixtures.
 
@@ -58,4 +59,20 @@ async fn the_tracked_stop_targets_read_runs_as_the_role() {
     )
     .await
     .expect("SELECT on ingest_tracked_stop_targets");
+}
+
+/// The arrivals sub-lane's read (DS-152): SELECT on the view
+/// `ingest_tracked_stop_arrival_targets` only.
+#[tokio::test]
+#[ignore = "requires a live database; run with DATABASE_URL set and --ignored"]
+async fn the_tracked_stop_arrival_targets_read_runs_as_the_role() {
+    let pool = pool().await;
+    ds_store::reads::tracked_stop_arrival_targets::tracked_stop_arrival_targets(
+        &pool,
+        chrono::Utc::now(),
+        chrono::Duration::minutes(10),
+        chrono::Duration::hours(2),
+    )
+    .await
+    .expect("SELECT on ingest_tracked_stop_arrival_targets");
 }

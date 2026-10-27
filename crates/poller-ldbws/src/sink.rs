@@ -23,12 +23,26 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use common::ingest::DataRejected;
-use common::{StationSample, TrackedStopBoard};
+use common::{StationSample, TrackedStopArrivalBoard, TrackedStopBoard};
 use ingest_stream::SchemaId;
 use ingest_stream::envelope::EnvelopeError;
 use ingest_stream::snapshot::{ROWS_PER_PART, Snapshot, SnapshotProducer};
 
 use crate::config::Config;
+
+/// One cycle's tracked-stop boards: the departure lane's (DS-127) and the
+/// arrivals sub-lane's (DS-152). Both ride the cycle's snapshot.
+#[derive(Debug, Default)]
+pub(crate) struct TrackedBoards {
+    pub departures: Vec<TrackedStopBoard>,
+    pub arrivals: Vec<TrackedStopArrivalBoard>,
+}
+
+impl TrackedBoards {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.departures.is_empty() && self.arrivals.is_empty()
+    }
+}
 
 /// The schema of a station-samples part.
 fn schema() -> SchemaId {
@@ -65,7 +79,7 @@ impl SampleSink {
     pub(crate) async fn deliver(
         &self,
         samples: &[StationSample],
-        tracked: &[TrackedStopBoard],
+        tracked: &TrackedBoards,
         budget: Duration,
     ) -> anyhow::Result<()> {
         let snapshot = match encode(&self.stream, samples, tracked) {
@@ -96,17 +110,25 @@ fn tracked_schema() -> SchemaId {
     SchemaId::new(common::TRACKED_STOP_BOARDS_SCHEMA, 1).expect("valid schema id")
 }
 
+/// The schema of a tracked-stop arrival boards part (DS-152).
+fn arrivals_schema() -> SchemaId {
+    #[expect(clippy::expect_used, reason = "a constant, valid schema id")]
+    SchemaId::new(common::TRACKED_STOP_ARRIVAL_BOARDS_SCHEMA, 1).expect("valid schema id")
+}
+
 /// One cycle's samples as a `station-samples/1` snapshot, plus its
-/// tracked-stop boards as `tracked-stop-boards/1` parts.
+/// tracked-stop boards as `tracked-stop-boards/1` and
+/// `tracked-stop-arrival-boards/1` parts.
 fn encode(
     stream: &SnapshotProducer,
     samples: &[StationSample],
-    tracked: &[TrackedStopBoard],
+    tracked: &TrackedBoards,
 ) -> Result<Snapshot, EnvelopeError> {
     let produced_at = samples
         .iter()
         .map(|sample| sample.polled_at)
-        .chain(tracked.iter().map(|board| board.polled_at))
+        .chain(tracked.departures.iter().map(|board| board.polled_at))
+        .chain(tracked.arrivals.iter().map(|board| board.polled_at))
         .max()
         .unwrap_or_else(Utc::now);
     let mut snapshot = Snapshot::new();
@@ -123,7 +145,15 @@ fn encode(
         &tracked_schema(),
         stream.producer_id(),
         produced_at,
-        tracked,
+        &tracked.departures,
+        ROWS_PER_PART,
+    )?;
+    snapshot.add(
+        stream.stream(),
+        &arrivals_schema(),
+        stream.producer_id(),
+        produced_at,
+        &tracked.arrivals,
         ROWS_PER_PART,
     )?;
     Ok(snapshot)
@@ -161,19 +191,29 @@ mod tests {
     fn tracked_stop_boards_ride_the_same_snapshot_as_their_own_schema() {
         let sink = stream_sink("redis://127.0.0.1:1", "unused");
         let t0: DateTime<Utc> = "2026-10-08T12:00:00Z".parse().unwrap();
-        let tracked = [TrackedStopBoard {
-            train_uid: "W12345".to_owned(),
-            service_date: "2026-10-08".parse().unwrap(),
-            crs: "YRK".to_owned(),
-            polled_at: t0 + TimeDelta::seconds(90),
-            departures: Vec::new(),
-        }];
+        let tracked = TrackedBoards {
+            departures: vec![TrackedStopBoard {
+                train_uid: "W12345".to_owned(),
+                service_date: "2026-10-08".parse().unwrap(),
+                crs: "YRK".to_owned(),
+                polled_at: t0 + TimeDelta::seconds(90),
+                departures: Vec::new(),
+            }],
+            arrivals: vec![TrackedStopArrivalBoard {
+                train_uid: "W12345".to_owned(),
+                service_date: "2026-10-08".parse().unwrap(),
+                crs: "LDS".to_owned(),
+                polled_at: t0 + TimeDelta::seconds(60),
+                arrivals: Vec::new(),
+            }],
+        };
         let snapshot = encode(&sink.stream, &[sample("ZQA", t0)], &tracked).unwrap();
         assert_eq!(
             snapshot.rows(),
             [
                 ("station-samples".to_owned(), 1),
-                ("tracked-stop-boards".to_owned(), 1)
+                ("tracked-stop-boards".to_owned(), 1),
+                ("tracked-stop-arrival-boards".to_owned(), 1)
             ]
         );
         let parts: Vec<Envelope> = snapshot
@@ -196,7 +236,7 @@ mod tests {
         let samples: Vec<StationSample> = (0..250)
             .map(|i| sample(&format!("Z{i:02}"), t0 + TimeDelta::seconds(i)))
             .collect();
-        let snapshot = encode(&sink.stream, &samples, &[]).unwrap();
+        let snapshot = encode(&sink.stream, &samples, &TrackedBoards::default()).unwrap();
         assert_eq!(snapshot.parts().len(), 3);
         assert_eq!(snapshot.rows(), [("station-samples".to_owned(), 250)]);
         let parts: Vec<Envelope> = snapshot
@@ -227,7 +267,7 @@ mod tests {
         let err = sink
             .deliver(
                 &[sample("ZQA", Utc::now())],
-                &[],
+                &TrackedBoards::default(),
                 Duration::from_millis(300),
             )
             .await
@@ -267,7 +307,7 @@ mod tests {
         );
         sink.deliver(
             &[sample("ZQA", t1), sample("ZQB", t1)],
-            &[],
+            &TrackedBoards::default(),
             Duration::from_secs(5),
         )
         .await
@@ -275,9 +315,13 @@ mod tests {
         assert_eq!(sink.last_fetched().await.unwrap(), Some(t1));
 
         let t2 = t1 + TimeDelta::minutes(1);
-        sink.deliver(&[sample("ZQA", t2)], &[], Duration::from_secs(5))
-            .await
-            .unwrap();
+        sink.deliver(
+            &[sample("ZQA", t2)],
+            &TrackedBoards::default(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         assert_eq!(sink.last_fetched().await.unwrap(), Some(t2));
         let entries: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
             .arg(&stream)
