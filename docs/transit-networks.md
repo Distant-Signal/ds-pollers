@@ -178,7 +178,7 @@ the api's metrics port (about 27,600 on a weekday, spec §3.1) and the
 `options` worst case against `api.tripPlanMaxOptionsSearchSize`. Put only
 the figures in the PR or the card, never feed rows or responses. The
 in-repo benchmark on hand-made data is
-`cargo test --release -p api --test transit_planning_budget -- --ignored --nocapture --test-threads=1`.
+`DS_RUN_BUDGET_BENCH=1 cargo test --release -p api --test transit_planning_budget -- --ignored --nocapture --test-threads=1`.
 
 ### Rollout (Metrolink)
 
