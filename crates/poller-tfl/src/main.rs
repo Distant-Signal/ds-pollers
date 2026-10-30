@@ -16,9 +16,10 @@
 //! (docs/superpowers/specs/2026-10-20-tfl-stop-lookup-design.md).
 //!
 //! With `TFL_ROUTES_ENABLED` it also runs a daily route-sequences job
-//! ([`routes`], DS-151): each of those lines' routes in stop order,
-//! published as `tfl-line-routes/1` on the same stream, which the
-//! planner's Tube access legs measure rides along.
+//! ([`routes`], DS-151): each of those lines' routes in stop order, with
+//! (DS-206) the timetabled running time between each two stops, published
+//! as `tfl-line-routes/1` on the same stream, which the planner's Tube
+//! access legs time rides along.
 //!
 //! There is no historical endpoint on `TfL`'s side. Everything this app can
 //! ever show for "the Victoria line last Tuesday" is what this poller
@@ -322,9 +323,12 @@ async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyh
         .increment(1);
         anyhow::bail!("refusing the TfL route sequences: {refusal}");
     }
+    let rows = with_running_times(client, config, rows).await;
+    let timed = rows.iter().filter(|r| r.step_seconds.is_some()).count();
     tracing::info!(
         lines = lines.len(),
         routes = rows.len(),
+        timed,
         invalid,
         "parsed TfL route sequences"
     );
@@ -337,6 +341,56 @@ async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyh
     ))
     .set(fetched_at.timestamp() as f64);
     Ok(())
+}
+
+/// `routes` with their running times (DS-206; [`routes::StepSamples`]):
+/// one `GET /Line/{id}/Timetable/{first}/to/{last}` per route (about 80 a
+/// day, at [`STOPS_CALL_GAP`]), every timetable of a line timing every
+/// route of it. A timetable that fails to fetch or parse is logged and
+/// counted (`tfl_route_timetables_failed_total`) and leaves only its own
+/// samples out: a step no timetable times has no time, and the api falls
+/// back to its distance estimate there.
+async fn with_running_times(
+    client: &Client,
+    config: &Config,
+    mut rows: Vec<common::tfl_routes::TflLineRoute>,
+) -> Vec<common::tfl_routes::TflLineRoute> {
+    let base = config.tfl_base_url.trim_end_matches('/');
+    let mut samples = routes::StepSamples::default();
+    let mut asked = std::collections::BTreeSet::new();
+    for route in &rows {
+        let (Some(first), Some(last)) = (route.stop_ids.first(), route.stop_ids.last()) else {
+            continue;
+        };
+        if !asked.insert((&route.line_id, first, last)) {
+            continue;
+        }
+        tokio::time::sleep(STOPS_CALL_GAP).await;
+        // Line ids are slugs and stop ids `NaPTAN` ids (both checked by
+        // `routes::parse_sequence`): safe in a path.
+        let url = format!("{base}/Line/{}/Timetable/{first}/to/{last}", route.line_id);
+        let added = match fetch_json(client, &url, config, "route-timetable").await {
+            Ok(body) => samples.add_timetable(&route.line_id, &body),
+            Err(err) => Err(err),
+        };
+        if let Err(err) = added {
+            metrics::counter!(common::metrics::metric_name(
+                "tfl_route_timetables_failed_total"
+            ))
+            .increment(1);
+            tracing::warn!(
+                line = %route.line_id,
+                %first,
+                %last,
+                error = %err,
+                "no running times from this TfL timetable"
+            );
+        }
+    }
+    for route in &mut rows {
+        route.step_seconds = samples.step_seconds(route);
+    }
+    rows
 }
 
 /// The row count of the last `schema` snapshot on the stream (the feed
