@@ -2495,4 +2495,167 @@ mod tests {
         }
         assert_eq!(model.lines.len(), 13);
     }
+
+    // --- The DLR and London Trams (the TfL design's P3) ----------------------
+
+    /// A hand-made `TfL`-shaped document of any mode: service `code`, its
+    /// operator, line name and `Mode`, `period`, every day, one pattern
+    /// calling at `stops` two minutes apart, and `journeys` (departures).
+    /// Every id is invented.
+    fn tfl_run_doc(
+        code: &str,
+        (operator, line, mode): (&str, &str, &str),
+        period: (&str, &str),
+        stops: &[&str],
+        journeys: &[&str],
+    ) -> String {
+        let mut points = String::new();
+        let mut links = String::new();
+        for stop in stops {
+            write!(
+                points,
+                "<StopPoint><AtcoCode>{stop}</AtcoCode><Descriptor><CommonName>{stop} DLR Station</CommonName></Descriptor></StopPoint>"
+            )
+            .unwrap();
+        }
+        for (n, pair) in stops.windows(2).enumerate() {
+            let (from, to) = (pair[0], pair[1]);
+            write!(
+                links,
+                "<JourneyPatternTimingLink id=\"JPL{code}-{n}\">\
+                 <From><Activity>pickUpAndSetDown</Activity><StopPointRef>{from}</StopPointRef></From>\
+                 <To><Activity>pickUpAndSetDown</Activity><StopPointRef>{to}</StopPointRef></To>\
+                 <RunTime>PT2M</RunTime></JourneyPatternTimingLink>"
+            )
+            .unwrap();
+        }
+        let mut vjs = String::new();
+        for (n, dep) in journeys.iter().enumerate() {
+            write!(
+                vjs,
+                "<VehicleJourney><VehicleJourneyCode>VJ{n}</VehicleJourneyCode>\
+                 <ServiceRef>{code}</ServiceRef><LineRef>L{code}</LineRef>\
+                 <JourneyPatternRef>JP{code}</JourneyPatternRef>\
+                 <DepartureTime>{dep}</DepartureTime></VehicleJourney>"
+            )
+            .unwrap();
+        }
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<TransXChange xmlns="http://www.transxchange.org.uk/" ModificationDateTime="2026-10-25T20:05:05" SchemaVersion="2.4">
+  <StopPoints>{points}</StopPoints>
+  <JourneyPatternSections><JourneyPatternSection id="JPS{code}">{links}</JourneyPatternSection></JourneyPatternSections>
+  <Operators><Operator id="OId_{operator}"><OperatorCode>{operator}</OperatorCode></Operator></Operators>
+  <Services><Service>
+    <ServiceCode>{code}</ServiceCode>
+    <Lines><Line id="L{code}"><LineName>{line}</LineName></Line></Lines>
+    <OperatingPeriod><StartDate>{start}</StartDate><EndDate>{end}</EndDate></OperatingPeriod>
+    <OperatingProfile><RegularDayType><DaysOfWeek><MondayToSunday /></DaysOfWeek></RegularDayType></OperatingProfile>
+    <RegisteredOperatorRef>OId_{operator}</RegisteredOperatorRef>
+    <Mode>{mode}</Mode>
+    <StandardService><Origin>A</Origin><Destination>B</Destination>
+      <JourneyPattern id="JP{code}"><Direction>outbound</Direction><JourneyPatternSectionRefs>JPS{code}</JourneyPatternSectionRefs></JourneyPattern>
+    </StandardService>
+  </Service></Services>
+  <VehicleJourneys>{vjs}</VehicleJourneys>
+</TransXChange>"#,
+            start = period.0,
+            end = period.1,
+        )
+    }
+
+    #[test]
+    fn the_dlr_and_trams_are_lines_of_the_tfl_network_and_the_rest_is_left_out() {
+        const LONG: (&str, &str) = ("2026-10-24", "2026-12-23");
+        let export = tfl_export(&[
+            (
+                "tfl_25-DLR-base.xml",
+                tfl_run_doc(
+                    "25-DLR-base",
+                    ("DLR", "DLR", "rail"),
+                    LONG,
+                    &["9400ZZDLZBK1", "9400ZZDLZSH1", "9400ZZDLZCW1"],
+                    &["07:00:00", "07:05:00"],
+                ),
+            ),
+            (
+                "tfl_63-TR-base.xml",
+                tfl_run_doc(
+                    "63-TR-base",
+                    ("TCL", "Tram", "tram"),
+                    LONG,
+                    &["9400ZZCRZWB1", "9400ZZCRZEC1", "9400ZZCRZBJ1"],
+                    &["06:00:00", "06:10:00", "06:20:00"],
+                ),
+            ),
+            // A tram part closure (the real one of 24 October to 5
+            // November ran no trams beyond East Croydon): fewer trams on
+            // fewer stops, the whole tram timetable for its days.
+            (
+                "tfl_63-TR-works.xml",
+                tfl_run_doc(
+                    "63-TR-works",
+                    ("TCL", "Tram", "tram"),
+                    ("2026-10-24", "2026-11-05"),
+                    &["9400ZZCRZWB1", "9400ZZCRZEC1"],
+                    &["06:15:00"],
+                ),
+            ),
+            // The cable car and a river bus: other operators, left out
+            // (an unmapped line name would refuse the feed otherwise).
+            (
+                "tfl_71-CAB.xml",
+                tfl_run_doc(
+                    "71-CAB",
+                    ("CAB", "London Cable Car", "rail"),
+                    LONG,
+                    &["9400ZZALZRD1", "9400ZZALZGP1"],
+                    &["07:00:00"],
+                ),
+            ),
+            (
+                "tfl_33-RB1.xml",
+                tfl_run_doc(
+                    "33-RB1",
+                    ("CV", "RB1", "ferry"),
+                    LONG,
+                    &["9300ZZA1", "9300ZZB1"],
+                    &["07:00:00"],
+                ),
+            ),
+        ]);
+        let model = parse(Cursor::new(export), &tfl(), &options("2026-10-29")).unwrap();
+        let at = |h: i32, m: i32| h * 3600 + m * 60;
+        let during = trips_on(&model, "2026-10-30");
+        assert_eq!(during["dlr"], [at(7, 0), at(7, 5)]);
+        assert_eq!(during["tram"], [at(6, 15)]);
+        let after = trips_on(&model, "2026-11-06");
+        assert_eq!(after["tram"], [at(6, 0), at(6, 10), at(6, 20)]);
+        assert_eq!(after.keys().collect::<Vec<_>>(), ["dlr", "tram"]);
+        // Every stop is the DLR's or the trams'.
+        assert!(
+            model
+                .stops
+                .iter()
+                .all(|s| s.stop_id.starts_with("9400ZZDL") || s.stop_id.starts_with("9400ZZCR")),
+            "{:?}",
+            model.stops
+        );
+        // Their lines and modes, with the network's other lines empty.
+        let served: Vec<(&str, Option<&str>)> = model
+            .lines
+            .iter()
+            .filter(|l| !l.directions.is_empty())
+            .map(|l| (l.line_id.as_str(), l.mode.as_deref()))
+            .collect();
+        assert_eq!(served, [("dlr", Some("dlr")), ("tram", Some("tram"))]);
+        // DLR stations' names lose " DLR Station" (from NaPTAN later; the
+        // document's own names until then).
+        let bank = model
+            .stops
+            .iter()
+            .find(|s| s.stop_id == "9400ZZDLZBK")
+            .unwrap();
+        assert_eq!(bank.name, "9400ZZDLZBK1");
+    }
 }

@@ -372,7 +372,21 @@ Each step its own Ranma-Config change; no secret but the Redis password.
    lines, about 7,800 patterns and 58,000 trips; `transit-tfl-timetable`
    fresh; `transit_feed_refused_total{network="tfl"}` flat. Compare one
    line's trips on a day TfL's status reports planned work with TfL's
-   own journey planner.
+   own journey planner, and the DLR and the trams too (read-only):
+
+   ```sql
+   SELECT t.line_id, count(*) FROM transit_trips t
+     JOIN transit_networks n ON n.network = t.network AND n.active_feed_version = t.feed_version
+     JOIN transit_service_days d ON d.network = t.network AND d.feed_version = t.feed_version
+      AND d.service_id = t.service_id AND d.service_date = CURRENT_DATE
+    WHERE t.network = 'tfl' GROUP BY 1 ORDER BY 1;
+   ```
+
+   On 2026-11-04 (a Wednesday with the tram part closure of 24 October to
+   5 November) TfL's export gave 1,584 DLR and 292 tram trips; a normal
+   weekday has 707 trams. A line missing from the list on a day it runs
+   means its file was refused or filtered: look for `unmapped_route` and
+   the operator codes (`LUL`, `DLR`, `TCL`) in the producer's log.
 4. **Public.** After a day with the timetable applied:
    `api.transitNetworks: [metrolink, tfl]`. "Trams and metros" lists
    "London (TfL)"; `/lines/tfl-<line>` links each Tube, DLR and tram
