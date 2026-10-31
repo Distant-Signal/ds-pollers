@@ -87,6 +87,8 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     common::logging::init(COMPONENT);
+    // See `timetable_cycle`.
+    common::heap::pin_mmap_threshold();
 
     let config = Config::parse();
     let network = NetworkConfig::load(&config.network)?;
@@ -148,7 +150,7 @@ async fn run() -> anyhow::Result<()> {
         false,
         ctx.config.metrics_port,
         &progress,
-        || timetable::poll_once(&ctx),
+        || timetable_cycle(&ctx),
     );
     let situations_loop = async {
         if !ctx.config.situations_enabled {
@@ -182,6 +184,23 @@ async fn run() -> anyhow::Result<()> {
         );
     }
     let _ = ctx.situations.shutdown(SHUTDOWN_GRACE).await;
+    result
+}
+
+/// One timetable cycle, then its freed heap back to the kernel. The parse
+/// peaks at hundreds of MiB (332 MiB on `TfL`'s export) and is freed a moment
+/// later, but glibc kept it resident for the rest of the day (313 MiB an
+/// hour after a run, 2026-10-31). With the mmap threshold pinned at startup
+/// the big buffers are their own mappings, and the trim returns the rest
+/// (`common::heap`).
+async fn timetable_cycle(ctx: &Context) -> anyhow::Result<()> {
+    let result = timetable::poll_once(ctx).await;
+    // The cycle's model, parts and baseline are dropped by now.
+    common::heap::release_freed_memory();
+    tracing::debug!(
+        rss_bytes = common::heap::resident_set_bytes(),
+        "released the timetable cycle's freed heap"
+    );
     result
 }
 
