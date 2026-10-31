@@ -14,6 +14,7 @@ use serde::Deserialize;
 const FILES: &[(&str, &str)] = &[
     ("metrolink", include_str!("../networks/metrolink.toml")),
     ("net", include_str!("../networks/net.toml")),
+    ("tfl", include_str!("../networks/tfl.toml")),
 ];
 
 /// The timetable source adapter a network's file is written for
@@ -26,6 +27,21 @@ pub(crate) enum AdapterKind {
     Gtfs,
     /// `TransXChange` (`adapter::txc`): TNDS, Nottingham NET.
     Txc,
+}
+
+/// How a TXC network's overlapping documents share a line's dates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum OverrideRule {
+    /// Only a later document of the same `ServiceCode` takes over (TNDS,
+    /// NET design §4.4).
+    #[default]
+    ServiceCode,
+    /// Also: on each date, only the active document with the shortest
+    /// `OperatingPeriod` runs each line (`TfL`, whose engineering-work and
+    /// bank holiday timetables are whole files over the base file's dates;
+    /// docs/superpowers/specs/2026-10-30-tfl-transit-design.md §3).
+    NarrowestPeriod,
 }
 
 impl AdapterKind {
@@ -61,8 +77,17 @@ pub(crate) struct NetworkConfig {
     pub replacement_bus_route_names: Vec<String>,
     /// The `NaPTAN` `atcoAreaCodes` value of the network's stops.
     pub naptan_area: String,
-    /// The ATCO code prefix of every station and platform.
-    pub atco_prefix: String,
+    /// The ATCO code prefixes of the network's stations and platforms
+    /// (one string, or a list: `TfL`'s Underground, DLR and trams).
+    #[serde(deserialize_with = "one_or_many")]
+    pub atco_prefix: Vec<String>,
+    /// A TXC zip of zips (`TfL`'s Journey Planner export): the one inner
+    /// zip whose name starts with this is the feed.
+    #[serde(default)]
+    pub inner_zip_prefix: Option<String>,
+    /// How overlapping TXC documents share a line's dates.
+    #[serde(default)]
+    pub override_rule: OverrideRule,
     /// Suffixes removed from stop names and headsigns, after the
     /// ` (<name>)` one (`NaPTAN` names NET's stops `Basford Tram Stop`).
     #[serde(default)]
@@ -101,10 +126,30 @@ pub(crate) struct LineConfig {
     /// in the same way when unmapped.
     #[serde(default)]
     pub txc_line_names: Vec<String>,
-    /// The SIRI-SX `LineRef` aliases of this line.
+    /// The SIRI-SX `LineRef` aliases of this line (none for a network
+    /// without situations).
+    #[serde(default)]
     pub siri_line_refs: Vec<String>,
     /// Display colour, `#rrggbb`.
     pub colour: String,
+    /// The line's own mode (`tube`, `dlr`, `tram`) when the network mixes
+    /// modes; display only, like the network's.
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+/// A string or a list of strings.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(de)? {
+        OneOrMany::One(one) => vec![one],
+        OneOrMany::Many(many) => many,
+    })
 }
 
 impl NetworkConfig {
@@ -151,14 +196,25 @@ impl NetworkConfig {
         );
         ensure!(!self.nocs.is_empty(), "no NOC");
         ensure!(!self.name.trim().is_empty(), "no name");
+        ensure!(!self.atco_prefix.is_empty(), "no atco_prefix");
+        for prefix in &self.atco_prefix {
+            ensure!(
+                !prefix.is_empty()
+                    && prefix
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()),
+                "atco_prefix {prefix:?}"
+            );
+        }
+        if let Some(inner) = &self.inner_zip_prefix {
+            ensure!(
+                self.adapter == AdapterKind::Txc && !inner.trim().is_empty(),
+                "inner_zip_prefix is for a txc network, and not empty"
+            );
+        }
         ensure!(
-            !self.atco_prefix.is_empty()
-                && self
-                    .atco_prefix
-                    .bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()),
-            "atco_prefix {:?}",
-            self.atco_prefix
+            self.override_rule == OverrideRule::ServiceCode || self.adapter == AdapterKind::Txc,
+            "override_rule is for a txc network"
         );
         ensure!(!self.lines.is_empty(), "no line");
         for affix in self
@@ -198,6 +254,15 @@ impl NetworkConfig {
             for siri in &line.siri_line_refs {
                 ensure!(refs.insert(siri.as_str()), "SIRI LineRef {siri:?} twice");
             }
+            if let Some(mode) = &line.mode {
+                ensure!(
+                    !mode.is_empty()
+                        && mode.len() <= 16
+                        && mode.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
+                    "line {:?} mode {mode:?} is not [a-z-]{{1,16}}",
+                    line.id
+                );
+            }
             ensure!(
                 is_colour(&line.colour),
                 "line {:?} colour {:?} is not #rrggbb",
@@ -222,6 +287,20 @@ impl NetworkConfig {
         self.lines
             .iter()
             .position(|l| self.route_names(l).iter().any(|n| n == route_name))
+    }
+
+    /// Whether `stop` has one of the network's ATCO prefixes.
+    pub(crate) fn has_prefix(&self, stop: &str) -> bool {
+        self.prefix_of(stop).is_some()
+    }
+
+    /// The (longest) network ATCO prefix `stop` starts with.
+    pub(crate) fn prefix_of(&self, stop: &str) -> Option<&str> {
+        self.atco_prefix
+            .iter()
+            .filter(|p| stop.starts_with(p.as_str()))
+            .max_by_key(|p| p.len())
+            .map(String::as_str)
     }
 
     /// A stop name or headsign without the ` (<network name>)` suffix
@@ -289,7 +368,9 @@ mod tests {
         let config = NetworkConfig::load("net").unwrap();
         assert_eq!(config.adapter, AdapterKind::Txc);
         assert_eq!(config.nocs, ["NEXT"]);
-        assert_eq!(config.atco_prefix, "9400ZZNO");
+        assert_eq!(config.atco_prefix, ["9400ZZNO"]);
+        assert_eq!(config.override_rule, OverrideRule::ServiceCode);
+        assert_eq!(config.inner_zip_prefix, None);
         let ids: Vec<&str> = config.lines.iter().map(|l| l.id.as_str()).collect();
         assert_eq!(ids, ["1", "2"]);
         assert_eq!(config.line_for_route("1"), Some(0));

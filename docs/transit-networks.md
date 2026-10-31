@@ -1,8 +1,9 @@
 # Transit networks: runbook
 
-Transit networks are tram and light-rail networks that are neither National
-Rail nor TfL: Manchester Metrolink (`metrolink`) and Nottingham Express
-Transit (`net`). Design:
+Transit networks are tram, light-rail and metro networks with their own
+timetable pages under `/transit`: Manchester Metrolink (`metrolink`),
+Nottingham Express Transit (`net`) and TfL's Underground, DLR and London
+Trams (`tfl`, see [TfL](#tfl-underground-dlr-and-london-trams)). Design:
 [the transit networks spec](superpowers/specs/2026-10-09-transit-networks-design.md)
 and [the NET addendum](superpowers/specs/2026-10-24-nottingham-net-design.md);
 plan: [the transit networks plan](superpowers/plans/2026-10-09-transit-networks-plan.md).
@@ -309,6 +310,77 @@ with `net` and `transit-net` in place of `metrolink` and
 appear first) means resizing `crates/ingest-stream/src/budget.rs` and the
 alert maps first (NET design §11).
 
+## TfL: Underground, DLR and London Trams (tfl)
+
+Design: [the TfL transit design](superpowers/specs/2026-10-30-tfl-transit-design.md).
+The timetable is TfL's weekly Journey Planner export,
+`https://tfl.gov.uk/tfl/syndication/feeds/journey-planner-timetables.zip`
+(about 141 MB, anonymous, no login), a zip of zips: the network file's
+`inner_zip_prefix` (`LULDLRTRAMRIVERCABLE`) names the inner zip read
+(8.8 MB, 33 TransXChange documents on 2026-10-26). The operators are
+`LUL`, `DLR` and `TCL`, so the river buses and the cable car are left out.
+What differs from Metrolink and NET:
+
+- **Overrides.** TfL publishes engineering-work and bank holiday timetables
+  as whole files over the base file's dates. The network file's
+  `override_rule = "narrowest-period"` runs, for each line and date, only
+  the active file with the shortest period (the design's §3). A short
+  file is the whole line for its days: a part closure shows as fewer
+  trains on fewer stations, as TfL's status says.
+- **Status is TfL's own.** No situations loop (the producer refuses
+  `situationsEnabled`): the pages read poller-tfl's `tfl-<line>` rows
+  (`common::transit::status_from_tfl`), and a line's pin is TfL's line
+  (`tfl-victoria`). Pins, notifications and rollups are TfL's as before.
+- **Stops.** Platforms are a station code and one digit (`9400ZZLUHR41`
+  is Heathrow Terminal 4's, station `9400ZZLUHR4`); the stations of the
+  Northern line's extension are `9400ZZBPSUST` and `9400ZZNEUGST`. TfL's
+  stop pages (`/tfl/stops/{id}`) use the stop-area spelling, `940G…`.
+- **No rail-links file.** TfL's stops already link their National Rail
+  stations (`tfl_stop_crs`), so `/transit/rail-links` lists none for
+  `tfl` and station pages keep their TfL links.
+- **Sizes** (TfL's 2026-10-26 export): 13 lines, about 1,140 stops, 7,849
+  patterns with 216,766 calls, 58,383 trips; a weekday has about 8,800
+  Underground, 1,584 DLR and 707 tram trips. The parse takes about 11 s and
+  332 MiB peak in a release build; the item is 61 parts. Its stream is
+  `MAXLEN` 128 (two items a day), about 30 MB worst case with its dead
+  letters, for which `ingest_stream::budget::BUDGET_BYTES` rose to 576 MiB
+  (production's Redis `maxmemory` is 2048mb).
+
+| Value | Default | What it does |
+| --- | --- | --- |
+| `redis.acl.clients.pollerTransitTfl` | `false` | Renders the producer's Redis user `poller-transit-tfl` (`optional`). Needs the `poller-transit-tfl-password` key in the users Secret. |
+| `ingestWriter.streams.transit-tfl` | `off` | `apply` makes the writer consume `ds:ingest:transit-tfl`. Needs `postgresql.roles.perService.writer.connect`. |
+| `pollerTransitSchedule.networks.tfl.enabled` | `false` | Runs the producer. The chart refuses it unless the stream is `apply`. |
+| `pollerTransitSchedule.networks.tfl.txcUrl` | TfL's export | The zip. |
+| `api.transitNetworks` | `[]` | List `tfl` to make it public. |
+
+### TfL's rollout
+
+Each step its own Ranma-Config change; no secret but the Redis password.
+
+1. **The Redis user.** Add `poller-transit-tfl-password` (letters and
+   digits) to the Redis users SealedSecret and set
+   `redis.acl.clients.pollerTransitTfl: true` in the same change. Redis
+   restarts once. Check `$REDIS ACL USERS | grep poller-transit-tfl`.
+2. **The writer and the producer**, in one change:
+   `ingestWriter.streams.transit-tfl: apply` and
+   `pollerTransitSchedule.networks.tfl.enabled: true`. The migration that
+   adds `transit_lines.mode` must already be deployed (it ships with the
+   code).
+3. **Check the timetable, with nothing public**, as Metrolink's step 3
+   with `transit-tfl` and `network = 'tfl'`: one `active` version with 13
+   lines, about 7,800 patterns and 58,000 trips; `transit-tfl-timetable`
+   fresh; `transit_feed_refused_total{network="tfl"}` flat. Compare one
+   line's trips on a day TfL's status reports planned work with TfL's
+   own journey planner.
+4. **Public.** After a day with the timetable applied:
+   `api.transitNetworks: [metrolink, tfl]`. "Trams and metros" lists
+   "London (TfL)"; `/lines/tfl-<line>` links each Tube, DLR and tram
+   line's timetable; `/attribution` gains the TfL timetables.
+
+Rollback is `api.transitNetworks` without `tfl`, then the producer and
+the stream off, as Metrolink's.
+
 ## Inspecting the stream and its dead letters
 
 The stream's cap is `MAXLEN ~ 320` (`crates/ingest-stream/src/budget.rs`).
@@ -424,10 +496,16 @@ For `<n>` (`[a-z0-9-]`):
 
 1. **Network file:** `crates/poller-transit-schedule/networks/<n>.toml`
    (its `adapter`, `gtfs` or `txc`, with the matching `gtfs_route_names`
-   or `txc_line_names`; NOCs, ATCO prefix, name clean-ups, SIRI filters
-   and line aliases, attribution), added to `FILES` in `src/network.rs`;
+   or `txc_line_names`; NOCs, ATCO prefix or prefixes, name clean-ups,
+   SIRI filters and line aliases, attribution; for a mixed network each
+   line's `mode`; for a TXC zip of zips `inner_zip_prefix`; for overlapping
+   override files `override_rule`), added to `FILES` in `src/network.rs`;
    rail links in `reference-data/transit/<n>-rail-links.csv`, added to
-   `src/rail_links.rs`.
+   `src/rail_links.rs` (none for a network whose stops link stations
+   another way, as `tfl`'s do).
+   A network whose line status is TfL's goes in
+   `common::transit::TFL_STATUS_NETWORKS` instead of having a situations
+   loop.
 2. **The id:** add it to `common::transit::NETWORKS`. The writer's
    network pinning reads it.
 3. **The stream:** `ingest_stream::streams` gains `TRANSIT_<N>`

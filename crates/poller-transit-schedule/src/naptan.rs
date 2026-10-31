@@ -34,8 +34,9 @@ pub(crate) struct Node {
 /// Access nodes by ATCO code.
 pub(crate) type Nodes = HashMap<String, Node>;
 
-/// Parses the CSV, keeping the rows whose ATCO code starts with `prefix`.
-pub(crate) fn parse(text: &str, prefix: &str) -> Result<Nodes> {
+/// Parses the CSV, keeping the rows whose ATCO code starts with one of
+/// `prefixes`.
+pub(crate) fn parse(text: &str, prefixes: &[String]) -> Result<Nodes> {
     let mut reader = csv::Reader::from_reader(text.as_bytes());
     let headers = reader.headers()?.clone();
     let at = |name: &str| {
@@ -68,7 +69,7 @@ pub(crate) fn parse(text: &str, prefix: &str) -> Result<Nodes> {
                 .filter(|v| v.is_finite())
         };
         let code = get(atco);
-        if !code.starts_with(prefix) {
+        if !prefixes.iter().any(|p| code.starts_with(p.as_str())) {
             continue;
         }
         nodes.insert(
@@ -85,7 +86,7 @@ pub(crate) fn parse(text: &str, prefix: &str) -> Result<Nodes> {
         );
     }
     if nodes.is_empty() {
-        bail!("no {prefix} rows");
+        bail!("no {} rows", prefixes.join(" or "));
     }
     Ok(nodes)
 }
@@ -189,7 +190,7 @@ mod tests {
 
     #[test]
     fn names_and_indicators_are_applied() {
-        let nodes = parse(FIXTURE, "9400ZZMA").unwrap();
+        let nodes = parse(FIXTURE, &["9400ZZMA".to_owned()]).unwrap();
         let pic = &nodes["9400ZZMAPIC"];
         assert_eq!(pic.short_name, "Piccadilly");
         assert_eq!(pic.stop_type, "MET");
@@ -208,7 +209,7 @@ mod tests {
 
     #[test]
     fn the_suffix_strip_is_the_fallback() {
-        let mut nodes = parse(FIXTURE, "9400ZZMA").unwrap();
+        let mut nodes = parse(FIXTURE, &["9400ZZMA".to_owned()]).unwrap();
         nodes.get_mut("9400ZZMAPIC").unwrap().short_name.clear();
         let mut m = model(vec![stop("9400ZZMAPIC", StopKind::Station)]);
         apply(&mut m, &nodes, &metrolink());
@@ -229,7 +230,7 @@ mod tests {
     #[test]
     fn net_names_lose_their_suffix_and_prefix_and_gain_coordinates() {
         let net = NetworkConfig::load("net").unwrap();
-        let nodes = parse(NET_ROWS, "9400ZZNO").unwrap();
+        let nodes = parse(NET_ROWS, &["9400ZZNO".to_owned()]).unwrap();
         let mut m = model(vec![
             stop("9400ZZNOBCF", StopKind::Station),
             stop("9400ZZNOBCF1", StopKind::Platform),
@@ -254,7 +255,7 @@ mod tests {
 
     #[test]
     fn a_file_without_the_networks_rows_is_an_error() {
-        assert!(parse(FIXTURE, "9400ZZNE").is_err());
-        assert!(parse("a,b\n1,2\n", "9400").is_err());
+        assert!(parse(FIXTURE, &["9400ZZNE".to_owned()]).is_err());
+        assert!(parse("a,b\n1,2\n", &["9400".to_owned()]).is_err());
     }
 }

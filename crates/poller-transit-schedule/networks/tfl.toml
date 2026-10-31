@@ -1,0 +1,136 @@
+# TfL's Underground, DLR and London Trams as one network
+# (docs/superpowers/specs/2026-10-30-tfl-transit-design.md). Compiled into
+# poller-transit-schedule with include_str! and checked at startup and in
+# its unit tests (src/network.rs).
+#
+# Source: TfL's weekly Journey Planner timetables (TransXChange), a zip of
+# zips whose inner `LULDLRTRAMRIVERCABLE ...zip` holds the rail modes,
+# under TfL's open data terms; stops from NaPTAN area 940 (OGL v3.0). A
+# line's day is its narrowest active document (the design's §3: TfL's
+# engineering-work and bank holiday timetables are whole files over the
+# base file's dates). The river buses and the cable car are other
+# operators, so they are left out. The colours are Distant Signal's own
+# display choices for each line name, not TfL's brand palette (DS uses no
+# TfL logos or roundels).
+id = "tfl"
+name = "London (TfL)"
+# Display only; NOT a SUPPORTED_MODES value (transit spec D4). Each line
+# has its own mode.
+mode = "metro"
+timezone = "Europe/London"
+adapter = "txc"
+# The documents' OperatorCode values (TfL's export has no
+# NationalOperatorCode): London Underground, the DLR and London Trams.
+nocs = ["LUL", "DLR", "TCL"]
+inner_zip_prefix = "LULDLRTRAMRIVERCABLE"
+override_rule = "narrowest-period"
+replacement_bus_route_names = []
+naptan_area = "940"
+# Platforms are a three-letter station code and one digit
+# (`9400ZZLUHR41`, Heathrow Terminal 4's); the Northern line's Battersea
+# and Nine Elms stations are `9400ZZBPSUST` and `9400ZZNEUGST`.
+atco_prefix = ["9400ZZLU", "9400ZZDL", "9400ZZCR", "9400ZZ"]
+stop_name_suffixes = [" Underground Station", " DLR Station", " Tram Stop"]
+
+[attribution]
+licence = "TfL-Open-Data"
+text = "Powered by TfL Open Data. Timetables: Transport for London's journey planner timetables. Stops: NaPTAN (Department for Transport), under the Open Government Licence v3.0."
+
+# TfL's own line status (the `tfl-<line>` rows from poller-tfl) is the
+# status of these lines, so there is no situations loop: the producer
+# refuses `situationsEnabled` with no participant.
+[situations]
+participant_refs = []
+vehicle_modes = []
+operator_refs = []
+
+[[lines]]
+id = "bakerloo"
+name = "Bakerloo"
+mode = "tube"
+txc_line_names = ["Bakerloo"]
+colour = "#9a5b2c"
+
+[[lines]]
+id = "central"
+name = "Central"
+mode = "tube"
+txc_line_names = ["Central"]
+colour = "#d6362b"
+
+[[lines]]
+id = "circle"
+name = "Circle"
+mode = "tube"
+txc_line_names = ["Circle"]
+colour = "#f2c40f"
+
+[[lines]]
+id = "district"
+name = "District"
+mode = "tube"
+txc_line_names = ["District"]
+colour = "#13843f"
+
+[[lines]]
+id = "hammersmith-city"
+name = "Hammersmith & City"
+mode = "tube"
+txc_line_names = ["Hammersmith & City"]
+colour = "#e88ea6"
+
+[[lines]]
+id = "jubilee"
+name = "Jubilee"
+mode = "tube"
+txc_line_names = ["Jubilee"]
+colour = "#8a9399"
+
+[[lines]]
+id = "metropolitan"
+name = "Metropolitan"
+mode = "tube"
+txc_line_names = ["Metropolitan"]
+colour = "#8a1f5c"
+
+[[lines]]
+id = "northern"
+name = "Northern"
+mode = "tube"
+txc_line_names = ["Northern"]
+colour = "#222222"
+
+[[lines]]
+id = "piccadilly"
+name = "Piccadilly"
+mode = "tube"
+txc_line_names = ["Piccadilly"]
+colour = "#1c3a94"
+
+[[lines]]
+id = "victoria"
+name = "Victoria"
+mode = "tube"
+txc_line_names = ["Victoria"]
+colour = "#1f97d4"
+
+[[lines]]
+id = "waterloo-city"
+name = "Waterloo & City"
+mode = "tube"
+txc_line_names = ["Waterloo & City"]
+colour = "#78c7b5"
+
+[[lines]]
+id = "dlr"
+name = "DLR"
+mode = "dlr"
+txc_line_names = ["DLR"]
+colour = "#14a39a"
+
+[[lines]]
+id = "tram"
+name = "London Trams"
+mode = "tram"
+txc_line_names = ["Tram"]
+colour = "#6ab023"

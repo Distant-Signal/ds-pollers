@@ -311,7 +311,7 @@ fn normalise(
     }
     let ours = raw.consequences.iter().any(|c| {
         c.modes.iter().any(|m| filter.vehicle_modes.contains(m))
-            || c.stops.iter().any(|s| s.starts_with(&network.atco_prefix))
+            || c.stops.iter().any(|s| network.has_prefix(s))
             || c.operators.iter().any(|o| filter.operator_refs.contains(o))
     });
     if !ours {
@@ -340,7 +340,7 @@ fn normalise(
             let stops: BTreeSet<String> = c
                 .stops
                 .iter()
-                .filter_map(|s| station_of(s, &network.atco_prefix))
+                .filter_map(|s| station_of(s, network.prefix_of(s)?))
                 .collect();
             line_ids.extend(lines.iter().cloned());
             stop_ids.extend(stops.iter().cloned());

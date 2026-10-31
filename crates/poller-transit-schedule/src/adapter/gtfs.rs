@@ -733,6 +733,7 @@ pub(crate) fn line_orders(
             colour: Some(line.colour.clone()),
             sort_order: i32::try_from(n + 1).unwrap_or(i32::MAX),
             directions,
+            mode: line.mode.clone(),
         });
     }
     lines

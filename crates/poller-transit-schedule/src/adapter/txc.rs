@@ -19,9 +19,20 @@
 //! 4. **Dates.** The journey's operating profile (else its pattern's, else
 //!    its service's), expanded from yesterday to today plus the horizon,
 //!    inside the service's `OperatingPeriod`; a later document of the same
-//!    `ServiceCode` takes over from its start date.
+//!    `ServiceCode` takes over from its start date. With the network's
+//!    `override_rule = "narrowest-period"` (`TfL`), a line runs on each date
+//!    only the journeys of its active document with the shortest
+//!    `OperatingPeriod` ([`override_winners`]). A journey's
+//!    `DepartureDayShift` adds whole days to its times, not its dates.
 //! 5. **Folding**, as GTFS: patterns by (line, direction, calls), service
 //!    ids by date set, each line's station order.
+//!
+//! **Memory.** Documents are read twice: once for their services' heads
+//! (journeys and stops skipped unparsed), then one at a time for their
+//! journeys, so only one document's tree is ever held (`TfL`'s rail zip is
+//! 333 MB of XML). A network file's `inner_zip_prefix` names the one
+//! inner zip of a zip of zips that is the feed (`TfL`'s Journey Planner
+//! export).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, Read, Seek};
@@ -36,7 +47,7 @@ use zip::ZipArchive;
 
 use super::{CappedReader, FeedError};
 use crate::model::TransitModel;
-use crate::network::NetworkConfig;
+use crate::network::{NetworkConfig, OverrideRule};
 
 /// The inflated-size cap of one TXC document (a whole entry is held while
 /// it is parsed; TNDS documents are one service each).
@@ -110,8 +121,23 @@ impl Node {
     }
 }
 
+/// Sections a document's first pass also skips: only its services' heads
+/// are read then.
+const HEAD_SKIPPED: &[&[u8]] = &[b"VehicleJourneys", b"JourneyPatternSections", b"StopPoints"];
+
+/// The inflated-size cap of the inner zip of a zip of zips (`TfL`'s rail
+/// timetables were 8.8 MB on 2026-10-26).
+pub(crate) const MAX_INNER_ZIP_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Parses a document into a tree, skipping [`SKIPPED`] sections.
+#[cfg(test)]
 fn parse_tree<R: BufRead>(input: R) -> Result<Node, FeedError> {
+    parse_tree_skipping(input, &[])
+}
+
+/// Parses a document into a tree, skipping [`SKIPPED`] sections and
+/// `also`.
+fn parse_tree_skipping<R: BufRead>(input: R, also: &[&[u8]]) -> Result<Node, FeedError> {
     let mut reader = quick_xml::Reader::from_reader(input);
     let mut buf = Vec::new();
     let mut skip = Vec::new();
@@ -121,7 +147,8 @@ fn parse_tree<R: BufRead>(input: R) -> Result<Node, FeedError> {
         let event = reader.read_event_into(&mut buf).map_err(malformed)?;
         match event {
             Event::Start(e) => {
-                if SKIPPED.contains(&e.local_name().as_ref()) {
+                let local = e.local_name();
+                if SKIPPED.contains(&local.as_ref()) || also.contains(&local.as_ref()) {
                     let end = e.name().as_ref().to_vec();
                     reader
                         .read_to_end_into(quick_xml::name::QName(&end), &mut skip)
@@ -296,14 +323,22 @@ fn activity(end: &Node) -> Option<Activity> {
 /// The station of a call at `stop`: the platform code without its
 /// trailing digits when that keeps the network's prefix
 /// (`9400ZZNOBCF1` to `9400ZZNOBCF`; every NET `PLT` row follows the rule,
-/// NET design §2.4). `None` for a stop outside the network (a bus stop) or
-/// that is itself a station.
+/// NET design §2.4), but never shorter than the prefix and a three-letter
+/// station code (`TfL`'s `9400ZZLUHR41` is `9400ZZLUHR4`, Heathrow Terminal
+/// 4). `None` for a stop outside the network (a bus stop) or that is
+/// itself a station.
 pub(crate) fn station_of(stop: &str, prefix: &str) -> Option<String> {
-    if !stop.starts_with(prefix) {
+    if !stop.starts_with(prefix) || !stop.is_ascii() {
         return None;
     }
-    let station = stop.trim_end_matches(|c: char| c.is_ascii_digit());
-    (station.len() < stop.len() && station.len() > prefix.len()).then(|| station.to_owned())
+    let trimmed = stop.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let end = trimmed.max((prefix.len() + 3).min(stop.len()));
+    (end < stop.len() && end > prefix.len()).then(|| stop[..end].to_owned())
+}
+
+/// [`station_of`] under the network's own prefix for `stop`.
+fn network_station(network: &NetworkConfig, stop: &str) -> Option<String> {
+    station_of(stop, network.prefix_of(stop)?)
 }
 
 // --- Operating profiles ------------------------------------------------------
@@ -641,6 +676,26 @@ struct Document {
     root: Node,
 }
 
+/// A kept document's head (the first pass): its services, not its
+/// journeys.
+struct DocHead {
+    entry: String,
+    revision: String,
+    services: Vec<ServiceHead>,
+}
+
+/// A service's head: what the dates and the override rule need.
+struct ServiceHead {
+    code: String,
+    /// Its lines (the DS lines its `LineName`s map to).
+    lines: Vec<RouteKind>,
+    /// The declared `OperatingPeriod` (open ends as `MIN`/`MAX`).
+    period: (NaiveDate, NaiveDate),
+    /// The weekdays its service-level profile runs (every day without
+    /// one, or with no regular day).
+    days: [bool; 7],
+}
+
 /// One end of a timing link.
 #[derive(Debug, Clone)]
 struct End {
@@ -736,12 +791,43 @@ fn mentions(bytes: &[u8], nocs: &[String]) -> bool {
     })
 }
 
-/// Reads every `.xml` entry of `archive` that is one of the network's.
-fn documents<R: Read + Seek>(
+/// Reads the `.xml` entry `name` of `archive` whole, through the cap.
+fn read_entry<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    name: &str,
+    cap: u64,
+) -> Result<Vec<u8>, FeedError> {
+    let entry = archive
+        .by_name(name)
+        .map_err(|err| malformed(format!("{name}: {err}")))?;
+    let mut bytes = Vec::new();
+    CappedReader::new(entry, cap, name.to_owned())
+        .read_to_end(&mut bytes)
+        .map_err(|err| {
+            if err.to_string().contains("inflated-size cap") {
+                FeedError::Oversize(format!("{name} (inflated)"))
+            } else {
+                malformed(format!("{name}: {err}"))
+            }
+        })?;
+    Ok(bytes)
+}
+
+/// Parses `bytes` (the entry `name`), naming it in a malformed error.
+fn parse_entry(name: &str, bytes: &[u8], also: &[&[u8]]) -> Result<Node, FeedError> {
+    parse_tree_skipping(bytes, also).map_err(|err| match err {
+        FeedError::Malformed(what) => FeedError::Malformed(format!("{name}: {what}")),
+        other => other,
+    })
+}
+
+/// The heads of every `.xml` entry of `archive` that is one of the
+/// network's (the first pass), in name order.
+fn document_heads<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     network: &NetworkConfig,
     cap: u64,
-) -> Result<Vec<Document>, FeedError> {
+) -> Result<Vec<DocHead>, FeedError> {
     let mut names: Vec<String> = archive
         .file_names()
         .collect::<Result<Vec<_>, _>>()
@@ -764,29 +850,17 @@ fn documents<R: Read + Seek>(
             }
             _ => continue,
         }
-        let entry = archive
-            .by_name(&name)
-            .map_err(|err| malformed(format!("{name}: {err}")))?;
-        let mut bytes = Vec::new();
-        CappedReader::new(entry, cap, name.clone())
-            .read_to_end(&mut bytes)
-            .map_err(|err| {
-                if err.to_string().contains("inflated-size cap") {
-                    FeedError::Oversize(format!("{name} (inflated)"))
-                } else {
-                    malformed(format!("{name}: {err}"))
-                }
-            })?;
+        let bytes = read_entry(archive, &name, cap)?;
         if !mentions(&bytes, &network.nocs) {
             continue;
         }
-        let root = parse_tree(bytes.as_slice()).map_err(|err| match err {
-            FeedError::Malformed(what) => FeedError::Malformed(format!("{name}: {what}")),
-            other => other,
-        })?;
-        if !network_operators(&root, &network.nocs).is_empty() {
-            kept.push(Document { entry: name, root });
+        let root = parse_entry(&name, &bytes, HEAD_SKIPPED)?;
+        drop(bytes);
+        let operators = network_operators(&root, &network.nocs);
+        if operators.is_empty() {
+            continue;
         }
+        kept.push(doc_head(name, &root, network, &operators)?);
     }
     if nested > 0 {
         tracing::info!(nested, "skipped zip entries inside the TXC zip");
@@ -794,41 +868,89 @@ fn documents<R: Read + Seek>(
     Ok(kept)
 }
 
+/// A document's head from its (head-only) tree: the network's services.
+fn doc_head(
+    entry: String,
+    root: &Node,
+    network: &NetworkConfig,
+    operators: &BTreeSet<String>,
+) -> Result<DocHead, FeedError> {
+    let mut services = Vec::new();
+    for service in root
+        .child("Services")
+        .into_iter()
+        .flat_map(|s| s.children("Service"))
+    {
+        let code = service
+            .text_at(&["ServiceCode"])
+            .ok_or_else(|| malformed(format!("{entry}: a service without its ServiceCode")))?;
+        if let Some(operator) = service.text_at(&["RegisteredOperatorRef"])
+            && !operators.contains(operator)
+        {
+            continue;
+        }
+        let start = service
+            .text_at(&["OperatingPeriod", "StartDate"])
+            .map(parse_date)
+            .transpose()?
+            .unwrap_or(NaiveDate::MIN);
+        let end = service
+            .text_at(&["OperatingPeriod", "EndDate"])
+            .map(parse_date)
+            .transpose()?
+            .unwrap_or(NaiveDate::MAX);
+        let mut lines = Vec::new();
+        for line in service
+            .child("Lines")
+            .into_iter()
+            .flat_map(|l| l.children("Line"))
+        {
+            let name = line.text_at(&["LineName"]).ok_or_else(|| {
+                malformed(format!(
+                    "{entry}: service {code}: a Line without its LineName"
+                ))
+            })?;
+            lines.push(route_kind(network, name)?);
+        }
+        let days = match service.child("OperatingProfile") {
+            Some(profile) => read_profile(profile)?.days,
+            None => [true; 7],
+        };
+        services.push(ServiceHead {
+            code: code.to_owned(),
+            lines,
+            period: (start, end),
+            days: if days.contains(&true) {
+                days
+            } else {
+                [true; 7]
+            },
+        });
+    }
+    Ok(DocHead {
+        entry,
+        revision: root
+            .attr("ModificationDateTime")
+            .unwrap_or_default()
+            .to_owned(),
+        services,
+    })
+}
+
 /// The days each document serves each of its services on: from its
 /// `OperatingPeriod` start, to its end or the day before a later
 /// document of the same `ServiceCode` starts (a new timetable takes over).
 /// Keyed by (document index, service code).
-fn service_periods(docs: &[Document]) -> Result<ServicePeriods, FeedError> {
+fn service_periods(docs: &[DocHead]) -> ServicePeriods {
     let mut by_code: BTreeMap<String, Vec<(NaiveDate, String, usize, NaiveDate)>> = BTreeMap::new();
     for (i, doc) in docs.iter().enumerate() {
-        let revision = doc
-            .root
-            .attr("ModificationDateTime")
-            .unwrap_or_default()
-            .to_owned();
-        for service in doc
-            .root
-            .child("Services")
-            .into_iter()
-            .flat_map(|s| s.children("Service"))
-        {
-            let code = service.text_at(&["ServiceCode"]).ok_or_else(|| {
-                malformed(format!("{}: a service without its ServiceCode", doc.entry))
-            })?;
-            let start = service
-                .text_at(&["OperatingPeriod", "StartDate"])
-                .map(parse_date)
-                .transpose()?
-                .unwrap_or(NaiveDate::MIN);
-            let end = service
-                .text_at(&["OperatingPeriod", "EndDate"])
-                .map(parse_date)
-                .transpose()?
-                .unwrap_or(NaiveDate::MAX);
-            by_code
-                .entry(code.to_owned())
-                .or_default()
-                .push((start, revision.clone(), i, end));
+        for service in &doc.services {
+            by_code.entry(service.code.clone()).or_default().push((
+                service.period.0,
+                doc.revision.clone(),
+                i,
+                service.period.1,
+            ));
         }
     }
     let mut out = HashMap::new();
@@ -842,8 +964,75 @@ fn service_periods(docs: &[Document]) -> Result<ServicePeriods, FeedError> {
             out.insert((*doc, code.clone()), (*start, end));
         }
     }
-    Ok(out)
+    out
 }
+
+/// Which (document, service code) runs each line on each date under the
+/// network's `override_rule = "narrowest-period"` (the `TfL` design §3.2):
+/// of the services active that date (inside their period, after the
+/// same-`ServiceCode` take-over, on one of their service-level weekdays),
+/// the one with the shortest declared `OperatingPeriod`; ties to the later
+/// start, then the later `ModificationDateTime`, then the later entry.
+/// `None` under the default rule.
+fn override_winners(
+    network: &NetworkConfig,
+    docs: &[DocHead],
+    periods: &ServicePeriods,
+    window: (NaiveDate, NaiveDate),
+) -> Option<Winners> {
+    if network.override_rule != OverrideRule::NarrowestPeriod {
+        return None;
+    }
+    let mut best: HashMap<(usize, NaiveDate), (Rank<'_>, usize, &str)> = HashMap::new();
+    for (i, doc) in docs.iter().enumerate() {
+        for service in &doc.services {
+            let Some(&(from, to)) = periods.get(&(i, service.code.clone())) else {
+                continue;
+            };
+            let width = (service.period.1 - service.period.0).num_days();
+            let rank: Rank<'_> = (
+                width,
+                std::cmp::Reverse(service.period.0),
+                std::cmp::Reverse(doc.revision.as_str()),
+                std::cmp::Reverse(doc.entry.as_str()),
+            );
+            let mut day = from.max(window.0);
+            let last = to.min(window.1);
+            while day <= last {
+                if service.days[day.weekday().num_days_from_monday() as usize] {
+                    for kind in &service.lines {
+                        let RouteKind::Line(line) = *kind else {
+                            continue;
+                        };
+                        let slot = best.entry((line, day)).or_insert((rank, i, &service.code));
+                        if rank < slot.0 {
+                            *slot = (rank, i, &service.code);
+                        }
+                    }
+                }
+                let Some(next) = day.succ_opt() else { break };
+                day = next;
+            }
+        }
+    }
+    Some(
+        best.into_iter()
+            .map(|(key, (_, doc, code))| (key, (doc, code.to_owned())))
+            .collect(),
+    )
+}
+
+/// An override candidate's rank, smallest first: its period's width in
+/// days, then the later start, the later revision and the later entry.
+type Rank<'a> = (
+    i64,
+    std::cmp::Reverse<NaiveDate>,
+    std::cmp::Reverse<&'a str>,
+    std::cmp::Reverse<&'a str>,
+);
+
+/// The (document index, service code) running each (line index, date).
+type Winners = HashMap<(usize, NaiveDate), (usize, String)>;
 
 /// The kind of route `name` is in `network`.
 fn route_kind(network: &NetworkConfig, name: &str) -> Result<RouteKind, FeedError> {
@@ -895,6 +1084,7 @@ fn journeys(
     doc: &Document,
     network: &NetworkConfig,
     periods: &ServicePeriods,
+    winners: Option<&Winners>,
     window: (NaiveDate, NaiveDate),
     calendar: &HolidayCalendar,
     names: &mut BTreeMap<String, String>,
@@ -1116,10 +1306,18 @@ fn journeys(
                 .unwrap_or_default()
         };
 
+        let shift = match vj.text_at(&["DepartureDayShift"]) {
+            Some(text) => text
+                .parse::<i32>()
+                .ok()
+                .filter(|days| (0..=1).contains(days))
+                .ok_or_else(|| in_doc(format!("journey {code}: DepartureDayShift {text:?}")))?,
+            None => 0,
+        };
         let departure = parse_time(
             vj.text_at(&["DepartureTime"])
                 .ok_or_else(|| in_doc(format!("journey {code}: no DepartureTime")))?,
-        )?;
+        )? + shift * 86_400;
         // (stop, arrival, departure, activity), every stop including passes.
         let mut stops: Vec<(String, i32, i32, Activity)> = Vec::with_capacity(links.len() + 1);
         stops.push((
@@ -1178,11 +1376,18 @@ fn journeys(
             .unwrap_or_default();
         let from = window.0.max(service.period.0);
         let to = window.1.min(service.period.1);
-        let dates = if from <= to {
+        let mut dates = if from <= to {
             expand(&profile, from, to, calendar)
         } else {
             BTreeSet::new()
         };
+        if let (Some(winners), RouteKind::Line(line)) = (winners, route) {
+            dates.retain(|day| {
+                winners
+                    .get(&(line, *day))
+                    .is_some_and(|(doc, code)| *doc == doc_index && code == service_code)
+            });
+        }
         let headsign = vj
             .text_at(&["DestinationDisplay"])
             .or(pattern.destination)
@@ -1209,17 +1414,62 @@ fn journeys(
 
 /// Reads `reader` (the TXC zip) as one network's timetable. See the module
 /// docs.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the module docs' steps 4 and 5 in order: ids, service days, patterns, trips, stops"
-)]
 pub(crate) fn parse<R: Read + Seek>(
     reader: R,
     network: &NetworkConfig,
     options: &TxcOptions,
 ) -> Result<TransitModel, FeedError> {
     let mut archive = ZipArchive::new(reader).map_err(|err| malformed(format!("zip: {err}")))?;
-    let docs = documents(&mut archive, network, options.max_entry_bytes)?;
+    match &network.inner_zip_prefix {
+        Some(prefix) => {
+            let bytes = inner_zip(&mut archive, prefix)?;
+            let mut inner = ZipArchive::new(std::io::Cursor::new(bytes))
+                .map_err(|err| malformed(format!("the inner zip: {err}")))?;
+            parse_archive(&mut inner, network, options)
+        }
+        None => parse_archive(&mut archive, network, options),
+    }
+}
+
+/// The one entry of `archive` whose name starts with `prefix` and ends
+/// `.zip`, read whole through [`MAX_INNER_ZIP_BYTES`].
+fn inner_zip<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    prefix: &str,
+) -> Result<Vec<u8>, FeedError> {
+    let names: Vec<String> = archive
+        .file_names()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| malformed(format!("zip: {err}")))?
+        .into_iter()
+        .filter(|name| {
+            name.starts_with(prefix)
+                && std::path::Path::new(name.as_ref())
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+        })
+        .map(std::borrow::Cow::into_owned)
+        .collect();
+    let [name] = names.as_slice() else {
+        return Err(malformed(format!(
+            "expected one inner zip named {prefix:?}..., found {}",
+            names.len()
+        )));
+    };
+    read_entry(archive, name, MAX_INNER_ZIP_BYTES)
+}
+
+/// [`parse`] on the zip of documents itself.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the module docs' steps 4 and 5 in order: ids, service days, patterns, trips, stops"
+)]
+fn parse_archive<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    network: &NetworkConfig,
+    options: &TxcOptions,
+) -> Result<TransitModel, FeedError> {
+    let docs = document_heads(archive, network, options.max_entry_bytes)?;
     if docs.is_empty() {
         return Err(malformed(format!(
             "no document with an operator of NOC {:?}",
@@ -1235,15 +1485,23 @@ pub(crate) fn parse<R: Read + Seek>(
         .checked_add_days(Days::new(u64::from(options.horizon_days)))
         .ok_or_else(|| malformed("date range"))?;
     let calendar = HolidayCalendar::new(from, to);
-    let periods = service_periods(&docs)?;
+    let periods = service_periods(&docs);
+    let winners = override_winners(network, &docs, &periods, (from, to));
     let mut names: BTreeMap<String, String> = BTreeMap::new();
     let mut all: Vec<Journey> = Vec::new();
-    for (i, doc) in docs.iter().enumerate() {
+    for (i, head) in docs.iter().enumerate() {
+        let bytes = read_entry(archive, &head.entry, options.max_entry_bytes)?;
+        let doc = Document {
+            entry: head.entry.clone(),
+            root: parse_entry(&head.entry, &bytes, &[])?,
+        };
+        drop(bytes);
         journeys(
             i,
-            doc,
+            &doc,
             network,
             &periods,
+            winners.as_ref(),
             (from, to),
             &calendar,
             &mut names,
@@ -1358,13 +1616,13 @@ pub(crate) fn parse<R: Read + Seek>(
     trips.sort_by(|a, b| a.trip_id.cmp(&b.trip_id));
 
     let stops = stop_rows(network, &patterns, &names)?;
-    let prefix = network.atco_prefix.as_str();
     let lines = super::gtfs::line_orders(network, &patterns, &trips, |stop| {
-        station_of(stop, prefix).unwrap_or_else(|| stop.to_owned())
+        network_station(network, stop).unwrap_or_else(|| stop.to_owned())
     });
     let source_feed_version = docs
         .iter()
-        .filter_map(|d| d.root.attr("ModificationDateTime"))
+        .map(|d| d.revision.as_str())
+        .filter(|r| !r.is_empty())
         .max()
         .map(|t| {
             let digits: String = t.chars().filter(char::is_ascii_digit).collect();
@@ -1391,7 +1649,6 @@ fn stop_rows(
     patterns: &[TransitPattern],
     names: &BTreeMap<String, String>,
 ) -> Result<Vec<TransitStop>, FeedError> {
-    let prefix = network.atco_prefix.as_str();
     let used: BTreeSet<&str> = patterns
         .iter()
         .flat_map(|p| p.stops.iter().map(|s| s.stop_id.as_str()))
@@ -1413,16 +1670,16 @@ fn stop_rows(
             return Err(malformed(format!("stop id {id:?}")));
         }
         let name = names.get(id).cloned().unwrap_or_else(|| id.to_owned());
-        let is_station = id.starts_with(prefix)
-            && id.len() > prefix.len()
-            && !id.ends_with(|c: char| c.is_ascii_digit());
+        let is_station = network.prefix_of(id).is_some_and(|prefix| {
+            id.len() > prefix.len() && network_station(network, id).is_none()
+        });
         if is_station {
             stations
                 .entry(id.to_owned())
                 .or_insert_with(|| row(id, StopKind::Station, None, name));
             continue;
         }
-        let station = station_of(id, prefix);
+        let station = network_station(network, id);
         if let Some(station) = &station {
             stations
                 .entry(station.clone())
@@ -1438,6 +1695,7 @@ fn stop_rows(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::io::{Cursor, Write};
 
     use super::*;
@@ -1917,5 +2175,324 @@ mod tests {
             model.service_day_count(),
         );
         assert!(!model.trips.is_empty());
+    }
+
+    // --- TfL's export (the TfL design §3, §5) --------------------------------
+
+    fn tfl() -> NetworkConfig {
+        NetworkConfig::load("tfl").unwrap()
+    }
+
+    /// A hand-made document in the shape of `TfL`'s Journey Planner export
+    /// (`OperatorCode`, no `NationalOperatorCode`, platforms
+    /// `9400ZZLU…1`): service `code` of `line`, `period`, `days` (a
+    /// `DaysOfWeek` child), one pattern `from` to `to`, and `journeys`
+    /// (departure, day shift). Every id is invented, so nothing here is
+    /// `TfL` data.
+    fn tfl_doc(
+        code: &str,
+        (operator, line): (&str, &str),
+        period: (&str, &str),
+        days: &str,
+        (from, to): (&str, &str),
+        journeys: &[(&str, u8)],
+    ) -> String {
+        let mut vjs = String::new();
+        for (n, (dep, shift)) in journeys.iter().enumerate() {
+            let shift = if *shift > 0 {
+                format!("<DepartureDayShift>{shift}</DepartureDayShift>")
+            } else {
+                String::new()
+            };
+            write!(
+                vjs,
+                "<VehicleJourney><VehicleJourneyCode>VJ{n}</VehicleJourneyCode>\
+                 <ServiceRef>{code}</ServiceRef><LineRef>L{code}</LineRef>\
+                 <JourneyPatternRef>JP{code}</JourneyPatternRef>\
+                 <DepartureTime>{dep}</DepartureTime>{shift}</VehicleJourney>"
+            )
+            .unwrap();
+        }
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<TransXChange xmlns="http://www.transxchange.org.uk/" ModificationDateTime="2026-10-25T20:05:05" SchemaVersion="2.4">
+  <StopPoints>
+    <StopPoint><AtcoCode>{from}</AtcoCode><Descriptor><CommonName>From Station</CommonName></Descriptor></StopPoint>
+    <StopPoint><AtcoCode>{to}</AtcoCode><Descriptor><CommonName>To Station</CommonName></Descriptor></StopPoint>
+  </StopPoints>
+  <RouteSections><RouteSection id="RS1"/></RouteSections>
+  <JourneyPatternSections><JourneyPatternSection id="JPS{code}">
+    <JourneyPatternTimingLink id="JPL{code}">
+      <From SequenceNumber="1"><Activity>pickUp</Activity><StopPointRef>{from}</StopPointRef></From>
+      <To SequenceNumber="2"><Activity>setDown</Activity><StopPointRef>{to}</StopPointRef></To>
+      <RunTime>PT4M</RunTime>
+    </JourneyPatternTimingLink>
+  </JourneyPatternSection></JourneyPatternSections>
+  <Operators><Operator id="OId_{operator}"><OperatorCode>{operator}</OperatorCode></Operator></Operators>
+  <Services><Service>
+    <ServiceCode>{code}</ServiceCode>
+    <Lines><Line id="L{code}"><LineName>{line}</LineName></Line></Lines>
+    <OperatingPeriod><StartDate>{start}</StartDate><EndDate>{end}</EndDate></OperatingPeriod>
+    <OperatingProfile><RegularDayType><DaysOfWeek><{days} /></DaysOfWeek></RegularDayType></OperatingProfile>
+    <RegisteredOperatorRef>OId_{operator}</RegisteredOperatorRef>
+    <Mode>underground</Mode>
+    <StandardService><Origin>A</Origin><Destination>B</Destination>
+      <JourneyPattern id="JP{code}"><Direction>outbound</Direction><JourneyPatternSectionRefs>JPS{code}</JourneyPatternSectionRefs></JourneyPattern>
+    </StandardService>
+  </Service></Services>
+  <VehicleJourneys>{vjs}</VehicleJourneys>
+</TransXChange>"#,
+            start = period.0,
+            end = period.1,
+        )
+    }
+
+    /// `TfL`'s zip of zips: a bus part and the rail zip holding `docs`.
+    fn tfl_export(docs: &[(&str, String)]) -> Vec<u8> {
+        let files: Vec<(&str, &str)> = docs.iter().map(|(n, t)| (*n, t.as_str())).collect();
+        let inner = zip(&files);
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let options = zip::write::SimpleFileOptions::default();
+            writer
+                .start_file("BUSES PART ONE 26102026.zip", options)
+                .unwrap();
+            writer.write_all(&zip(&[("bus.xml", OTHER)])).unwrap();
+            writer
+                .start_file("LULDLRTRAMRIVERCABLE FULL 26102026.zip", options)
+                .unwrap();
+            writer.write_all(&inner).unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    const ZZA: (&str, &str) = ("9400ZZLUZZA1", "9400ZZLUZZB2");
+
+    /// Each line's trip starts on `day`, sorted.
+    fn trips_on(model: &TransitModel, day: &str) -> BTreeMap<String, Vec<i32>> {
+        let day = date(day);
+        let mut out: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+        for trip in &model.trips {
+            if dates(model, &trip.trip_id).contains(&day) {
+                out.entry(trip.line_id.clone().unwrap_or_default())
+                    .or_default()
+                    .push(trip.start_s);
+            }
+        }
+        for starts in out.values_mut() {
+            starts.sort_unstable();
+        }
+        out
+    }
+
+    fn victoria(code: &str, period: (&str, &str), days: &str, journeys: &[(&str, u8)]) -> String {
+        tfl_doc(code, ("LUL", "Victoria"), period, days, ZZA, journeys)
+    }
+
+    #[test]
+    fn a_tfl_override_file_replaces_its_lines_base_file_on_its_days() {
+        let at = |h: i32, m: i32| h * 3600 + m * 60;
+        let export = tfl_export(&[
+            (
+                "tfl_1-ZZA-base.xml",
+                victoria(
+                    "1-ZZA-base",
+                    ("2026-10-24", "2026-12-23"),
+                    "MondayToSunday",
+                    &[("06:00:00", 0), ("06:10:00", 0), ("06:20:00", 0)],
+                ),
+            ),
+            // Engineering work on 30 October to 1 November, on its Friday
+            // only: one train.
+            (
+                "tfl_1-ZZA-works.xml",
+                victoria(
+                    "1-ZZA-works",
+                    ("2026-10-30", "2026-11-01"),
+                    "Friday",
+                    &[("07:00:00", 0)],
+                ),
+            ),
+            // Another line's base: never hidden by the Victoria's works.
+            (
+                "tfl_25-DLR-base.xml",
+                tfl_doc(
+                    "25-DLR-base",
+                    ("DLR", "DLR"),
+                    ("2026-10-24", "2026-12-23"),
+                    "MondayToSunday",
+                    ("9400ZZDLZZC1", "9400ZZDLZZD1"),
+                    &[("05:30:00", 0)],
+                ),
+            ),
+        ]);
+        let model = parse(Cursor::new(export), &tfl(), &options("2026-10-29")).unwrap();
+        let base = vec![at(6, 0), at(6, 10), at(6, 20)];
+        // Thursday: the base file.
+        assert_eq!(trips_on(&model, "2026-10-29")["victoria"], base);
+        // Friday: the works file only, and the DLR as usual.
+        let friday = trips_on(&model, "2026-10-30");
+        assert_eq!(friday["victoria"], [at(7, 0)]);
+        assert_eq!(friday["dlr"], [at(5, 30)]);
+        // Saturday: inside the works' period but not on its weekday, so
+        // the base runs.
+        assert_eq!(trips_on(&model, "2026-10-31")["victoria"], base);
+        // After it: the base again.
+        assert_eq!(trips_on(&model, "2026-11-06")["victoria"], base);
+        // Lines carry their own modes.
+        let line_modes: Vec<(&str, Option<&str>)> = model
+            .lines
+            .iter()
+            .filter(|l| !l.directions.is_empty())
+            .map(|l| (l.line_id.as_str(), l.mode.as_deref()))
+            .collect();
+        assert_eq!(
+            line_modes,
+            [("victoria", Some("tube")), ("dlr", Some("dlr"))]
+        );
+        // Stations from the platform codes.
+        let stations: Vec<&str> = model
+            .stops
+            .iter()
+            .filter(|s| s.kind == StopKind::Station)
+            .map(|s| s.stop_id.as_str())
+            .collect();
+        assert_eq!(
+            stations,
+            ["9400ZZDLZZC", "9400ZZDLZZD", "9400ZZLUZZA", "9400ZZLUZZB"]
+        );
+    }
+
+    #[test]
+    fn a_tfl_day_shift_runs_past_midnight_on_its_service_day() {
+        let export = tfl_export(&[(
+            "tfl_1-ZZA-base.xml",
+            victoria(
+                "1-ZZA-base",
+                ("2026-10-24", "2026-12-23"),
+                "Saturday",
+                &[("23:50:00", 0), ("00:12:00", 1)],
+            ),
+        )]);
+        let model = parse(Cursor::new(export), &tfl(), &options("2026-10-29")).unwrap();
+        // Saturday 31 October's two trains: the second at 24:12.
+        assert_eq!(
+            trips_on(&model, "2026-10-31")["victoria"],
+            [23 * 3600 + 50 * 60, 86_400 + 12 * 60]
+        );
+        assert!(!trips_on(&model, "2026-11-01").contains_key("victoria"));
+        let shifted = model.trips.iter().find(|t| t.start_s > 86_400).unwrap();
+        let calls = &pattern(&model, &shifted.trip_id).stops;
+        assert_eq!(calls[1].arr_offset_s, 240, "offsets stay from the start");
+        // A shift other than 0 or 1 is refused.
+        let bad = tfl_export(&[(
+            "tfl_1-ZZA-base.xml",
+            victoria(
+                "1-ZZA-base",
+                ("2026-10-24", "2026-12-23"),
+                "Saturday",
+                &[("00:12:00", 3)],
+            ),
+        )]);
+        let err = parse(Cursor::new(bad), &tfl(), &options("2026-10-29")).unwrap_err();
+        assert_eq!(err.reason(), "malformed", "{err}");
+    }
+
+    #[test]
+    fn the_tfl_export_needs_exactly_one_rail_zip() {
+        let doc = victoria(
+            "1-ZZA-base",
+            ("2026-10-24", "2026-12-23"),
+            "MondayToSunday",
+            &[("06:00:00", 0)],
+        );
+        // The documents straight in the outer zip: no inner zip.
+        let flat = zip(&[("tfl_1-ZZA-base.xml", doc.as_str())]);
+        let err = parse(Cursor::new(flat), &tfl(), &options("2026-10-29")).unwrap_err();
+        assert!(err.to_string().contains("found 0"), "{err}");
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let options = zip::write::SimpleFileOptions::default();
+            for name in ["LULDLRTRAMRIVERCABLE A.zip", "LULDLRTRAMRIVERCABLE B.zip"] {
+                writer.start_file(name, options).unwrap();
+                writer
+                    .write_all(&zip(&[("tfl_1-ZZA-base.xml", doc.as_str())]))
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let err = parse(Cursor::new(buf), &tfl(), &options("2026-10-29")).unwrap_err();
+        assert!(err.to_string().contains("found 2"), "{err}");
+    }
+
+    #[test]
+    fn tfl_stations_keep_a_three_letter_code() {
+        // Heathrow Terminal 4's platform is HR4 and a digit.
+        assert_eq!(
+            station_of("9400ZZLUHR41", "9400ZZLU").as_deref(),
+            Some("9400ZZLUHR4")
+        );
+        assert_eq!(station_of("9400ZZLUHR4", "9400ZZLU"), None);
+        let network = tfl();
+        assert_eq!(network.prefix_of("9400ZZDLBNK2"), Some("9400ZZDL"));
+        assert_eq!(
+            network_station(&network, "9400ZZDLBNK2").as_deref(),
+            Some("9400ZZDLBNK")
+        );
+        // The Northern line's Battersea stop is a station code itself.
+        assert_eq!(network.prefix_of("9400ZZBPSUST"), Some("9400ZZ"));
+        assert_eq!(network_station(&network, "9400ZZBPSUST"), None);
+        assert_eq!(network.prefix_of("3390BA14"), None);
+        assert_eq!(
+            network.clean_stop_name("Battersea Power Station Underground Station"),
+            "Battersea Power Station"
+        );
+        assert_eq!(network.clean_stop_name("Bank DLR Station"), "Bank");
+    }
+
+    /// `TfL`'s whole export (`TRANSIT_REAL_TFL`, a downloaded
+    /// `journey-planner-timetables.zip` that is never committed): the
+    /// counts, the parse time and each line's trips on a few days.
+    #[test]
+    #[ignore = "needs TRANSIT_REAL_TFL, a downloaded TfL journey planner export"]
+    fn the_real_tfl_export() {
+        let Ok(path) = std::env::var("TRANSIT_REAL_TFL") else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let file = std::io::BufReader::new(std::fs::File::open(path).unwrap());
+        let today = common::transit::service_date(chrono::Utc::now());
+        let model = parse(
+            file,
+            &tfl(),
+            &TxcOptions {
+                today,
+                horizon_days: 60,
+                max_entry_bytes: MAX_ENTRY_BYTES,
+            },
+        )
+        .unwrap();
+        let pattern_stops: usize = model.patterns.iter().map(|p| p.stops.len()).sum();
+        eprintln!(
+            "parsed in {:?}: {} lines, {} stops, {} patterns ({pattern_stops} calls), {} trips, {} services",
+            started.elapsed(),
+            model.lines.len(),
+            model.stops.len(),
+            model.patterns.len(),
+            model.trips.len(),
+            model.service_days.len(),
+        );
+        for offset in [0, 7, 14] {
+            let day = today + Days::new(offset);
+            let per: BTreeMap<String, usize> = trips_on(&model, &day.to_string())
+                .into_iter()
+                .map(|(line, starts)| (line, starts.len()))
+                .collect();
+            eprintln!("{day}: {per:?}");
+        }
+        assert_eq!(model.lines.len(), 13);
     }
 }
