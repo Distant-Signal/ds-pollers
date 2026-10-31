@@ -28,6 +28,11 @@ use reqwest::Client;
 /// comfortably short relative to the 86400s recommended poll interval.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Once mode (`RUN_ONCE`, a scheduled Job; `common::poller_loop`): how long
+/// the run waits for its snapshot to reach the stream before failing (exit
+/// 1, so the Job retries). Inside the chart's `activeDeadlineSeconds`.
+const ONCE_FLUSH_GRACE: Duration = Duration::from_secs(120);
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     common::logging::exit_code(run().await)
@@ -46,7 +51,7 @@ async fn run() -> anyhow::Result<()> {
     let cycle = || poll_once(&client, &config, &stream);
 
     // The startup cursor is the stream's newest entry (spec §11.3).
-    common::poller_loop::run_poll_loop_with_cursor(
+    let result = common::poller_loop::run_poll_loop_with_cursor(
         "tocs",
         || async { Ok(stream.last_produced_at().await?) },
         poll_interval,
@@ -55,7 +60,10 @@ async fn run() -> anyhow::Result<()> {
         &progress,
         cycle,
     )
-    .await
+    .await;
+    // The loop returns only in once mode, or on a fatal error: exit only
+    // once the snapshot is in the stream.
+    common::poller_loop::finish_once(result, stream.shutdown(ONCE_FLUSH_GRACE)).await
 }
 
 /// The `ds:ingest:reference` producer. One part per snapshot (about 40
