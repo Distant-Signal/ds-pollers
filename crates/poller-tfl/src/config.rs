@@ -75,6 +75,15 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = false, action = clap::ArgAction::Set)]
     pub tfl_routes_enabled: bool,
 
+    /// Which jobs this process runs (docs/scheduled-jobs.md): `all` (the
+    /// default: the five-minute status poll and, while on, the daily stops
+    /// and routes jobs, in one Deployment), `status` alone, or `daily` alone
+    /// (the stops and routes jobs), so the daily jobs can run as a
+    /// `CronJob` while the status poll stays always on. Once mode
+    /// (`RUN_ONCE`) needs `daily`.
+    #[arg(long, env = "TFL_JOBS", value_enum, default_value_t = Jobs::All)]
+    pub jobs: Jobs,
+
     /// Port for this poller's Prometheus `/metrics` endpoint. Stays a
     /// plain field, not part of `MetricsArgs` -- its default differs per
     /// crate and `docker-compose.yml` relies on the code default.
@@ -87,6 +96,48 @@ pub(crate) struct Config {
     /// `/livez` listener and stall window (SVC-08).
     #[command(flatten)]
     pub health: common::service_args::HealthArgs,
+}
+
+/// The jobs a process runs (`TFL_JOBS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Jobs {
+    /// The status poll and the daily jobs.
+    All,
+    /// The five-minute line-status poll only.
+    Status,
+    /// The daily stops and routes jobs only.
+    Daily,
+}
+
+impl Jobs {
+    /// Whether the status poll runs.
+    pub(crate) fn status(self) -> bool {
+        matches!(self, Self::All | Self::Status)
+    }
+
+    /// Whether the daily jobs (each while its own flag is on) run.
+    pub(crate) fn daily(self) -> bool {
+        matches!(self, Self::All | Self::Daily)
+    }
+}
+
+impl Config {
+    /// `daily` alone needs a daily job on, and once mode (`RUN_ONCE`, a
+    /// scheduled Job) runs the daily jobs once each, so it needs `daily`.
+    pub(crate) fn check_jobs(&self, once: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.jobs != Jobs::Daily || self.tfl_stops_enabled || self.tfl_routes_enabled,
+            "TFL_JOBS is daily but neither TFL_STOPS_ENABLED nor TFL_ROUTES_ENABLED is on: \
+             this process would run nothing"
+        );
+        anyhow::ensure!(
+            !once || self.jobs == Jobs::Daily,
+            "RUN_ONCE needs TFL_JOBS=daily (it is {:?}): a scheduled run is the daily jobs, \
+             once each",
+            self.jobs
+        );
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for Config {
@@ -104,6 +155,7 @@ impl std::fmt::Debug for Config {
                 &self.tfl_stops_max_drop_fraction,
             )
             .field("tfl_routes_enabled", &self.tfl_routes_enabled)
+            .field("jobs", &self.jobs)
             .field("metrics_port", &self.metrics_port)
             .field("metrics", &self.metrics)
             .field("health", &self.health)
@@ -115,7 +167,7 @@ impl std::fmt::Debug for Config {
 mod config_debug_tests {
     use clap::Parser;
 
-    use super::Config;
+    use super::{Config, Jobs};
 
     #[test]
     fn debug_redacts_the_tfl_app_key() {
@@ -156,5 +208,34 @@ mod config_debug_tests {
         let on =
             Config::try_parse_from(args.iter().chain(&["--tfl-stops-enabled", "true"])).unwrap();
         assert!(on.tfl_stops_enabled);
+    }
+
+    #[test]
+    fn the_job_selector_defaults_to_all_and_checks_its_partners() {
+        let parse = |extra: &[&str]| {
+            Config::try_parse_from(["poller-tfl", "--tfl-app-key", "k"].iter().chain(extra))
+                .unwrap()
+        };
+        let all = parse(&[]);
+        assert_eq!(all.jobs, Jobs::All);
+        assert!(all.jobs.status() && all.jobs.daily());
+        all.check_jobs(false).unwrap();
+        assert!(
+            all.check_jobs(true).is_err(),
+            "once mode is the daily jobs alone"
+        );
+        let status = parse(&["--jobs", "status"]);
+        assert!(status.jobs.status() && !status.jobs.daily());
+        assert!(status.check_jobs(true).is_err());
+        // Daily with nothing on runs nothing.
+        assert!(parse(&["--jobs", "daily"]).check_jobs(false).is_err());
+        let daily = parse(&["--jobs", "daily", "--tfl-stops-enabled", "true"]);
+        assert!(!daily.jobs.status() && daily.jobs.daily());
+        daily.check_jobs(true).unwrap();
+        let routes_only = parse(&["--jobs", "daily", "--tfl-routes-enabled", "true"]);
+        routes_only.check_jobs(true).unwrap();
+        assert!(
+            Config::try_parse_from(["poller-tfl", "--tfl-app-key", "k", "--jobs", "x"]).is_err()
+        );
     }
 }

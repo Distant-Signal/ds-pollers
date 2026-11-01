@@ -48,6 +48,10 @@ const TFL_AUTH_HEADER_NAME: &str = "Ocp-Apim-Subscription-Key";
 /// connection and never answers would otherwise hang the poll loop forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Once mode: how long a daily job waits for its snapshot to reach the
+/// stream before failing (exit 1, so the Job retries).
+const ONCE_FLUSH_GRACE: Duration = Duration::from_secs(120);
+
 /// How a fetch retries a 429 or 5xx. `TfL`'s registered free tier is
 /// documented at roughly 500 requests per minute, but the enforcement is
 /// inconsistent (the 2026-11-01 routes run was told "Try again in 17
@@ -162,6 +166,8 @@ async fn run() -> anyhow::Result<()> {
     common::heap::pin_mmap_threshold();
 
     let config = Config::parse();
+    let once = common::poller_loop::RunOnce::from_env()?.is_some();
+    config.check_jobs(once)?;
     let progress = health_http::spawn_liveness(&config.health);
     // `clap` treats a present-but-empty env var as a supplied value, so an
     // orchestrator (e.g. `docker-compose.yml`'s `TFL_APP_KEY: ${TFL_APP_KEY}`)
@@ -174,7 +180,7 @@ async fn run() -> anyhow::Result<()> {
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let stream = stream_sink(&config)?;
 
-    let stops = if config.tfl_stops_enabled {
+    let stops = if config.tfl_stops_enabled && config.jobs.daily() {
         Some(daily_sink(
             &config,
             common::tfl_stops::SCHEMA,
@@ -184,7 +190,7 @@ async fn run() -> anyhow::Result<()> {
         tracing::info!("the stops job is off (TFL_STOPS_ENABLED)");
         None
     };
-    let routes = if config.tfl_routes_enabled {
+    let routes = if config.tfl_routes_enabled && config.jobs.daily() {
         Some(daily_sink(
             &config,
             common::tfl_routes::SCHEMA,
@@ -195,18 +201,29 @@ async fn run() -> anyhow::Result<()> {
         None
     };
 
+    if once {
+        return daily_once(&client, &config, &progress, stops, routes).await;
+    }
+
     let cycle = || poll_once(&client, &config, &stream);
 
     // The startup cursor is the stream's newest entry (spec §11.3).
-    let status_loop = common::poller_loop::run_poll_loop_with_cursor(
-        "tfl",
-        || async { Ok(stream.last_produced_at().await?) },
-        poll_interval,
-        config.metrics.metrics_enabled,
-        config.metrics_port,
-        &progress,
-        cycle,
-    );
+    let status_loop = async {
+        if !config.jobs.status() {
+            tracing::info!("the status poll is off (TFL_JOBS)");
+            return std::future::pending().await;
+        }
+        common::poller_loop::run_poll_loop_with_cursor(
+            "tfl",
+            || async { Ok(stream.last_produced_at().await?) },
+            poll_interval,
+            config.metrics.metrics_enabled,
+            config.metrics_port,
+            &progress,
+            cycle,
+        )
+        .await
+    };
     let stops_loop = async {
         let Some(stops) = &stops else {
             return std::future::pending().await;
@@ -243,6 +260,71 @@ async fn run() -> anyhow::Result<()> {
         result = stops_loop => result,
         result = routes_loop => result,
     }
+}
+
+/// Once mode (`RUN_ONCE` with `TFL_JOBS=daily`, a scheduled Job;
+/// docs/scheduled-jobs.md): each enabled daily job once, each skipping if
+/// its own snapshot is fresher than `RUN_ONCE_SKIP_IF_FRESHER_THAN_SECS`,
+/// each waiting for its snapshot to reach the stream. Both run even if one
+/// fails. A transient failure of either exits 1 (the Job retries, and the
+/// one that succeeded then skips); a refusal alone exits 3.
+async fn daily_once(
+    client: &Client,
+    config: &Config,
+    progress: &common::progress::Progress,
+    stops: Option<DailySink>,
+    routes: Option<DailySink>,
+) -> anyhow::Result<()> {
+    let interval = Duration::from_secs(config.tfl_stops_interval_secs);
+    let mut results = Vec::new();
+    if let Some(stops) = stops {
+        let result = common::poller_loop::run_poll_loop_with_cursor(
+            "tfl-stops",
+            || async { Ok(stops.stream.last_produced_at().await?) },
+            interval,
+            false,
+            config.metrics_port,
+            progress,
+            || release_after(stops_once(client, config, &stops)),
+        )
+        .await;
+        results.push(
+            common::poller_loop::finish_once(result, stops.stream.shutdown(ONCE_FLUSH_GRACE)).await,
+        );
+    }
+    if let Some(routes) = routes {
+        let result = common::poller_loop::run_poll_loop_with_cursor(
+            "tfl-routes",
+            || async { Ok(routes.stream.last_produced_at().await?) },
+            interval,
+            false,
+            config.metrics_port,
+            progress,
+            || release_after(routes_once(client, config, &routes)),
+        )
+        .await;
+        results.push(
+            common::poller_loop::finish_once(result, routes.stream.shutdown(ONCE_FLUSH_GRACE))
+                .await,
+        );
+    }
+    worst_of(results)
+}
+
+/// The error a once-mode run exits with: a transient one (exit 1, retried)
+/// before a refusal (exit 3, not retried), so a retry still re-runs the
+/// job that can succeed.
+fn worst_of(results: Vec<anyhow::Result<()>>) -> anyhow::Result<()> {
+    let mut rejected = None;
+    for result in results {
+        if let Err(err) = result {
+            if common::logging::exit_status_of(&err) == 1 {
+                return Err(err);
+            }
+            rejected.get_or_insert(err);
+        }
+    }
+    rejected.map_or(Ok(()), Err)
 }
 
 /// A daily job's producer on `ds:ingest:tfl-stops` (the stops job's
@@ -339,7 +421,10 @@ async fn stops_once(client: &Client, config: &Config, sink: &DailySink) -> anyho
             "reason" => refusal.reason()
         )
         .increment(1);
-        anyhow::bail!("refusing the TfL stops snapshot: {refusal}");
+        // The data itself refused: the next interval, or exit 3 in a Job.
+        return Err(anyhow::Error::new(common::ingest::DataRejected(format!(
+            "refusing the TfL stops snapshot: {refusal}"
+        ))));
     }
 
     let with_rail = rows
@@ -408,7 +493,10 @@ async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyh
             "reason" => refusal.reason()
         )
         .increment(1);
-        anyhow::bail!("refusing the TfL route sequences: {refusal}");
+        // The data itself refused: the next interval, or exit 3 in a Job.
+        return Err(anyhow::Error::new(common::ingest::DataRejected(format!(
+            "refusing the TfL route sequences: {refusal}"
+        ))));
     }
     let rows = with_running_times(client, config, rows).await;
     let timed = rows.iter().filter(|r| r.step_seconds.is_some()).count();
@@ -737,6 +825,18 @@ mod tests {
                 "attempt {attempt}: {delay:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_once_run_exits_transient_before_rejected() {
+        let rejected =
+            || Err(anyhow::anyhow!("refused").context(common::logging::ExitStatus::REJECTED));
+        let transient = || Err(anyhow::anyhow!("TfL timed out"));
+        assert!(worst_of(vec![Ok(()), Ok(())]).is_ok());
+        let err = worst_of(vec![rejected(), transient()]).unwrap_err();
+        assert_eq!(common::logging::exit_status_of(&err), 1);
+        let err = worst_of(vec![Ok(()), rejected()]).unwrap_err();
+        assert_eq!(common::logging::exit_status_of(&err), 3);
     }
 
     #[test]
