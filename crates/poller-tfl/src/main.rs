@@ -90,6 +90,8 @@ async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     common::logging::init("poller-tfl");
+    // See `release_after`.
+    common::heap::pin_mmap_threshold();
 
     let config = Config::parse();
     let progress = health_http::spawn_liveness(&config.health);
@@ -149,7 +151,7 @@ async fn run() -> anyhow::Result<()> {
             false,
             config.metrics_port,
             &progress,
-            || stops_once(&client, &config, stops),
+            || release_after(stops_once(&client, &config, stops)),
         )
         .await
     };
@@ -164,7 +166,7 @@ async fn run() -> anyhow::Result<()> {
             false,
             config.metrics_port,
             &progress,
-            || routes_once(&client, &config, routes),
+            || release_after(routes_once(&client, &config, routes)),
         )
         .await
     };
@@ -209,6 +211,23 @@ const STOPS_CALL_GAP: Duration = Duration::from_millis(250);
 
 /// One stops run (spec §1): every page of Tube, DLR and tram stop points,
 /// then their hubs, through the feed guard, published as one snapshot.
+/// Runs a daily job (stops or routes), then hands its freed heap back to
+/// the kernel. Each builds hundreds of stops or every line's route
+/// timetables and frees them a moment later, but glibc kept the peak
+/// resident for the rest of the day: 88 MiB against the pod's 32Mi request
+/// on 2026-11-01, hours after the 19:00 routes run. With the mmap threshold
+/// pinned at startup the big buffers are their own mappings, and the trim
+/// returns the rest (`common::heap`, as poller-transit-schedule does).
+async fn release_after(job: impl Future<Output = anyhow::Result<()>>) -> anyhow::Result<()> {
+    let result = job.await;
+    common::heap::release_freed_memory();
+    tracing::debug!(
+        rss_bytes = common::heap::resident_set_bytes(),
+        "released the daily job's freed heap"
+    );
+    result
+}
+
 async fn stops_once(client: &Client, config: &Config, sink: &DailySink) -> anyhow::Result<()> {
     let fetched_at = Utc::now();
     let base = config.tfl_base_url.trim_end_matches('/');
