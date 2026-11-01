@@ -64,7 +64,13 @@ async fn run() -> anyhow::Result<()> {
         retry_budget,
         backoff: ingest::POST_RETRY_BACKOFF,
     };
-    run_with(&client, &config, &progress, &sink).await
+    // The loop returns only in once mode (`RUN_ONCE`, a scheduled Job;
+    // `common::poller_loop`) or on a fatal error. Its write is one awaited
+    // transaction inside the cycle, so the data is committed by now; close
+    // the pool so the session ends cleanly before the exit.
+    let result = run_with(&client, &config, &progress, &sink).await;
+    sink.pool.close().await;
+    result
 }
 
 /// Waits for Postgres (INF-5), connects the pool (with

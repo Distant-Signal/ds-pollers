@@ -43,6 +43,9 @@ const COMPONENT: &str = "poller-transit-schedule";
 
 /// How long shutdown waits for an unsent snapshot.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// Once mode: how long a run waits for its timetable (61 parts for `TfL`)
+/// to reach the stream before failing (exit 1, so the Job retries).
+const ONCE_FLUSH_GRACE: Duration = Duration::from_secs(120);
 
 /// One whole download (the North West GTFS was 159 MB on 2026-10-14), over
 /// HTTPS or (TNDS) FTP.
@@ -93,6 +96,8 @@ async fn run() -> anyhow::Result<()> {
     let config = Config::parse();
     let network = NetworkConfig::load(&config.network)?;
     config.check_against(&network)?;
+    let once = common::poller_loop::RunOnce::from_env()?.is_some();
+    config.check_once_mode(once)?;
     let stream = ingest_stream::streams::transit(&network.id);
     tracing::info!(network = %network.network_id(), %stream, ?config, "starting");
     let redis = config
@@ -132,27 +137,29 @@ async fn run() -> anyhow::Result<()> {
         situations_etag: std::sync::Mutex::new(None),
     };
     refresh::check_at_start(&ctx).await;
-    let readiness = async {
-        let mut tick = tokio::time::interval(READINESS_INTERVAL);
-        loop {
-            tick.tick().await;
-            ready.store(
-                ctx.timetable.is_available() && ctx.situations.is_available(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
-    };
+    let readiness = report_readiness(&ctx, &ready);
 
-    let timetable_loop = common::poller_loop::run_poll_loop_with_cursor(
-        "transit-timetable",
-        || timetable::cursor(&ctx),
-        ctx.config.timetable_interval(),
-        false,
-        ctx.config.metrics_port,
-        &progress,
-        || timetable_cycle(&ctx),
-    );
+    let timetable_loop = async {
+        if !ctx.config.loops.timetable() {
+            tracing::info!("the timetable loop is off (TRANSIT_LOOPS)");
+            return std::future::pending().await;
+        }
+        common::poller_loop::run_poll_loop_with_cursor(
+            "transit-timetable",
+            || timetable::cursor(&ctx),
+            ctx.config.timetable_interval(),
+            false,
+            ctx.config.metrics_port,
+            &progress,
+            || timetable_cycle(&ctx),
+        )
+        .await
+    };
     let situations_loop = async {
+        if !ctx.config.loops.situations() {
+            tracing::info!("the situations loop is off (TRANSIT_LOOPS)");
+            return std::future::pending().await;
+        }
         if !ctx.config.situations_enabled {
             tracing::info!("the situations loop is off (TRANSIT_SITUATIONS_ENABLED)");
             return std::future::pending().await;
@@ -178,12 +185,38 @@ async fn run() -> anyhow::Result<()> {
             Ok(())
         }
     };
+    finish(&ctx, result, once).await
+}
+
+/// Keeps readiness to whether the producers of the loops this process runs
+/// can write.
+async fn report_readiness(ctx: &Context, ready: &std::sync::atomic::AtomicBool) {
+    let mut tick = tokio::time::interval(READINESS_INTERVAL);
+    loop {
+        tick.tick().await;
+        let loops = ctx.config.loops;
+        ready.store(
+            (!loops.timetable() || ctx.timetable.is_available())
+                && (!loops.situations() || ctx.situations.is_available()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// Flushes both producers. In once mode (a scheduled Job) the run fails
+/// (exit 1, retried) if its timetable did not reach the stream; a long-running
+/// process only warns, as the next start sends a fresh one.
+async fn finish(ctx: &Context, result: anyhow::Result<()>, once: bool) -> anyhow::Result<()> {
+    let _ = ctx.situations.shutdown(SHUTDOWN_GRACE).await;
+    if once {
+        return common::poller_loop::finish_once(result, ctx.timetable.shutdown(ONCE_FLUSH_GRACE))
+            .await;
+    }
     if !ctx.timetable.shutdown(SHUTDOWN_GRACE).await {
         tracing::warn!(
             "an unsent timetable was dropped at shutdown; the next start sends a fresh one"
         );
     }
-    let _ = ctx.situations.shutdown(SHUTDOWN_GRACE).await;
     result
 }
 

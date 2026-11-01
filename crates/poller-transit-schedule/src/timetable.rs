@@ -12,7 +12,6 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use anyhow::bail;
 use chrono::{DateTime, Utc};
 use common::metrics::metric_name;
 use common::transit::{TimetableCommit, schema};
@@ -249,10 +248,14 @@ pub(crate) async fn poll_once(ctx: &Context) -> anyhow::Result<()> {
         ctx.config.feed_max_drop_fraction,
     ) {
         count(ctx, FEED_REFUSED, [("reason", refusal.reason())]);
-        bail!(
+        // A refusal of the data itself: the same feed is refused again, so
+        // the loop waits a whole interval instead of re-downloading it on the
+        // failed-cycle backoff, and a once-mode run exits 3 (its Job fails
+        // without retrying; common::poller_loop).
+        return Err(anyhow::Error::new(common::ingest::DataRejected(format!(
             "network {}: the timetable was refused ({refusal}); the previous version stays active",
             ctx.network.id
-        );
+        ))));
     }
     for (kind, rows) in [
         ("lines", counts.lines),

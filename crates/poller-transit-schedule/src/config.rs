@@ -102,6 +102,15 @@ pub(crate) struct Config {
     #[arg(long, env = "TRANSIT_SITUATIONS_ENABLED", default_value_t = false, action = clap::ArgAction::Set)]
     pub situations_enabled: bool,
 
+    /// Which of the two loops this process runs (docs/scheduled-jobs.md):
+    /// `both` (the default, one Deployment), or `timetable` / `situations`
+    /// alone, so the daily timetable can run as a `CronJob` while the
+    /// five-minute situations loop stays a small Deployment. `situations`
+    /// needs `TRANSIT_SITUATIONS_ENABLED`; once mode (`RUN_ONCE`) needs
+    /// `timetable`.
+    #[arg(long, env = "TRANSIT_LOOPS", value_enum, default_value_t = Loops::Both)]
+    pub loops: Loops,
+
     /// Days of service dates stored after today (Q8: 60).
     #[arg(long, env = "TRANSIT_HORIZON_DAYS", default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=400))]
     pub horizon_days: u32,
@@ -193,7 +202,49 @@ impl Config {
              participant: no source publishes its disruptions",
             network.id
         );
+        anyhow::ensure!(
+            self.loops != Loops::Situations || self.situations_enabled,
+            "TRANSIT_LOOPS is situations but TRANSIT_SITUATIONS_ENABLED is off: \
+             this process would run no loop"
+        );
         Ok(())
+    }
+
+    /// Once mode (`RUN_ONCE`, a scheduled Job) runs one timetable cycle and
+    /// exits, so it needs the timetable loop alone: with both, whichever
+    /// loop returned first would end the run.
+    pub(crate) fn check_once_mode(&self, once: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !once || self.loops == Loops::Timetable,
+            "RUN_ONCE needs TRANSIT_LOOPS=timetable (it is {:?}): a scheduled run is one \
+             timetable cycle",
+            self.loops
+        );
+        Ok(())
+    }
+}
+
+/// The loops a process runs (`TRANSIT_LOOPS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Loops {
+    /// The daily timetable only.
+    Timetable,
+    /// The situations (SIRI-SX) loop only.
+    Situations,
+    /// Both, in one process.
+    Both,
+}
+
+impl Loops {
+    /// Whether the timetable loop runs.
+    pub(crate) fn timetable(self) -> bool {
+        matches!(self, Self::Timetable | Self::Both)
+    }
+
+    /// Whether the situations loop may run (it still needs
+    /// `TRANSIT_SITUATIONS_ENABLED`).
+    pub(crate) fn situations(self) -> bool {
+        matches!(self, Self::Situations | Self::Both)
     }
 }
 
@@ -241,6 +292,7 @@ impl std::fmt::Debug for Config {
             .field("timetable_interval_secs", &self.timetable_interval_secs)
             .field("situations_interval_secs", &self.situations_interval_secs)
             .field("situations_enabled", &self.situations_enabled)
+            .field("loops", &self.loops)
             .field("horizon_days", &self.horizon_days)
             .field("feed_max_drop_fraction", &self.feed_max_drop_fraction)
             .field("timetable_refresh", &self.timetable_refresh)
@@ -371,6 +423,34 @@ mod tests {
         ])
         .unwrap();
         metrolink_config.check_against(&metrolink).unwrap();
+    }
+
+    #[test]
+    fn the_loop_selector_defaults_to_both_and_checks_its_partners() {
+        let parse = |args: &[&str]| {
+            Config::try_parse_from([&["p", "--network", "metrolink"], args].concat()).unwrap()
+        };
+        let metrolink = crate::network::NetworkConfig::load("metrolink").unwrap();
+        let both = parse(&[]);
+        assert_eq!(both.loops, Loops::Both);
+        assert!(both.loops.timetable() && both.loops.situations());
+        let timetable = parse(&["--loops", "timetable"]);
+        assert!(timetable.loops.timetable() && !timetable.loops.situations());
+        timetable.check_against(&metrolink).unwrap();
+        // Situations alone without the situations loop on runs nothing.
+        let err = parse(&["--loops", "situations"])
+            .check_against(&metrolink)
+            .unwrap_err();
+        assert!(err.to_string().contains("no loop"), "{err}");
+        let situations = parse(&["--loops", "situations", "--situations-enabled", "true"]);
+        assert!(!situations.loops.timetable() && situations.loops.situations());
+        situations.check_against(&metrolink).unwrap();
+        // Once mode is one timetable cycle.
+        timetable.check_once_mode(true).unwrap();
+        both.check_once_mode(false).unwrap();
+        assert!(both.check_once_mode(true).is_err());
+        assert!(situations.check_once_mode(true).is_err());
+        assert!(Config::try_parse_from(["p", "--network", "metrolink", "--loops", "x"]).is_err());
     }
 
     #[test]
