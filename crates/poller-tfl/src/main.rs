@@ -48,23 +48,91 @@ const TFL_AUTH_HEADER_NAME: &str = "Ocp-Apim-Subscription-Key";
 /// connection and never answers would otherwise hang the poll loop forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Attempts per poll cycle before giving up and waiting for the next tick.
-/// `TfL`'s registered free tier is documented at roughly 500 requests per
-/// minute, but community reports say the enforcement is inconsistent — so
-/// this poller does not assume a budget, it just backs off when told to.
-const MAX_ATTEMPTS: u32 = 3;
+/// How a fetch retries a 429 or 5xx. `TfL`'s registered free tier is
+/// documented at roughly 500 requests per minute, but the enforcement is
+/// inconsistent (the 2026-11-01 routes run was told "Try again in 17
+/// seconds" after about 100 requests in 30 s), so this poller does not
+/// assume a budget: it backs off when told to, for at least as long as
+/// `TfL` asks (`Retry-After`, or the 429 body's "Try again in N seconds"),
+/// jittered. The status poll and the daily jobs share one key's quota.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryPolicy {
+    /// Attempts in all, the first included.
+    max_attempts: u32,
+    /// Backoff when `TfL` names no wait: 2 s doubling, capped.
+    backoff: common::backoff::Backoff,
+}
+
+/// The five-minute line-status poll: three attempts, so a retrying cycle
+/// stays well inside its 300 s interval even when told to wait.
+const STATUS_RETRY: RetryPolicy = RetryPolicy {
+    max_attempts: 3,
+    backoff: common::backoff::Backoff::new(Duration::from_secs(2), Duration::from_secs(60)),
+};
+
+/// The daily stops and routes jobs: no deadline worth keeping, and a fetch
+/// they give up on loses data (a route timetable's running times), so they
+/// retry longer.
+const DAILY_RETRY: RetryPolicy = RetryPolicy {
+    max_attempts: 6,
+    backoff: common::backoff::Backoff::new(Duration::from_secs(2), Duration::from_secs(60)),
+};
+
+/// The policy for a fetch, by its `what` label.
+fn retry_policy(what: &str) -> RetryPolicy {
+    if what == "line-status" {
+        STATUS_RETRY
+    } else {
+        DAILY_RETRY
+    }
+}
+
+/// How long `TfL` asked to wait: the `Retry-After` header in seconds, else
+/// the "Try again in N seconds." of its 429 body (API Management's).
+fn requested_wait(retry_after: Option<&str>, body: &str) -> Option<Duration> {
+    if let Some(secs) = retry_after.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return Some(Duration::from_secs(secs));
+    }
+    let rest = body.split("Try again in ").nth(1)?;
+    let secs: u64 = rest.split_whitespace().next()?.parse().ok()?;
+    rest.split_whitespace()
+        .nth(1)
+        .is_some_and(|unit| unit.starts_with("second"))
+        .then(|| Duration::from_secs(secs))
+}
+
+/// A `TfL` request that ended with an HTTP error status (after any
+/// retries). The message is the one the poller always logged.
+#[derive(Debug)]
+struct FetchFailed {
+    what: String,
+    status: StatusCode,
+    body: String,
+}
+
+impl std::fmt::Display for FetchFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "TfL {} fetch failed: {} {}",
+            self.what, self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for FetchFailed {}
+
+/// Whether `err` is `TfL` saying the resource does not exist (404).
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<FetchFailed>()
+        .is_some_and(|f| f.status == StatusCode::NOT_FOUND)
+}
 
 /// Worth retrying inside the cycle: rate limiting and transient upstream
 /// faults. A 4xx that is not 429 means this poller is wrong (bad key, bad
 /// mode name) and retrying it just burns quota.
 fn should_retry(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-}
-
-/// 2s, 4s. Both delays plus two requests fit comfortably inside the 300s
-/// poll interval, so a retrying cycle can never overlap the next one.
-fn retry_delay(attempt: u32) -> Duration {
-    Duration::from_secs(2u64.pow(attempt))
 }
 
 /// Fails startup if `key` is empty (after trimming whitespace). Guards
@@ -369,6 +437,10 @@ async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyh
 /// counted (`tfl_route_timetables_failed_total`) and leaves only its own
 /// samples out: a step no timetable times has no time, and the api falls
 /// back to its distance estimate there.
+/// The route timetables `TfL` does not publish (404), logged once each.
+static UNPUBLISHED_TIMETABLES: std::sync::LazyLock<common::log_once::LogOnceSet> =
+    std::sync::LazyLock::new(common::log_once::LogOnceSet::new);
+
 async fn with_running_times(
     client: &Client,
     config: &Config,
@@ -390,6 +462,25 @@ async fn with_running_times(
         let url = format!("{base}/Line/{}/Timetable/{first}/to/{last}", route.line_id);
         let added = match fetch_json(client, &url, config, "route-timetable").await {
             Ok(body) => samples.add_timetable(&route.line_id, &body),
+            Err(err) if is_not_found(&err) => {
+                // TfL publishes a timetable only from a line's timetabled
+                // origins (trams: from Wimbledon alone), so a 404 is a
+                // route it has none for, every day: not a failure. Logged
+                // once a process.
+                metrics::counter!(common::metrics::metric_name(
+                    "tfl_route_timetables_unpublished_total"
+                ))
+                .increment(1);
+                if UNPUBLISHED_TIMETABLES.should_log(&url) {
+                    tracing::info!(
+                        line = %route.line_id,
+                        %first,
+                        %last,
+                        "TfL publishes no timetable for this route; its steps keep any times other routes give them"
+                    );
+                }
+                continue;
+            }
             Err(err) => Err(err),
         };
         if let Err(err) = added {
@@ -500,6 +591,7 @@ async fn fetch_json(
     // apart. See docs/superpowers/specs/2026-08-29-metrics-design.md's v1
     // scope item 3.
     let mut retried_status: Option<StatusCode> = None;
+    let policy = retry_policy(what);
     loop {
         let response = client
             .get(url)
@@ -524,20 +616,52 @@ async fn fetch_json(
         }
 
         attempt += 1;
-        if attempt >= MAX_ATTEMPTS || !should_retry(status) {
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = response.text().await.unwrap_or_default();
+        if attempt >= policy.max_attempts || !should_retry(status) {
+            // A 404 is `TfL` not publishing the resource (a tram timetable
+            // from anywhere but its timetabled origin), not a fault.
+            let outcome = if status == StatusCode::NOT_FOUND {
+                "not_found"
+            } else {
+                "exhausted"
+            };
             metrics::counter!(
                 common::metrics::metric_name("tfl_fetch_total"),
                 "what" => what.to_string(),
-                "outcome" => "exhausted"
+                "outcome" => outcome
             )
             .increment(1);
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("TfL {what} fetch failed: {status} {body}");
+            return Err(FetchFailed {
+                what: what.to_owned(),
+                status,
+                body,
+            }
+            .into());
         }
 
         retried_status = Some(status);
-        let delay = retry_delay(attempt);
-        tracing::warn!(%status, attempt, delay_secs = delay.as_secs(), "TfL {what} fetch failed; retrying");
+        metrics::counter!(
+            common::metrics::metric_name("tfl_fetch_retries_total"),
+            "what" => what.to_string(),
+            "status" => if status == StatusCode::TOO_MANY_REQUESTS { "429" } else { "5xx" }
+        )
+        .increment(1);
+        let asked = requested_wait(retry_after.as_deref(), &body);
+        // At least what TfL asked for (jittered up by at most a quarter,
+        // capped at 5 minutes), else the jittered exponential backoff.
+        let delay = policy.backoff.delay_honouring(attempt - 1, asked);
+        tracing::warn!(
+            %status,
+            attempt,
+            delay_secs = delay.as_secs(),
+            asked_secs = asked.map(|d| d.as_secs()),
+            "TfL {what} fetch failed; retrying"
+        );
         tokio::time::sleep(delay).await;
     }
 }
@@ -563,16 +687,77 @@ mod tests {
     }
 
     #[test]
-    fn backoff_fits_inside_one_poll_interval() {
-        assert_eq!(retry_delay(1), Duration::from_secs(2));
-        assert_eq!(retry_delay(2), Duration::from_secs(4));
-        let total: u64 = (1..MAX_ATTEMPTS)
-            .map(|attempt| retry_delay(attempt).as_secs())
+    fn the_status_poll_backoff_fits_inside_one_poll_interval() {
+        // Worst case: every retry told to wait the backoff's cap, jittered
+        // up by a quarter.
+        let worst: Duration = (0..STATUS_RETRY.max_attempts - 1)
+            .map(|_| STATUS_RETRY.backoff.max.mul_f64(1.25))
             .sum();
         assert!(
-            total < 300,
-            "total backoff {total}s must not overrun the 300s poll interval"
+            worst < Duration::from_secs(300),
+            "total backoff {worst:?} must not overrun the 300s poll interval"
         );
+        assert_eq!(retry_policy("line-status"), STATUS_RETRY);
+        for daily in [
+            "stops",
+            "stop-hubs",
+            "lines",
+            "route-sequence",
+            "route-timetable",
+        ] {
+            assert_eq!(retry_policy(daily), DAILY_RETRY, "{daily}");
+        }
+        const { assert!(DAILY_RETRY.max_attempts > STATUS_RETRY.max_attempts) };
+    }
+
+    #[test]
+    fn tfl_s_requested_wait_comes_from_the_header_or_the_429_body() {
+        let body = r#"{ "statusCode": 429, "message": "Rate limit is exceeded. Try again in 17 seconds." }"#;
+        assert_eq!(requested_wait(None, body), Some(Duration::from_secs(17)));
+        assert_eq!(
+            requested_wait(Some("5"), body),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            requested_wait(Some("soon"), body),
+            Some(Duration::from_secs(17))
+        );
+        assert_eq!(requested_wait(None, "Internal Server Error"), None);
+        assert_eq!(requested_wait(None, "Try again in 3 minutes."), None);
+    }
+
+    #[test]
+    fn a_retry_waits_at_least_what_tfl_asked_for() {
+        for attempt in 0..5 {
+            let delay = DAILY_RETRY
+                .backoff
+                .delay_honouring(attempt, Some(Duration::from_secs(17)));
+            assert!(
+                delay >= Duration::from_secs(17) && delay <= Duration::from_secs(60).mul_f64(1.25),
+                "attempt {attempt}: {delay:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_404_is_told_apart_from_other_failures() {
+        let not_found = anyhow::Error::from(FetchFailed {
+            what: "route-timetable".into(),
+            status: StatusCode::NOT_FOUND,
+            body: String::new(),
+        });
+        assert!(is_not_found(&not_found));
+        assert_eq!(
+            not_found.to_string(),
+            "TfL route-timetable fetch failed: 404 Not Found "
+        );
+        let limited = anyhow::Error::from(FetchFailed {
+            what: "route-timetable".into(),
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: String::new(),
+        });
+        assert!(!is_not_found(&limited));
+        assert!(!is_not_found(&anyhow::anyhow!("timed out")));
     }
 
     #[test]
