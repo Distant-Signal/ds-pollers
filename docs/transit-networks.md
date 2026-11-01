@@ -144,8 +144,9 @@ so `api.transitNetworks` must list the network too.
 
 Deploy notes: no migration, no grant change (the api role already reads
 `transit_*`, `stations` and `line_status`). The api restarts for the new
-values. Each cached date grows by the network's day (about 6 MB for a
-Metrolink weekday); the cache keeps 2.
+values. Each cached date grows by the network's day (about 5 MB for a
+Metrolink weekday since DS-225's interned codes, 9 MB before); the cache
+keeps 2.
 
 ### TfL in the planner
 
@@ -170,7 +171,10 @@ graph (the TfL design §11). What differs from Metrolink:
   60 MB); searches with transit +5 to +8% (`fastest`) and -3 to +15%
   (`options`) over three runs, within the 1.60 budget. The planner's connections hold their codes inline since
   this change, which took the rail day from about 104 MB to 64 MB, so the
-  api with TfL uses less than it did with Metrolink alone.
+  api with TfL uses less than it did with Metrolink alone. Since DS-225's
+  interned codes (32-byte connections) the rail day is about 27.5 MB, TfL
+  adds about 8 MB a date and rail, Metrolink and TfL together are about
+  44 MB a cached date.
 
 Rollout: after `tfl` has been public a day, set
 `api.tripPlanTransitNetworks: [metrolink, tfl]`. Check
