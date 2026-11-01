@@ -244,22 +244,54 @@ impl StepSamples {
         let steps: Vec<Option<u32>> = route
             .stop_ids
             .windows(2)
-            .map(|pair| {
-                let key = (route.line_id.clone(), pair[0].clone(), pair[1].clone());
-                let &(sum, count) = self.by_step.get(&key)?;
-                let seconds = (sum / f64::from(count) * 60.0).round();
-                // Whole minutes from `TfL`, so at most an hour's worth (the
-                // check) of a small count: in range for a `u32`.
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "a non-negative whole number of seconds, at most an hour"
-                )]
-                let seconds = seconds as u32;
-                (seconds <= MAX_STEP_SECONDS).then_some(seconds)
-            })
+            .map(|pair| self.seconds(&route.line_id, &pair[0], &pair[1]))
             .collect();
         steps.iter().any(Option::is_some).then_some(steps)
+    }
+
+    /// [`StepSamples::step_seconds`] for a route `TfL` publishes no
+    /// timetable for (trams other than from Wimbledon): each step with no
+    /// sample of its own takes the same two stops' running time the other
+    /// way (B to A for A to B), where a timetable has one. A step with its
+    /// own samples keeps them, so a published time is never replaced; a
+    /// reversed segment of another route fills just the steps it shares.
+    /// Returns the steps and how many were mirrored.
+    pub(crate) fn step_seconds_mirrored(
+        &self,
+        route: &TflLineRoute,
+    ) -> (Option<Vec<Option<u32>>>, usize) {
+        let mut mirrored = 0;
+        let steps: Vec<Option<u32>> = route
+            .stop_ids
+            .windows(2)
+            .map(|pair| {
+                self.seconds(&route.line_id, &pair[0], &pair[1])
+                    .or_else(|| {
+                        let reverse = self.seconds(&route.line_id, &pair[1], &pair[0]);
+                        mirrored += usize::from(reverse.is_some());
+                        reverse
+                    })
+            })
+            .collect();
+        (steps.iter().any(Option::is_some).then_some(steps), mirrored)
+    }
+
+    /// The mean running time from `from` to `to` on `line_id`, in whole
+    /// seconds, if a timetable has a sample of it (and it is at most
+    /// [`MAX_STEP_SECONDS`]).
+    fn seconds(&self, line_id: &str, from: &str, to: &str) -> Option<u32> {
+        let key = (line_id.to_owned(), from.to_owned(), to.to_owned());
+        let &(sum, count) = self.by_step.get(&key)?;
+        let seconds = (sum / f64::from(count) * 60.0).round();
+        // Whole minutes from `TfL`, so at most an hour's worth (the check)
+        // of a small count: in range for a `u32`.
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a non-negative whole number of seconds, at most an hour"
+        )]
+        let seconds = seconds as u32;
+        (seconds <= MAX_STEP_SECONDS).then_some(seconds)
     }
 }
 
@@ -436,6 +468,78 @@ mod tests {
             ..branch_a()
         };
         assert_eq!(samples.step_seconds(&other), None);
+    }
+
+    /// A route over `stops`, on testline.
+    fn route_over(stops: &[&str]) -> TflLineRoute {
+        TflLineRoute {
+            stop_ids: stops.iter().map(|&s| s.to_owned()).collect(),
+            ..branch_a()
+        }
+    }
+
+    /// Samples timing `steps` (from, to, minutes) on testline.
+    fn samples_of(steps: &[(&str, &str, f64)]) -> StepSamples {
+        let mut samples = StepSamples::default();
+        for &(from, to, minutes) in steps {
+            samples
+                .by_step
+                .insert(("testline".into(), from.into(), to.into()), (minutes, 1));
+        }
+        samples
+    }
+
+    #[test]
+    fn an_exact_reverse_route_is_timed_from_the_other_direction() {
+        // Timed one way only (A to D), as a tram from Wimbledon.
+        let samples = samples_of(&[("A", "B", 2.0), ("B", "C", 3.0), ("C", "D", 1.0)]);
+        let back = route_over(&["D", "C", "B", "A"]);
+        assert_eq!(samples.step_seconds(&back), None, "no samples of its own");
+        assert_eq!(
+            samples.step_seconds_mirrored(&back),
+            (Some(vec![Some(60), Some(180), Some(120)]), 3)
+        );
+    }
+
+    #[test]
+    fn a_partial_reverse_mirrors_only_the_shared_steps() {
+        // The timed route shares only C-B-A with this one, reversed.
+        let samples = samples_of(&[("A", "B", 2.0), ("B", "C", 3.0)]);
+        let branch = route_over(&["E", "D", "C", "B", "A"]);
+        assert_eq!(
+            samples.step_seconds_mirrored(&branch),
+            (Some(vec![None, None, Some(180), Some(120)]), 2)
+        );
+    }
+
+    #[test]
+    fn no_reverse_mirrors_nothing() {
+        let samples = samples_of(&[("A", "B", 2.0)]);
+        // Same direction as the samples' stops, but other stops.
+        assert_eq!(
+            samples.step_seconds_mirrored(&route_over(&["X", "Y", "Z"])),
+            (None, 0)
+        );
+        // Another line's samples are not this line's.
+        let other = TflLineRoute {
+            line_id: "otherline".into(),
+            ..route_over(&["B", "A"])
+        };
+        assert_eq!(samples.step_seconds_mirrored(&other), (None, 0));
+    }
+
+    #[test]
+    fn a_step_with_its_own_samples_is_never_replaced() {
+        // B to A has its own 4 minutes; A to B's 2 must not replace it.
+        // C to B has none, so it takes B to C's 3.
+        let samples = samples_of(&[("A", "B", 2.0), ("B", "C", 3.0), ("B", "A", 4.0)]);
+        let back = route_over(&["C", "B", "A"]);
+        assert_eq!(
+            samples.step_seconds_mirrored(&back),
+            (Some(vec![Some(180), Some(240)]), 1)
+        );
+        // Without mirroring, only the step it has samples for.
+        assert_eq!(samples.step_seconds(&back), Some(vec![None, Some(240)]));
     }
 
     #[test]

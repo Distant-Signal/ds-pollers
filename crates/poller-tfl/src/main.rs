@@ -518,6 +518,10 @@ async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyh
     Ok(())
 }
 
+/// The route timetables `TfL` does not publish (404), logged once each.
+static UNPUBLISHED_TIMETABLES: std::sync::LazyLock<common::log_once::LogOnceSet> =
+    std::sync::LazyLock::new(common::log_once::LogOnceSet::new);
+
 /// `routes` with their running times (DS-206; [`routes::StepSamples`]):
 /// one `GET /Line/{id}/Timetable/{first}/to/{last}` per route (about 80 a
 /// day, at [`STOPS_CALL_GAP`]), every timetable of a line timing every
@@ -525,10 +529,12 @@ async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyh
 /// counted (`tfl_route_timetables_failed_total`) and leaves only its own
 /// samples out: a step no timetable times has no time, and the api falls
 /// back to its distance estimate there.
-/// The route timetables `TfL` does not publish (404), logged once each.
-static UNPUBLISHED_TIMETABLES: std::sync::LazyLock<common::log_once::LogOnceSet> =
-    std::sync::LazyLock::new(common::log_once::LogOnceSet::new);
-
+///
+/// A route `TfL` publishes no timetable for (a 404: the trams from
+/// anywhere but Wimbledon) also takes, for each step no timetable times,
+/// the same two stops' running time the other way
+/// ([`routes::StepSamples::step_seconds_mirrored`]), counted in
+/// `tfl_route_steps_mirrored_total{line}` and logged.
 async fn with_running_times(
     client: &Client,
     config: &Config,
@@ -537,6 +543,9 @@ async fn with_running_times(
     let base = config.tfl_base_url.trim_end_matches('/');
     let mut samples = routes::StepSamples::default();
     let mut asked = std::collections::BTreeSet::new();
+    // `(line, first stop, last stop)` of the routes `TfL` has no timetable
+    // for.
+    let mut unpublished = std::collections::BTreeSet::new();
     for route in &rows {
         let (Some(first), Some(last)) = (route.stop_ids.first(), route.stop_ids.last()) else {
             continue;
@@ -559,6 +568,7 @@ async fn with_running_times(
                     "tfl_route_timetables_unpublished_total"
                 ))
                 .increment(1);
+                unpublished.insert((route.line_id.clone(), first.clone(), last.clone()));
                 if UNPUBLISHED_TIMETABLES.should_log(&url) {
                     tracing::info!(
                         line = %route.line_id,
@@ -586,7 +596,31 @@ async fn with_running_times(
         }
     }
     for route in &mut rows {
-        route.step_seconds = samples.step_seconds(route);
+        let key = (
+            route.line_id.clone(),
+            route.stop_ids.first().cloned().unwrap_or_default(),
+            route.stop_ids.last().cloned().unwrap_or_default(),
+        );
+        if !unpublished.contains(&key) {
+            route.step_seconds = samples.step_seconds(route);
+            continue;
+        }
+        let (steps, mirrored) = samples.step_seconds_mirrored(route);
+        route.step_seconds = steps;
+        if mirrored > 0 {
+            metrics::counter!(
+                common::metrics::metric_name("tfl_route_steps_mirrored_total"),
+                "line" => route.line_id.clone()
+            )
+            .increment(u64::try_from(mirrored).unwrap_or(u64::MAX));
+            tracing::info!(
+                line = %route.line_id,
+                route = %route.name,
+                mirrored,
+                steps = route.stop_ids.len().saturating_sub(1),
+                "timed steps of a route TfL publishes no timetable for from the reverse direction"
+            );
+        }
     }
     rows
 }
