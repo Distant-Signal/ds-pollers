@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 # The transit networks' producer (docs/superpowers/specs/2026-10-09-transit-
 # networks-design.md §6): one process per network, stream-only (no
