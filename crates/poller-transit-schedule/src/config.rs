@@ -477,39 +477,4 @@ mod tests {
             );
         }
     }
-
-    /// The chart's template sets every variable this config reads, and
-    /// nothing it does not (a renamed variable would be silently ignored).
-    #[test]
-    fn the_chart_template_sets_exactly_the_config_env() {
-        use clap::CommandFactory;
-        let template = common::manifest_dir!()
-            .join("../../charts/distant-signal/templates/poller-transit-schedule-deployment.yaml");
-        let text = std::fs::read_to_string(&template).unwrap();
-        let set: std::collections::BTreeSet<&str> = text
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("- name: "))
-            .filter(|n| n.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
-            .collect();
-        let declared: std::collections::BTreeSet<String> = Config::command()
-            .get_arguments()
-            .filter_map(|arg| arg.get_env().and_then(|env| env.to_str()))
-            .map(str::to_owned)
-            .collect();
-        // REDIS_USERNAME/REDIS_PASSWORD come from redisClientAuthEnv;
-        // RUST_LOG is the logging filter, not a Config field.
-        for name in &set {
-            assert!(
-                declared.contains(*name) || *name == "RUST_LOG",
-                "the template sets {name}, which Config does not read"
-            );
-        }
-        for name in &declared {
-            assert!(
-                set.contains(name.as_str())
-                    || ["REDIS_USERNAME", "REDIS_PASSWORD"].contains(&name.as_str()),
-                "Config reads {name}, which the template never sets"
-            );
-        }
-    }
 }

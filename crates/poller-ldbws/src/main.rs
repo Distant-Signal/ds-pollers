@@ -103,8 +103,16 @@ const NUMROWS_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// should take.
 const CYCLE_TIME_BUDGET: Duration = Duration::from_secs(45);
 
+/// What `--print-config-defaults` prints (`ds_runtime::service_args`).
+fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
+    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-ldbws")
+        .postgres_pool(sample_source::DEFAULT_MAX_CONNECTIONS)
+        .db_role(ds_store::schema::DbRole::LdbwsRo.key())
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    ds_runtime::service_args::exit_if_print_config_defaults(config_defaults);
     ds_runtime::logging::exit_code(run().await)
 }
 

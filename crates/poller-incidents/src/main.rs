@@ -26,8 +26,16 @@ use reqwest::Client;
 /// comfortably short relative to the 300s recommended poll interval.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What `--print-config-defaults` prints (`ds_runtime::service_args`).
+fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
+    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-incidents")
+        .postgres_pool(DEFAULT_MAX_CONNECTIONS)
+        .db_role(ds_store::schema::DbRole::Incidents.key())
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    ds_runtime::service_args::exit_if_print_config_defaults(config_defaults);
     ds_runtime::logging::exit_code(run().await)
 }
 
