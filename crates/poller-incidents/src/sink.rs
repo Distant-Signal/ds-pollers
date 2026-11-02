@@ -493,11 +493,10 @@ mod db_tests {
         .expect("table contents")
     }
 
-    /// The repository's line catalogue, as the image carries it.
+    /// The line catalogue the binary embeds.
     fn catalogue() -> Vec<common::LineDefinition> {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lines");
-        common::config::parse_lines(dir.to_str().expect("utf-8 path"))
-            .expect("parse lines/")
+        ds_lines::embedded()
+            .expect("the embedded catalogue loads")
             .0
     }
 

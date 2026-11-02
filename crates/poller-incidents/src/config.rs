@@ -52,10 +52,11 @@ pub(crate) struct Config {
     #[arg(long, env, hide_env_values = true)]
     pub database_url: Option<Secret>,
 
-    /// Directory of line-catalogue TOML files: the
-    /// matcher that fills `incidents.affected_lines` is built from it at
-    /// startup, as the api's is. The image carries the catalogue here.
-    #[arg(long = "lines-dir", env = "LINES_DIR", default_value = "/app/lines")]
+    /// The line catalogue: the matcher that fills `incidents.affected_lines`
+    /// is built from it at startup, as the api's is. The one built into the
+    /// binary (`ds_lines::EMBEDDED`), or a directory of line-catalogue TOML
+    /// files.
+    #[arg(long = "lines-dir", env = "LINES_DIR", default_value = ds_lines::EMBEDDED)]
     pub lines_dir: String,
 
     /// Redis, for the `incident-text-changed` XADD (required). May
@@ -138,7 +139,7 @@ mod tests {
     fn the_defaults_are_the_heartbeat_and_the_lines_dir() {
         let config = parse(&[]);
         assert!(config.incidents_row_heartbeat);
-        assert_eq!(config.lines_dir, "/app/lines");
+        assert_eq!(config.lines_dir, ds_lines::EMBEDDED);
     }
 
     #[test]
