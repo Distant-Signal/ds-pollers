@@ -189,8 +189,8 @@ async fn download_capped(client: &Client, url: &str, max_bytes: u64) -> anyhow::
 
 /// The `User-Agent` every request to Irish Rail / NTA carries (LEG-21):
 /// honest and identifying (crate name, version, project URL) rather than
-/// reqwest's default of sending none at all. See `common::user_agent`.
-const USER_AGENT: &str = common::user_agent!();
+/// reqwest's default of sending none at all. See `ds_runtime::user_agent`.
+const USER_AGENT: &str = ds_runtime::user_agent!();
 
 /// Builds the HTTP client used for the GTFS download and ingest POSTs.
 /// Split out of `main` so the test below can assert, over real HTTP, that
@@ -204,13 +204,13 @@ fn build_client() -> reqwest::Result<Client> {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    common::logging::init("poller-irish-rail-gtfs");
+    ds_runtime::logging::init("poller-irish-rail-gtfs");
 
     let config = Config::parse();
     let progress = health_http::spawn_liveness(&config.health);
@@ -270,7 +270,7 @@ async fn poll_once(client: &Client, config: &Config, sinks: &Sinks) -> anyhow::R
     // pathological feed would stall this whole process's tokio runtime for
     // however long the (bounded, but still real) decompression work takes,
     // including this poller's own `/metrics` endpoint
-    // (`common::metrics::install` runs its HTTP listener on this same
+    // (`ds_runtime::metrics::install` runs its HTTP listener on this same
     // runtime).
     let gtfs = tokio::task::spawn_blocking(move || {
         reject_gtfs_zip_bomb(&bytes)?;
@@ -318,7 +318,7 @@ mod download_capped_tests {
     #[tokio::test]
     async fn client_sends_an_identifying_user_agent() {
         assert!(USER_AGENT.starts_with(concat!("distant-signal-", env!("CARGO_PKG_NAME"), "/")));
-        assert!(USER_AGENT.contains(common::user_agent::PROJECT_URL));
+        assert!(USER_AGENT.contains(ds_runtime::user_agent::PROJECT_URL));
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(wiremock::matchers::header("user-agent", USER_AGENT))

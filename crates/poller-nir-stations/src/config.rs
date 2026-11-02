@@ -16,13 +16,13 @@ use clap::Parser;
 /// docs/superpowers/plans/2026-09-05-nir-tier-a-implementation-plan.md's
 /// Global Constraints.
 ///
-/// Built by the shared [`common::user_agent!`] macro (LEG-21/LEG-24), so it
+/// Built by the shared [`ds_runtime::user_agent!`] macro (LEG-21/LEG-24), so it
 /// names this crate, its real version and the current project URL, e.g.
 /// `distant-signal-poller-nir-stations/0.1.0
 /// (+https://github.com/Distant-Signal/distant-signal)`. Re-verified
 /// 2026-09-27 with one GET per default CSV URL below: both HTTP 200 with the
 /// expected CSV header.
-pub(crate) const USER_AGENT: &str = common::user_agent!();
+pub(crate) const USER_AGENT: &str = ds_runtime::user_agent!();
 
 /// CLI/env configuration for the `poller-nir-stations` service.
 ///
@@ -77,7 +77,7 @@ pub(crate) struct Config {
 
     /// `/livez` listener and stall window (SVC-08).
     #[command(flatten)]
-    pub health: common::service_args::HealthArgs,
+    pub health: ds_runtime::service_args::HealthArgs,
 }
 
 impl std::fmt::Debug for Config {
@@ -130,7 +130,7 @@ mod user_agent_tests {
             format!(
                 "distant-signal-poller-nir-stations/{} (+{})",
                 env!("CARGO_PKG_VERSION"),
-                common::user_agent::PROJECT_URL
+                ds_runtime::user_agent::PROJECT_URL
             )
         );
         assert!(!USER_AGENT.contains("network-rail-status"));

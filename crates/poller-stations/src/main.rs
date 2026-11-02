@@ -37,20 +37,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    common::logging::init("poller-stations");
+    ds_runtime::logging::init("poller-stations");
 
     let config = Config::parse();
     config.validate()?;
     // Installed here rather than by the poll loop, so the schema gate's
     // `db_schema_ready` is exported while it waits.
     if config.metrics.metrics_enabled {
-        common::metrics::install(config.metrics_port)?;
+        ds_runtime::metrics::install(config.metrics_port)?;
     }
     let progress = health_http::spawn_liveness(&config.health);
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
@@ -78,7 +78,7 @@ async fn run() -> anyhow::Result<()> {
 /// role (spec §12.2) before the first poll.
 async fn connect_database(
     config: &Config,
-    progress: &common::progress::Progress,
+    progress: &ds_runtime::progress::Progress,
 ) -> anyhow::Result<sqlx::PgPool> {
     let url = &config.database_url;
     ds_store::pool::register_metrics();
@@ -93,7 +93,7 @@ async fn connect_database(
 async fn run_with(
     client: &Client,
     config: &Config,
-    progress: &common::progress::Progress,
+    progress: &ds_runtime::progress::Progress,
     sink: &DbSink,
 ) -> anyhow::Result<()> {
     common::poller_loop::run_poll_loop_with_source(

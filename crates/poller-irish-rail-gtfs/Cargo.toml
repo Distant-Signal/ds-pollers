@@ -14,6 +14,7 @@ anyhow = "1.0.102"
 chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 common = { path = "../common" }
+ds-runtime = { path = "../ds-runtime" }
 dotenvy = "0.15.7"
 gtfs-structures = "0.50"
 metrics = "0.24"

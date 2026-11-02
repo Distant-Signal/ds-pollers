@@ -149,7 +149,7 @@ pub(crate) struct Config {
     /// `/livez` listener and stall window. The chart sets an hour: one
     /// 123 MB download, its parse and the produce.
     #[command(flatten)]
-    pub health: common::service_args::HealthArgs,
+    pub health: ds_runtime::service_args::HealthArgs,
 }
 
 impl Config {
