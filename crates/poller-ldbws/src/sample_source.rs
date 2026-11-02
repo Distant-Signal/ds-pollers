@@ -25,9 +25,9 @@ pub(crate) struct SampleStationsArgs {
     #[arg(long, env, hide_env_values = true)]
     pub database_url: Option<ds_runtime::secret::Secret>,
 
-    /// The line catalogue: the same `lines/*.toml` the api serves, baked
-    /// into the image at `/app/lines`.
-    #[arg(long = "lines-dir", env = "LINES_DIR", default_value = "/app/lines")]
+    /// The line catalogue: the same `lines/*.toml` the api serves, built
+    /// into the binary (`ds_lines::EMBEDDED`), or a directory.
+    #[arg(long = "lines-dir", env = "LINES_DIR", default_value = ds_lines::EMBEDDED)]
     pub lines_dir: String,
 
     /// Set at startup ([`SampleStationsArgs::connect`]); `None` until
@@ -58,7 +58,7 @@ impl SampleStationsArgs {
             .database_url
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("poller-ldbws needs DATABASE_URL"))?;
-        let catalogue = common::config::parse_lines(&self.lines_dir)?;
+        let catalogue = ds_lines::parse_lines(&self.lines_dir)?;
         anyhow::ensure!(
             !catalogue.is_empty(),
             "no line definitions in {}: refusing to sample from an empty catalogue",
@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn the_read_needs_a_database_url() {
         let config = parse(&[]);
-        assert_eq!(config.reads.lines_dir, "/app/lines");
+        assert_eq!(config.reads.lines_dir, ds_lines::EMBEDDED);
         assert!(config.reads.direct.is_none());
         assert!(config.reads.validate().is_err());
         let db = parse(&[
@@ -244,10 +244,7 @@ mod tests {
     #[sqlx::test(migrations = "../ds-store/migrations")]
     #[ignore = "needs DATABASE_URL (a role that can create databases)"]
     async fn the_db_selection_equals_the_api_s(pool: sqlx::PgPool) {
-        let lines_dir = common::manifest_dir!().join("../../lines");
-        let catalogue = common::config::parse_lines(&lines_dir.to_string_lossy())
-            .unwrap()
-            .to_vec();
+        let catalogue = ds_lines::embedded().unwrap().to_vec();
         assert!(catalogue.len() > 2);
         for user in ["u-ldbws-1", "u-ldbws-2"] {
             sqlx::query("INSERT INTO users (id) VALUES ($1)")

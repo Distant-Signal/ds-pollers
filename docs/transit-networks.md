@@ -255,7 +255,7 @@ turns it into the same tables as Metrolink's. No source publishes NET's
 disruptions (BODS SIRI-SX has no Nottingham participant), so NET runs the
 timetable loop only: its lines show no status, and the producer refuses
 to start with `situationsEnabled` on. Rail links: Nottingham, Bulwell and
-Hucknall (`reference-data/transit/net-rail-links.csv`).
+Hucknall (`crates/poller-transit-schedule/reference-data/net-rail-links.csv`).
 
 | Value | Default | What it does |
 | --- | --- | --- |
@@ -551,7 +551,7 @@ For `<n>` (`[a-z0-9-]`):
    SIRI filters and line aliases, attribution; for a mixed network each
    line's `mode`; for a TXC zip of zips `inner_zip_prefix`; for overlapping
    override files `override_rule`), added to `FILES` in `src/network.rs`;
-   rail links in `reference-data/transit/<n>-rail-links.csv`, added to
+   rail links in `crates/poller-transit-schedule/reference-data/<n>-rail-links.csv`, added to
    `src/rail_links.rs` (none for a network whose stops link stations
    another way, as `tfl`'s do).
    A network whose line status is TfL's goes in
