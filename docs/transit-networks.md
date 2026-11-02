@@ -36,7 +36,7 @@ Everything ships off. These are Metrolink's switches, all in Ranma-Config
 The deploy that first carries the transit tables (and every later deploy
 that adds a transit table or changes its grants, such as a new network's
 freshness sources) relies on the chart running the postgres roles setup
-Job as a `pre-upgrade` hook after the migrate Job (chart fix 41bfe34a,
+Job as a `pre-upgrade` hook after the migrate Job (chart fix d374bd71,
 2026-10-14; docs/postgres-app-role.md, "Hook order"). Before that fix the
 Job was `post-upgrade`: Helm waited for the rollout first, while the
 ingest-writer (`Recreate`, its schema gate checking its grants on the new
