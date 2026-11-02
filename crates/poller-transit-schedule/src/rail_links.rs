@@ -1,6 +1,6 @@
 //! The links between a network's stations and National Rail stations
 //! (transit spec §6.3): a checked-in CSV per network,
-//! `reference-data/transit/<network>-rail-links.csv`, compiled in and sent
+//! `crates/poller-transit-schedule/reference-data/<network>-rail-links.csv`, compiled in and sent
 //! with every timetable (the writer replaces `transit_rail_links` with it
 //! at each activation).
 //!
@@ -15,12 +15,9 @@ use common::transit::{RailLinkKind, TransitRailLink, is_stop_id};
 const FILES: &[(&str, &str)] = &[
     (
         "metrolink",
-        include_str!("../../../reference-data/transit/metrolink-rail-links.csv"),
+        include_str!("../reference-data/metrolink-rail-links.csv"),
     ),
-    (
-        "net",
-        include_str!("../../../reference-data/transit/net-rail-links.csv"),
-    ),
+    ("net", include_str!("../reference-data/net-rail-links.csv")),
 ];
 
 /// The network's rail links (none if it has no file).
@@ -28,7 +25,9 @@ pub(crate) fn rail_links(network: &str) -> Result<Vec<TransitRailLink>> {
     let Some((_, text)) = FILES.iter().find(|(name, _)| *name == network) else {
         return Ok(Vec::new());
     };
-    parse(text).with_context(|| format!("reference-data/transit/{network}-rail-links.csv"))
+    parse(text).with_context(|| {
+        format!("crates/poller-transit-schedule/reference-data/{network}-rail-links.csv")
+    })
 }
 
 fn parse(text: &str) -> Result<Vec<TransitRailLink>> {

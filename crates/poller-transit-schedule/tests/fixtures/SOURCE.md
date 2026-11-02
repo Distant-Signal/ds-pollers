@@ -34,11 +34,11 @@ under the Open Government Licence v3.0 (Department for Transport).
 
 Rows unchanged, all columns kept: the `MET` station and `PLT` platform
 rows of 14 Metrolink stops (the ten rail interchanges of
-`reference-data/transit/metrolink-rail-links.csv`, plus Heaton Park,
+`crates/poller-transit-schedule/reference-data/metrolink-rail-links.csv`, plus Heaton Park,
 Besses o'th' Barn, Market Street and Timperley); 47 rows. Then, from the
 same URL downloaded on 2026-10-24, the 9 rows of NET's three rail
 interchanges (Nottingham Station, Bulwell and Hucknall, of
-`reference-data/transit/net-rail-links.csv`), appended; 56 rows.
+`crates/poller-transit-schedule/reference-data/net-rail-links.csv`), appended; 56 rows.
 
 ## `tnds-em-net-mini.xml`
 
