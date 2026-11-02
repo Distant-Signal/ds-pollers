@@ -105,13 +105,13 @@ const CYCLE_TIME_BUDGET: Duration = Duration::from_secs(45);
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    common::logging::init("poller-ldbws");
+    ds_runtime::logging::init("poller-ldbws");
 
     let mut config = Config::parse();
     config.reads.validate()?;
@@ -140,7 +140,7 @@ async fn run() -> anyhow::Result<()> {
     // the first skip; stays 0 forever with no budget set.
     for limit in [BudgetLimit::Cycle, BudgetLimit::Hour] {
         metrics::counter!(
-            common::metrics::metric_name("ldbws_budget_skipped_polls_total"),
+            ds_runtime::metrics::metric_name("ldbws_budget_skipped_polls_total"),
             "limit" => limit.as_str()
         )
         .increment(0);
@@ -279,7 +279,7 @@ fn retry_policy(poll_interval: Duration) -> common::poller_loop::RetryPolicy {
             backoff: ingest::API_STARTUP_WAIT.backoff,
             max_wait: Duration::ZERO,
         },
-        failed_cycle: common::backoff::Backoff::new(poll_interval * 2, poll_interval * 2),
+        failed_cycle: ds_runtime::backoff::Backoff::new(poll_interval * 2, poll_interval * 2),
     }
 }
 
@@ -316,7 +316,7 @@ async fn poll_once(
     config: &Config,
     state: &mut CycleState<'_>,
     first_list_wait: &ingest::ApiWait,
-    progress: Option<&common::progress::Progress>,
+    progress: Option<&ds_runtime::progress::Progress>,
     sink: &SampleSink,
 ) -> anyhow::Result<()> {
     let stations =
@@ -445,7 +445,7 @@ async fn station_list(
     config: &Config,
     cached: &mut Option<Vec<String>>,
     wait: &ingest::ApiWait,
-    progress: Option<&common::progress::Progress>,
+    progress: Option<&ds_runtime::progress::Progress>,
 ) -> anyhow::Result<Vec<String>> {
     let started = tokio::time::Instant::now();
     let mut failures: u32 = 0;
@@ -494,16 +494,16 @@ async fn station_list(
     reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52"
 )]
 fn record_cycle_metrics(total: usize, completed: usize, sampled: usize, stalest: Duration) {
-    metrics::gauge!(common::metrics::metric_name("ldbws_stations_total")).set(total as f64);
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name("ldbws_stations_total")).set(total as f64);
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "ldbws_stations_attempted_per_cycle"
     ))
     .set(completed as f64);
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "ldbws_stations_sampled_per_cycle"
     ))
     .set(sampled as f64);
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "ldbws_stalest_station_age_seconds"
     ))
     .set(stalest.as_secs_f64());
@@ -530,10 +530,14 @@ fn record_rotation_progress(
     now: std::time::Instant,
 ) {
     if let Some(full) = rotation.record_progress(total, completed, now) {
-        metrics::gauge!(common::metrics::metric_name("ldbws_full_rotation_seconds"))
-            .set(full.duration.as_secs_f64());
-        metrics::gauge!(common::metrics::metric_name("ldbws_full_rotation_cycles"))
-            .set(f64::from(full.cycles));
+        metrics::gauge!(ds_runtime::metrics::metric_name(
+            "ldbws_full_rotation_seconds"
+        ))
+        .set(full.duration.as_secs_f64());
+        metrics::gauge!(ds_runtime::metrics::metric_name(
+            "ldbws_full_rotation_cycles"
+        ))
+        .set(f64::from(full.cycles));
         if full.duration > AGGREGATOR_MAX_SAMPLE_AGE {
             tracing::warn!(
                 stations_total = total,
@@ -576,7 +580,7 @@ fn record_rotation_progress(
 /// stations.
 fn set_invalid_crs_gauge(crs: &str, invalid: bool) {
     metrics::gauge!(
-        common::metrics::metric_name("ldbws_invalid_crs_station"),
+        ds_runtime::metrics::metric_name("ldbws_invalid_crs_station"),
         "crs" => crs.to_string()
     )
     .set(if invalid { 1.0 } else { 0.0 });
@@ -608,7 +612,7 @@ fn record_invalid_crs(rotation: &mut Rotation, crs: &str, body: &str, now: std::
 /// logs one warning. Never called with no budget set.
 fn record_budget_skip(config: &Config, total: usize, skipped: usize, limit: BudgetLimit) {
     metrics::counter!(
-        common::metrics::metric_name("ldbws_budget_skipped_polls_total"),
+        ds_runtime::metrics::metric_name("ldbws_budget_skipped_polls_total"),
         "limit" => limit.as_str()
     )
     .increment(skipped as u64);
@@ -783,25 +787,31 @@ const TRACKED_STOP_TARGETS_METRIC: &str = "ldbws_tracked_stop_targets";
 fn register_tracked_stop_metrics() {
     for outcome in ["ok", "error"] {
         metrics::counter!(
-            common::metrics::metric_name(TRACKED_STOP_POLLS_METRIC),
+            ds_runtime::metrics::metric_name(TRACKED_STOP_POLLS_METRIC),
             "outcome" => outcome
         )
         .increment(0);
     }
-    metrics::counter!(common::metrics::metric_name(TRACKED_STOP_SKIPPED_METRIC)).increment(0);
-    metrics::gauge!(common::metrics::metric_name(TRACKED_STOP_TARGETS_METRIC)).set(0.0);
+    metrics::counter!(ds_runtime::metrics::metric_name(
+        TRACKED_STOP_SKIPPED_METRIC
+    ))
+    .increment(0);
+    metrics::gauge!(ds_runtime::metrics::metric_name(
+        TRACKED_STOP_TARGETS_METRIC
+    ))
+    .set(0.0);
     for outcome in ["ok", "error"] {
         metrics::counter!(
-            common::metrics::metric_name(TRACKED_STOP_ARRIVAL_POLLS_METRIC),
+            ds_runtime::metrics::metric_name(TRACKED_STOP_ARRIVAL_POLLS_METRIC),
             "outcome" => outcome
         )
         .increment(0);
     }
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         TRACKED_STOP_ARRIVAL_SKIPPED_METRIC
     ))
     .increment(0);
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         TRACKED_STOP_ARRIVAL_TARGETS_METRIC
     ))
     .set(0.0);
@@ -839,8 +849,10 @@ async fn sample_tracked_stops(
             return Vec::new();
         }
     };
-    metrics::gauge!(common::metrics::metric_name(TRACKED_STOP_TARGETS_METRIC))
-        .set(targets.len() as f64);
+    metrics::gauge!(ds_runtime::metrics::metric_name(
+        TRACKED_STOP_TARGETS_METRIC
+    ))
+    .set(targets.len() as f64);
     cadence.prune(now);
     let due = cadence.due(&targets, now);
     let cap = usize::try_from(config.tracked_stop_max_requests_per_cycle).unwrap_or(usize::MAX);
@@ -864,7 +876,7 @@ async fn sample_tracked_stops(
                             departures,
                         });
                         metrics::counter!(
-                            common::metrics::metric_name(TRACKED_STOP_POLLS_METRIC),
+                            ds_runtime::metrics::metric_name(TRACKED_STOP_POLLS_METRIC),
                             "outcome" => "ok"
                         )
                         .increment(1);
@@ -875,7 +887,7 @@ async fn sample_tracked_stops(
                         cadence.polled(target, Utc::now());
                         tracing::warn!(crs = %target.crs, error = ?err, "tracked-stop board poll failed");
                         metrics::counter!(
-                            common::metrics::metric_name(TRACKED_STOP_POLLS_METRIC),
+                            ds_runtime::metrics::metric_name(TRACKED_STOP_POLLS_METRIC),
                             "outcome" => "error"
                         )
                         .increment(1);
@@ -892,8 +904,10 @@ async fn sample_tracked_stops(
         }
     }
     let skipped = due.len().saturating_sub(attempted);
-    metrics::counter!(common::metrics::metric_name(TRACKED_STOP_SKIPPED_METRIC))
-        .increment(u64::try_from(skipped).unwrap_or(u64::MAX));
+    metrics::counter!(ds_runtime::metrics::metric_name(
+        TRACKED_STOP_SKIPPED_METRIC
+    ))
+    .increment(u64::try_from(skipped).unwrap_or(u64::MAX));
     boards
 }
 
@@ -943,7 +957,7 @@ async fn sample_tracked_arrivals(
             return Vec::new();
         }
     };
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         TRACKED_STOP_ARRIVAL_TARGETS_METRIC
     ))
     .set(targets.len() as f64);
@@ -979,7 +993,7 @@ async fn sample_tracked_arrivals(
                             arrivals,
                         });
                         metrics::counter!(
-                            common::metrics::metric_name(TRACKED_STOP_ARRIVAL_POLLS_METRIC),
+                            ds_runtime::metrics::metric_name(TRACKED_STOP_ARRIVAL_POLLS_METRIC),
                             "outcome" => "ok"
                         )
                         .increment(1);
@@ -990,7 +1004,7 @@ async fn sample_tracked_arrivals(
                         cadence.polled(target, Utc::now());
                         tracing::warn!(crs = %target.crs, error = ?err, "tracked-stop arrival board poll failed");
                         metrics::counter!(
-                            common::metrics::metric_name(TRACKED_STOP_ARRIVAL_POLLS_METRIC),
+                            ds_runtime::metrics::metric_name(TRACKED_STOP_ARRIVAL_POLLS_METRIC),
                             "outcome" => "error"
                         )
                         .increment(1);
@@ -1007,7 +1021,7 @@ async fn sample_tracked_arrivals(
         }
     }
     let skipped = due.len().saturating_sub(attempted);
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         TRACKED_STOP_ARRIVAL_SKIPPED_METRIC
     ))
     .increment(u64::try_from(skipped).unwrap_or(u64::MAX));
@@ -1282,7 +1296,7 @@ async fn fetch_departures(
                     // -- logs don't carry the same per-series cardinality
                     // cost a Prometheus label does.
                     metrics::counter!(
-                        common::metrics::metric_name("ldbws_numrows_fallback_total"),
+                        ds_runtime::metrics::metric_name("ldbws_numrows_fallback_total"),
                         "outcome" => "recovered"
                     )
                     .increment(1);
@@ -1308,7 +1322,7 @@ async fn fetch_departures(
                 let Some(next_num_rows) = next_num_rows else {
                     if fell_back {
                         metrics::counter!(
-                            common::metrics::metric_name("ldbws_numrows_fallback_total"),
+                            ds_runtime::metrics::metric_name("ldbws_numrows_fallback_total"),
                             "outcome" => "exhausted"
                         )
                         .increment(1);
@@ -1414,10 +1428,10 @@ mod tests {
             ldbws_arrivals_consumer_key: None,
             ldbws_arrivals_consumer_secret: None,
             metrics_port: 9091,
-            metrics: common::service_args::MetricsArgs {
+            metrics: ds_runtime::service_args::MetricsArgs {
                 metrics_enabled: false,
             },
-            health: common::service_args::HealthArgs {
+            health: ds_runtime::service_args::HealthArgs {
                 health_bind_url: "127.0.0.1:0".to_string(),
                 progress_stall_secs: 1800,
             },
@@ -2184,7 +2198,7 @@ mod tests {
 
     /// Never waits long for a first station list.
     const TEST_LIST_WAIT: ingest::ApiWait = ingest::ApiWait {
-        backoff: common::backoff::Backoff::new(
+        backoff: ds_runtime::backoff::Backoff::new(
             Duration::from_millis(10),
             Duration::from_millis(20),
         ),

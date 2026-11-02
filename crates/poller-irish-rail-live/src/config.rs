@@ -13,7 +13,7 @@ use clap::Parser;
 /// closest existing precedent for "make one API call per station each
 /// cycle"): `internal_oauth`/`metrics` are `#[command(flatten)]`d shared
 /// arg blocks (`common::oauth_client::InternalOAuthArgs`,
-/// `common::service_args::MetricsArgs`) rather than the 5+1 individual
+/// `ds_runtime::service_args::MetricsArgs`) rather than the 5+1 individual
 /// fields the sibling `poller-irish-rail-gtfs` crate still hand-rolls --
 /// that crate predates
 /// docs/superpowers/specs/2026-09-05-rust-service-deduplication-design.md's
@@ -88,11 +88,11 @@ pub(crate) struct Config {
     pub metrics_port: u16,
 
     #[command(flatten)]
-    pub metrics: common::service_args::MetricsArgs,
+    pub metrics: ds_runtime::service_args::MetricsArgs,
 
     /// `/livez` listener and stall window (SVC-08).
     #[command(flatten)]
-    pub health: common::service_args::HealthArgs,
+    pub health: ds_runtime::service_args::HealthArgs,
 }
 
 #[cfg(test)]

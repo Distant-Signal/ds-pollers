@@ -13,7 +13,7 @@ use clap::Parser;
 /// `TfL` subscription key; a derived `Debug` would print it in full to any
 /// future `tracing::debug!("{config:?}")`, matching the same class of bug
 /// already fixed for `common::oauth_client::OAuthCredentials` and
-/// `common::service_args::KafkaConnectionArgs`. The hand-written impl
+/// `ds_runtime::service_args::KafkaConnectionArgs`. The hand-written impl
 /// below redacts it.
 #[derive(Parser)]
 pub(crate) struct Config {
@@ -91,11 +91,11 @@ pub(crate) struct Config {
     pub metrics_port: u16,
 
     #[command(flatten)]
-    pub metrics: common::service_args::MetricsArgs,
+    pub metrics: ds_runtime::service_args::MetricsArgs,
 
     /// `/livez` listener and stall window (SVC-08).
     #[command(flatten)]
-    pub health: common::service_args::HealthArgs,
+    pub health: ds_runtime::service_args::HealthArgs,
 }
 
 /// The jobs a process runs (`TFL_JOBS`).

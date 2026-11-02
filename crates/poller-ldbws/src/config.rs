@@ -13,7 +13,7 @@ use clap::Parser;
 /// RDM Live Departure Board API key; a derived `Debug` would print it in
 /// full to any future `tracing::debug!("{config:?}")`, matching the same
 /// class of bug already fixed for `common::oauth_client::OAuthCredentials`
-/// and `common::service_args::KafkaConnectionArgs`. The hand-written impl
+/// and `ds_runtime::service_args::KafkaConnectionArgs`. The hand-written impl
 /// below redacts it.
 #[derive(Parser)]
 pub(crate) struct Config {
@@ -137,13 +137,13 @@ pub(crate) struct Config {
     /// (how RDM API products authenticate, as `RDM_API_KEY` does for the
     /// departure boards).
     #[arg(long, env, hide_env_values = true)]
-    pub ldbws_arrivals_consumer_key: Option<common::secret::Secret>,
+    pub ldbws_arrivals_consumer_key: Option<ds_runtime::secret::Secret>,
 
     /// The arrivals product's consumer secret. Wired from the Secret for
     /// completeness but not sent: RDM's API products authenticate with
     /// the consumer key alone.
     #[arg(long, env, hide_env_values = true)]
-    pub ldbws_arrivals_consumer_secret: Option<common::secret::Secret>,
+    pub ldbws_arrivals_consumer_secret: Option<ds_runtime::secret::Secret>,
 
     /// Port for this poller's Prometheus `/metrics` endpoint. Stays a
     /// plain field, not part of `MetricsArgs` -- its default differs per
@@ -152,11 +152,11 @@ pub(crate) struct Config {
     pub metrics_port: u16,
 
     #[command(flatten)]
-    pub metrics: common::service_args::MetricsArgs,
+    pub metrics: ds_runtime::service_args::MetricsArgs,
 
     /// `/livez` listener and stall window (SVC-08).
     #[command(flatten)]
-    pub health: common::service_args::HealthArgs,
+    pub health: ds_runtime::service_args::HealthArgs,
 
     /// `DATABASE_URL` and `LINES_DIR` (ingest architecture plan 4.5): see
     /// `sample_source.rs`.
@@ -187,7 +187,7 @@ pub(crate) struct IngestArgs {
 
     /// That user's password (or the `redis.auth` one). Never logged.
     #[arg(long, env, hide_env_values = true)]
-    pub redis_password: Option<common::secret::Secret>,
+    pub redis_password: Option<ds_runtime::secret::Secret>,
 }
 
 impl IngestArgs {
@@ -196,7 +196,7 @@ impl IngestArgs {
         let Some(url) = self.redis_url.as_deref().filter(|url| !url.is_empty()) else {
             anyhow::bail!("poller-ldbws needs REDIS_URL, for ds:ingest:station-samples");
         };
-        let url = common::redis_auth::redis_url_with_credentials(
+        let url = ds_runtime::redis_auth::redis_url_with_credentials(
             url,
             self.redis_username.as_deref(),
             self.redis_password.as_ref(),
