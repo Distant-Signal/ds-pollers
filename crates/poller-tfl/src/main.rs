@@ -64,14 +64,14 @@ struct RetryPolicy {
     /// Attempts in all, the first included.
     max_attempts: u32,
     /// Backoff when `TfL` names no wait: 2 s doubling, capped.
-    backoff: common::backoff::Backoff,
+    backoff: ds_runtime::backoff::Backoff,
 }
 
 /// The five-minute line-status poll: three attempts, so a retrying cycle
 /// stays well inside its 300 s interval even when told to wait.
 const STATUS_RETRY: RetryPolicy = RetryPolicy {
     max_attempts: 3,
-    backoff: common::backoff::Backoff::new(Duration::from_secs(2), Duration::from_secs(60)),
+    backoff: ds_runtime::backoff::Backoff::new(Duration::from_secs(2), Duration::from_secs(60)),
 };
 
 /// The daily stops and routes jobs: no deadline worth keeping, and a fetch
@@ -79,7 +79,7 @@ const STATUS_RETRY: RetryPolicy = RetryPolicy {
 /// retry longer.
 const DAILY_RETRY: RetryPolicy = RetryPolicy {
     max_attempts: 6,
-    backoff: common::backoff::Backoff::new(Duration::from_secs(2), Duration::from_secs(60)),
+    backoff: ds_runtime::backoff::Backoff::new(Duration::from_secs(2), Duration::from_secs(60)),
 };
 
 /// The policy for a fetch, by its `what` label.
@@ -155,15 +155,15 @@ fn require_non_empty_key(key: &str) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    common::logging::init("poller-tfl");
+    ds_runtime::logging::init("poller-tfl");
     // See `release_after`.
-    common::heap::pin_mmap_threshold();
+    ds_runtime::heap::pin_mmap_threshold();
 
     let config = Config::parse();
     let once = common::poller_loop::RunOnce::from_env()?.is_some();
@@ -271,7 +271,7 @@ async fn run() -> anyhow::Result<()> {
 async fn daily_once(
     client: &Client,
     config: &Config,
-    progress: &common::progress::Progress,
+    progress: &ds_runtime::progress::Progress,
     stops: Option<DailySink>,
     routes: Option<DailySink>,
 ) -> anyhow::Result<()> {
@@ -318,7 +318,7 @@ fn worst_of(results: Vec<anyhow::Result<()>>) -> anyhow::Result<()> {
     let mut rejected = None;
     for result in results {
         if let Err(err) = result {
-            if common::logging::exit_status_of(&err) == 1 {
+            if ds_runtime::logging::exit_status_of(&err) == 1 {
                 return Err(err);
             }
             rejected.get_or_insert(err);
@@ -367,12 +367,12 @@ const STOPS_CALL_GAP: Duration = Duration::from_millis(250);
 /// resident for the rest of the day: 88 MiB against the pod's 32Mi request
 /// on 2026-11-01, hours after the 19:00 routes run. With the mmap threshold
 /// pinned at startup the big buffers are their own mappings, and the trim
-/// returns the rest (`common::heap`, as poller-transit-schedule does).
+/// returns the rest (`ds_runtime::heap`, as poller-transit-schedule does).
 async fn release_after(job: impl Future<Output = anyhow::Result<()>>) -> anyhow::Result<()> {
     let result = job.await;
-    common::heap::release_freed_memory();
+    ds_runtime::heap::release_freed_memory();
     tracing::debug!(
-        rss_bytes = common::heap::resident_set_bytes(),
+        rss_bytes = ds_runtime::heap::resident_set_bytes(),
         "released the daily job's freed heap"
     );
     result
@@ -417,7 +417,7 @@ async fn stops_once(client: &Client, config: &Config, sink: &DailySink) -> anyho
     let baseline = last_published_count(sink, common::tfl_stops::SCHEMA).await?;
     if let Err(refusal) = stops::check(rows.len(), baseline, config.tfl_stops_max_drop_fraction) {
         metrics::counter!(
-            common::metrics::metric_name("tfl_stops_refused_total"),
+            ds_runtime::metrics::metric_name("tfl_stops_refused_total"),
             "reason" => refusal.reason()
         )
         .increment(1);
@@ -439,9 +439,9 @@ async fn stops_once(client: &Client, config: &Config, sink: &DailySink) -> anyho
     );
     sink.stream.publish(&rows, fetched_at).await?;
     #[expect(clippy::cast_precision_loss, reason = "a few hundred stops")]
-    metrics::gauge!(common::metrics::metric_name("tfl_stops_published")).set(rows.len() as f64);
+    metrics::gauge!(ds_runtime::metrics::metric_name("tfl_stops_published")).set(rows.len() as f64);
     #[expect(clippy::cast_precision_loss, reason = "a Unix timestamp in seconds")]
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "tfl_stops_last_success_timestamp_seconds"
     ))
     .set(fetched_at.timestamp() as f64);
@@ -489,7 +489,7 @@ async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyh
     let baseline = last_published_count(sink, common::tfl_routes::SCHEMA).await?;
     if let Err(refusal) = stops::check(rows.len(), baseline, config.tfl_stops_max_drop_fraction) {
         metrics::counter!(
-            common::metrics::metric_name("tfl_routes_refused_total"),
+            ds_runtime::metrics::metric_name("tfl_routes_refused_total"),
             "reason" => refusal.reason()
         )
         .increment(1);
@@ -509,9 +509,10 @@ async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyh
     );
     sink.stream.publish(&rows, fetched_at).await?;
     #[expect(clippy::cast_precision_loss, reason = "about a hundred routes")]
-    metrics::gauge!(common::metrics::metric_name("tfl_routes_published")).set(rows.len() as f64);
+    metrics::gauge!(ds_runtime::metrics::metric_name("tfl_routes_published"))
+        .set(rows.len() as f64);
     #[expect(clippy::cast_precision_loss, reason = "a Unix timestamp in seconds")]
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         "tfl_routes_last_success_timestamp_seconds"
     ))
     .set(fetched_at.timestamp() as f64);
@@ -519,8 +520,8 @@ async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyh
 }
 
 /// The route timetables `TfL` does not publish (404), logged once each.
-static UNPUBLISHED_TIMETABLES: std::sync::LazyLock<common::log_once::LogOnceSet> =
-    std::sync::LazyLock::new(common::log_once::LogOnceSet::new);
+static UNPUBLISHED_TIMETABLES: std::sync::LazyLock<ds_runtime::log_once::LogOnceSet> =
+    std::sync::LazyLock::new(ds_runtime::log_once::LogOnceSet::new);
 
 /// `routes` with their running times (DS-206; [`routes::StepSamples`]):
 /// one `GET /Line/{id}/Timetable/{first}/to/{last}` per route (about 80 a
@@ -564,7 +565,7 @@ async fn with_running_times(
                 // origins (trams: from Wimbledon alone), so a 404 is a
                 // route it has none for, every day: not a failure. Logged
                 // once a process.
-                metrics::counter!(common::metrics::metric_name(
+                metrics::counter!(ds_runtime::metrics::metric_name(
                     "tfl_route_timetables_unpublished_total"
                 ))
                 .increment(1);
@@ -582,7 +583,7 @@ async fn with_running_times(
             Err(err) => Err(err),
         };
         if let Err(err) = added {
-            metrics::counter!(common::metrics::metric_name(
+            metrics::counter!(ds_runtime::metrics::metric_name(
                 "tfl_route_timetables_failed_total"
             ))
             .increment(1);
@@ -609,7 +610,7 @@ async fn with_running_times(
         route.step_seconds = steps;
         if mirrored > 0 {
             metrics::counter!(
-                common::metrics::metric_name("tfl_route_steps_mirrored_total"),
+                ds_runtime::metrics::metric_name("tfl_route_steps_mirrored_total"),
                 "line" => route.line_id.clone()
             )
             .increment(u64::try_from(mirrored).unwrap_or(u64::MAX));
@@ -729,7 +730,7 @@ async fn fetch_json(
                 Some(_) => "retried_5xx",
             };
             metrics::counter!(
-                common::metrics::metric_name("tfl_fetch_total"),
+                ds_runtime::metrics::metric_name("tfl_fetch_total"),
                 "what" => what.to_string(),
                 "outcome" => outcome
             )
@@ -753,7 +754,7 @@ async fn fetch_json(
                 "exhausted"
             };
             metrics::counter!(
-                common::metrics::metric_name("tfl_fetch_total"),
+                ds_runtime::metrics::metric_name("tfl_fetch_total"),
                 "what" => what.to_string(),
                 "outcome" => outcome
             )
@@ -768,7 +769,7 @@ async fn fetch_json(
 
         retried_status = Some(status);
         metrics::counter!(
-            common::metrics::metric_name("tfl_fetch_retries_total"),
+            ds_runtime::metrics::metric_name("tfl_fetch_retries_total"),
             "what" => what.to_string(),
             "status" => if status == StatusCode::TOO_MANY_REQUESTS { "429" } else { "5xx" }
         )
@@ -864,13 +865,13 @@ mod tests {
     #[test]
     fn a_once_run_exits_transient_before_rejected() {
         let rejected =
-            || Err(anyhow::anyhow!("refused").context(common::logging::ExitStatus::REJECTED));
+            || Err(anyhow::anyhow!("refused").context(ds_runtime::logging::ExitStatus::REJECTED));
         let transient = || Err(anyhow::anyhow!("TfL timed out"));
         assert!(worst_of(vec![Ok(()), Ok(())]).is_ok());
         let err = worst_of(vec![rejected(), transient()]).unwrap_err();
-        assert_eq!(common::logging::exit_status_of(&err), 1);
+        assert_eq!(ds_runtime::logging::exit_status_of(&err), 1);
         let err = worst_of(vec![Ok(()), rejected()]).unwrap_err();
-        assert_eq!(common::logging::exit_status_of(&err), 3);
+        assert_eq!(ds_runtime::logging::exit_status_of(&err), 3);
     }
 
     #[test]

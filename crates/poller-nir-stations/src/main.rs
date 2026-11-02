@@ -27,13 +27,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    common::logging::init("poller-nir-stations");
+    ds_runtime::logging::init("poller-nir-stations");
 
     let config = Config::parse();
     let progress = health_http::spawn_liveness(&config.health);

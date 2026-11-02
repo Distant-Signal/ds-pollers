@@ -1,5 +1,5 @@
 use clap::Parser;
-use common::secret::Secret;
+use ds_runtime::secret::Secret;
 
 /// CLI/env configuration for the `poller-incidents` service.
 ///
@@ -14,7 +14,7 @@ use common::secret::Secret;
 /// RDM Knowledgebase API key; a derived `Debug` would print it in full to
 /// any future `tracing::debug!("{config:?}")`, matching the same class of
 /// bug already fixed for `common::oauth_client::OAuthCredentials` and
-/// `common::service_args::KafkaConnectionArgs`. The hand-written impl
+/// `ds_runtime::service_args::KafkaConnectionArgs`. The hand-written impl
 /// below redacts it.
 #[derive(Parser)]
 pub(crate) struct Config {
@@ -40,15 +40,15 @@ pub(crate) struct Config {
     pub metrics_port: u16,
 
     #[command(flatten)]
-    pub metrics: common::service_args::MetricsArgs,
+    pub metrics: ds_runtime::service_args::MetricsArgs,
 
     /// `/livez` listener and stall window (SVC-08).
     #[command(flatten)]
-    pub health: common::service_args::HealthArgs,
+    pub health: ds_runtime::service_args::HealthArgs,
 
     /// The `distant_signal_incidents` role's connection (required).
     /// Pool size and timeouts come from the shared `DATABASE_*` variables
-    /// (`common::pg`); the default pool is 2.
+    /// (`ds_runtime::pg`); the default pool is 2.
     #[arg(long, env, hide_env_values = true)]
     pub database_url: Option<Secret>,
 
@@ -65,7 +65,7 @@ pub(crate) struct Config {
 
     /// Redis AUTH password (chart `redis.auth`, or the `poller-incidents`
     /// ACL user's own). Applied by
-    /// `common::redis_auth::redis_url_with_credentials`, never logged.
+    /// `ds_runtime::redis_auth::redis_url_with_credentials`, never logged.
     #[arg(long, env, hide_env_values = true)]
     pub redis_password: Option<Secret>,
 

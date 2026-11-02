@@ -97,7 +97,7 @@ pub(crate) fn check_against_last_published(
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     check(previous, new, max_drop_fraction).map_err(|refused| {
-        metrics::counter!(common::metrics::metric_name("gtfs_feed_refused_total")).increment(1);
+        metrics::counter!(ds_runtime::metrics::metric_name("gtfs_feed_refused_total")).increment(1);
         tracing::error!(?previous, ?new, max_drop_fraction, "{refused}");
         anyhow::Error::new(common::ingest::DataRejected(refused.to_string()))
     })
@@ -118,7 +118,7 @@ pub(crate) fn record_published(published: FeedCounts) {
         ("lines", published.lines as f64),
     ] {
         metrics::gauge!(
-            common::metrics::metric_name("gtfs_feed_published_items"),
+            ds_runtime::metrics::metric_name("gtfs_feed_published_items"),
             "kind" => kind
         )
         .set(count);

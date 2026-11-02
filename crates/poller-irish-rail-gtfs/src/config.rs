@@ -49,7 +49,7 @@ pub(crate) struct Config {
 
     /// `/livez` listener and stall window (SVC-08).
     #[command(flatten)]
-    pub health: common::service_args::HealthArgs,
+    pub health: ds_runtime::service_args::HealthArgs,
 
     /// Sharp-drop guard (`feed_guard`): a feed whose station or line count
     /// fell by more than this fraction since the last published feed is

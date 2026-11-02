@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context as _, Result, bail};
 use chrono::Utc;
-use common::metrics::metric_name;
 use common::transit::{SituationScope, TransitSituations, schema};
+use ds_runtime::metrics::metric_name;
 use ingest_stream::snapshot::Snapshot;
 use ingest_stream::{Envelope, SchemaId};
 

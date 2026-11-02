@@ -13,8 +13,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use common::metrics::metric_name;
 use common::transit::{TimetableCommit, schema};
+use ds_runtime::metrics::metric_name;
 
 use crate::Context;
 use crate::adapter::gtfs::{self, GtfsOptions};
