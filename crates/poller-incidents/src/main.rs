@@ -90,7 +90,7 @@ async fn db_sink(
         .ok_or_else(|| anyhow::anyhow!("poller-incidents needs REDIS_URL"))?;
 
     // Before any DB work: a broken catalogue is a configuration error.
-    let lines = common::config::parse_lines(&config.lines_dir)?;
+    let lines = ds_lines::parse_lines(&config.lines_dir)?;
     anyhow::ensure!(
         !lines.is_empty(),
         "no line definitions in {}: refusing to write incidents with an empty catalogue \

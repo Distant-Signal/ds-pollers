@@ -115,10 +115,6 @@ RUN apt-get update \
     && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 1000 --gid 1000 poller
 
 COPY --from=builder /usr/local/bin/poller-incidents /usr/local/bin/poller-incidents
-# The line catalogue (LINES_DIR, default /app/lines): the DB sink
-# (INGEST_SINK=db, ingest plan 2c.2) builds the matcher that fills
-# incidents.affected_lines from it at startup, as the api does.
-COPY --chown=poller:poller lines/ /app/lines/
 
 # Numeric USER, not the `poller` name useradd created above: Kubernetes'
 # runAsNonRoot admission check (this chart's podSecurityContext sets
