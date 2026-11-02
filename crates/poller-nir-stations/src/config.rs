@@ -19,7 +19,7 @@ use clap::Parser;
 /// Built by the shared [`common::user_agent!`] macro (LEG-21/LEG-24), so it
 /// names this crate, its real version and the current project URL, e.g.
 /// `distant-signal-poller-nir-stations/0.1.0
-/// (+https://github.com/FasterSpeeding/Distant-Signal)`. Re-verified
+/// (+https://github.com/Distant-Signal/distant-signal)`. Re-verified
 /// 2026-09-27 with one GET per default CSV URL below: both HTTP 200 with the
 /// expected CSV header.
 pub(crate) const USER_AGENT: &str = common::user_agent!();
