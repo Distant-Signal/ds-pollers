@@ -58,8 +58,8 @@ const CYCLE_TIME_BUDGET: Duration = Duration::from_secs(240);
 
 /// The `User-Agent` every request to Irish Rail carries (LEG-21): honest and
 /// identifying (crate name, version, project URL) rather than reqwest's
-/// default of sending none at all. See `common::user_agent`.
-const USER_AGENT: &str = common::user_agent!();
+/// default of sending none at all. See `ds_runtime::user_agent`.
+const USER_AGENT: &str = ds_runtime::user_agent!();
 
 /// Builds the HTTP client used for every upstream fetch and ingest POST.
 /// Split out of `main` so the test below can assert, over real HTTP, that
@@ -73,13 +73,13 @@ fn build_client() -> reqwest::Result<Client> {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    common::logging::init("poller-irish-rail-live");
+    ds_runtime::logging::init("poller-irish-rail-live");
 
     let config = Config::parse();
     let progress = health_http::spawn_liveness(&config.health);
@@ -254,7 +254,7 @@ mod tests {
     #[tokio::test]
     async fn client_sends_an_identifying_user_agent() {
         assert!(USER_AGENT.starts_with(concat!("distant-signal-", env!("CARGO_PKG_NAME"), "/")));
-        assert!(USER_AGENT.contains(common::user_agent::PROJECT_URL));
+        assert!(USER_AGENT.contains(ds_runtime::user_agent::PROJECT_URL));
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(wiremock::matchers::header("user-agent", USER_AGENT))
@@ -285,10 +285,10 @@ mod tests {
             poll_interval_secs: 300,
             station_codes_override: vec![],
             metrics_port: 9091,
-            metrics: common::service_args::MetricsArgs {
+            metrics: ds_runtime::service_args::MetricsArgs {
                 metrics_enabled: false,
             },
-            health: common::service_args::HealthArgs {
+            health: ds_runtime::service_args::HealthArgs {
                 health_bind_url: "127.0.0.1:0".to_string(),
                 progress_stall_secs: 1800,
             },

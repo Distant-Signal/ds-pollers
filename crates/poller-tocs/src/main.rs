@@ -35,13 +35,13 @@ const ONCE_FLUSH_GRACE: Duration = Duration::from_secs(120);
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    common::logging::init("poller-tocs");
+    ds_runtime::logging::init("poller-tocs");
 
     let config = Config::parse();
     let progress = health_http::spawn_liveness(&config.health);

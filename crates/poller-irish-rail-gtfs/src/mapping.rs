@@ -91,7 +91,7 @@ impl FeedIssues {
     pub(crate) fn record(&self) {
         for (issue, count) in &self.0 {
             metrics::counter!(
-                common::metrics::metric_name("gtfs_feed_issues_total"),
+                ds_runtime::metrics::metric_name("gtfs_feed_issues_total"),
                 "kind" => issue.kind()
             )
             .increment(*count);

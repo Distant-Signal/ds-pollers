@@ -20,10 +20,10 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 1;
 #[derive(Debug, Default, clap::Args)]
 pub(crate) struct SampleStationsArgs {
     /// Postgres, as the `ldbws_ro` role (required). Pool size and timeouts
-    /// come from the shared `DATABASE_*` variables (`common::pg`); the
+    /// come from the shared `DATABASE_*` variables (`ds_runtime::pg`); the
     /// default pool is 1 (spec §6.6, role limit 2).
     #[arg(long, env, hide_env_values = true)]
-    pub database_url: Option<common::secret::Secret>,
+    pub database_url: Option<ds_runtime::secret::Secret>,
 
     /// The line catalogue: the same `lines/*.toml` the api serves, built
     /// into the binary (`ds_lines::EMBEDDED`), or a directory.
@@ -42,7 +42,7 @@ impl SampleStationsArgs {
         if self
             .database_url
             .as_ref()
-            .is_none_or(common::secret::Secret::is_empty)
+            .is_none_or(ds_runtime::secret::Secret::is_empty)
         {
             anyhow::bail!("poller-ldbws needs DATABASE_URL, for the sample stations");
         }

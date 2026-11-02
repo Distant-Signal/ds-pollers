@@ -52,7 +52,7 @@ const ONCE_FLUSH_GRACE: Duration = Duration::from_secs(120);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// The `User-Agent` of every request: honest and identifying (LEG-21).
-const USER_AGENT: &str = common::user_agent!();
+const USER_AGENT: &str = ds_runtime::user_agent!();
 
 /// What every cycle needs.
 pub(crate) struct Context {
@@ -84,14 +84,14 @@ const READINESS_INTERVAL: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    common::logging::init(COMPONENT);
+    ds_runtime::logging::init(COMPONENT);
     // See `timetable_cycle`.
-    common::heap::pin_mmap_threshold();
+    ds_runtime::heap::pin_mmap_threshold();
 
     let config = Config::parse();
     let network = NetworkConfig::load(&config.network)?;
@@ -118,7 +118,7 @@ async fn run() -> anyhow::Result<()> {
     let situations = SnapshotProducer::new(redis.clone(), &stream, COMPONENT);
     situations.start();
     if config.metrics_enabled {
-        common::metrics::install(config.metrics_port)?;
+        ds_runtime::metrics::install(config.metrics_port)?;
     }
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -225,13 +225,13 @@ async fn finish(ctx: &Context, result: anyhow::Result<()>, once: bool) -> anyhow
 /// later, but glibc kept it resident for the rest of the day (313 MiB an
 /// hour after a run, 2026-10-31). With the mmap threshold pinned at startup
 /// the big buffers are their own mappings, and the trim returns the rest
-/// (`common::heap`).
+/// (`ds_runtime::heap`).
 async fn timetable_cycle(ctx: &Context) -> anyhow::Result<()> {
     let result = timetable::poll_once(ctx).await;
     // The cycle's model, parts and baseline are dropped by now.
-    common::heap::release_freed_memory();
+    ds_runtime::heap::release_freed_memory();
     tracing::debug!(
-        rss_bytes = common::heap::resident_set_bytes(),
+        rss_bytes = ds_runtime::heap::resident_set_bytes(),
         "released the timetable cycle's freed heap"
     );
     result

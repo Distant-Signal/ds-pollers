@@ -28,7 +28,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 /// `pg_stat_activity.application_name` of the DB sink's pool.
@@ -40,7 +40,7 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 2;
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    common::logging::init("poller-incidents");
+    ds_runtime::logging::init("poller-incidents");
 
     let config = Config::parse();
     config.validate()?;
@@ -50,7 +50,7 @@ async fn run() -> anyhow::Result<()> {
     let budget = common::poller_loop::post_retry_budget(poll_interval);
 
     if config.metrics.metrics_enabled {
-        common::metrics::install(config.metrics_port)?;
+        ds_runtime::metrics::install(config.metrics_port)?;
     }
     let sink = db_sink(&config, &progress, budget).await?;
     tracing::info!(
@@ -77,7 +77,7 @@ async fn run() -> anyhow::Result<()> {
 /// publish, so a Redis outage never blocks startup or ingest).
 async fn db_sink(
     config: &Config,
-    progress: &common::progress::Progress,
+    progress: &ds_runtime::progress::Progress,
     budget: Duration,
 ) -> anyhow::Result<sink::DbSink<sink::RedisPublisher>> {
     let database_url = config
@@ -110,7 +110,7 @@ async fn db_sink(
     // first, and the chart's alert sums them across pods).
     ds_store::incidents::removal::register_metrics();
 
-    let redis_url = common::redis_auth::redis_url_with_credentials(
+    let redis_url = ds_runtime::redis_auth::redis_url_with_credentials(
         redis_url.expose(),
         config.redis_username.as_deref(),
         config.redis_password.as_ref(),
@@ -141,7 +141,7 @@ async fn poll_once(
         complete = parsed.complete(),
         "parsed incidents from RDM feed"
     );
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "poller_incidents_skipped_elements_total"
     ))
     .increment(parsed.skipped);
