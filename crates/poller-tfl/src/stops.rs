@@ -503,7 +503,7 @@ mod tests {
         let tube = &stops["940GZZLUXAA"];
         assert_eq!(tube.crs, ["XAA"]);
         assert_eq!(tube.rail_tiplocs, ["AARDV2", "AARDVK"]);
-        assert!(stops["940GZZDLXBB"].crs.is_empty());
+        assert_eq!(stops["940GZZDLXBB"].crs, [] as [String; 0]);
     }
 
     #[test]
@@ -527,7 +527,7 @@ mod tests {
             &mut stops,
             &hub_rail(parse_page(HUBS_JSON).unwrap().stop_points),
         );
-        assert!(stops["940GZZLUXGG"].crs.is_empty());
+        assert_eq!(stops["940GZZLUXGG"].crs, [] as [String; 0]);
     }
 
     #[test]

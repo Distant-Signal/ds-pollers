@@ -188,6 +188,6 @@ mod tests {
             assert!(parse(&format!("{header}{bad}")).is_err(), "{bad}");
         }
         assert!(parse("stop,crs\n").is_err());
-        assert!(rail_links("supertram").unwrap().is_empty());
+        assert_eq!(rail_links("supertram").unwrap(), []);
     }
 }

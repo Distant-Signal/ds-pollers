@@ -502,7 +502,7 @@ mod tests {
 
         let recovered = rotation.finish_cycle(&all, 3, all.iter().map(String::as_str), due);
         assert_eq!(recovered, vec![bad.clone()]);
-        assert!(rotation.invalid_stations().is_empty());
+        assert_eq!(rotation.invalid_stations(), [] as [&str; 0]);
         assert_eq!(rotation.pollable(&all, due), all);
     }
 
@@ -587,9 +587,9 @@ mod tests {
         let mut all = stations(3);
         let bad = all[0].clone();
         rotation.mark_invalid(&bad, started);
-        assert!(rotation.prune_invalid(&all).is_empty());
+        assert_eq!(rotation.prune_invalid(&all), [] as [String; 0]);
         all.remove(0);
         assert_eq!(rotation.prune_invalid(&all), vec![bad]);
-        assert!(rotation.invalid_stations().is_empty());
+        assert_eq!(rotation.invalid_stations(), [] as [&str; 0]);
     }
 }

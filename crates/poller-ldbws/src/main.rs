@@ -2057,7 +2057,7 @@ mod tests {
         .await;
 
         assert!(sampling.samples.is_empty());
-        assert!(sampling.invalid_crs.is_empty());
+        assert_eq!(sampling.invalid_crs, []);
         assert_eq!(sampling.completed, 1);
     }
 

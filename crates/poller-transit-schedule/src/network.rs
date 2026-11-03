@@ -377,7 +377,7 @@ mod tests {
         assert_eq!(config.line_for_route("Line 2"), Some(1));
         assert_eq!(config.line_for_route("3"), None);
         // No SIRI-SX participant publishes NET (NET design §2.3).
-        assert!(config.situations.participant_refs.is_empty());
+        assert_eq!(config.situations.participant_refs, [] as [String; 0]);
         assert_eq!(config.clean_stop_name("Basford Tram Stop"), "Basford");
         assert_eq!(config.clean_stop_name("Tram Stop"), "Tram Stop");
         assert_eq!(config.clean_indicator("NET NE-bound"), "NE-bound");

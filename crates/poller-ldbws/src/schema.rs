@@ -460,7 +460,7 @@ mod tests {
         // JSON body carries no cross-poll history of its own.
         assert_eq!(first.planned_platform, None);
         assert_eq!(first.rsid.as_deref(), Some("GW123400"));
-        assert!(first.calling_points.is_empty());
+        assert_eq!(first.calling_points, []);
 
         let second = &departures[1];
         assert_eq!(second.estimated, "On time");
@@ -750,11 +750,7 @@ mod tests {
 
     #[test]
     fn an_empty_arrival_board_parses_to_nothing() {
-        assert!(
-            parse_arrivals(r#"{"crs": "LDS"}"#)
-                .expect("parse")
-                .is_empty()
-        );
+        assert_eq!(parse_arrivals(r#"{"crs": "LDS"}"#).expect("parse"), []);
         assert!(parse_arrivals("not json").is_err());
     }
 }

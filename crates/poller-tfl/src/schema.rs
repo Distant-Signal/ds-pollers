@@ -342,7 +342,7 @@ mod tests {
         );
         // v1 is line-status only: TfL's affectedStops are Naptan ids, which
         // this app's CHAR(3) CRS columns cannot hold.
-        assert!(disruption.affected_stops.is_empty());
+        assert_eq!(disruption.affected_stops, [] as [String; 0]);
         assert!(disruption.affected_routes.is_empty());
         assert_eq!(
             disruption.source.as_deref(),

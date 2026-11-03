@@ -277,7 +277,7 @@ mod tests {
     fn a_real_empty_response_parses_to_zero_departures_not_an_error() {
         let departures =
             parse_station_departures(REAL_EMPTY_RESPONSE).expect("empty response must parse");
-        assert!(departures.is_empty());
+        assert_eq!(departures, []);
     }
 
     /// A real captured excerpt of `getAllStationsXML` (api.irishrail.ie,

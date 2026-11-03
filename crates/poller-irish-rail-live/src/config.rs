@@ -141,7 +141,7 @@ mod tests {
             "an absent STATION_CODES_OVERRIDE must parse to an empty Vec, not [\"\"] -- \
              a non-empty vec here permanently defeats station discovery in production"
         );
-        assert!(config.station_codes_override.is_empty());
+        assert_eq!(config.station_codes_override, [] as [String; 0]);
     }
 
     #[test]

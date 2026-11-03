@@ -832,8 +832,8 @@ mod tests {
             lines,
             ["blue", "green", "navy", "pink", "purple", "red", "yellow"]
         );
-        assert!(!model.lines[0].directions.is_empty());
-        assert!(model.lines[2].directions.is_empty());
+        assert_ne!(model.lines[0].directions, []);
+        assert_eq!(model.lines[2].directions, []);
         // The horizon: yesterday to today + 60.
         assert_eq!(model.horizon.from.to_string(), "2026-10-18");
         assert_eq!(model.horizon.to.to_string(), "2026-12-18");

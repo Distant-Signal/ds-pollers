@@ -229,7 +229,10 @@ mod tests {
         cadence.polled(&far[0], at(0));
         cadence.polled(&near[0], at(0));
         let one_cycle_later = at(0) + Duration::seconds(58);
-        assert!(cadence.due(&far, one_cycle_later).is_empty());
+        assert_eq!(
+            cadence.due(&far, one_cycle_later),
+            [] as [&TrackedStopTarget; 0]
+        );
         assert_eq!(cadence.due(&near, one_cycle_later).len(), 1);
         let two_cycles_later = at(0) + Duration::seconds(118);
         assert_eq!(cadence.due(&far, two_cycles_later).len(), 1);
@@ -238,8 +241,14 @@ mod tests {
     #[test]
     fn a_malformed_code_is_never_polled() {
         let cadence = Cadence::default();
-        assert!(cadence.due(&[target("A", "Y/K", 30)], at(0)).is_empty());
-        assert!(cadence.due(&[target("A", "YORK", 30)], at(0)).is_empty());
+        assert_eq!(
+            cadence.due(&[target("A", "Y/K", 30)], at(0)),
+            [] as [&TrackedStopTarget; 0]
+        );
+        assert_eq!(
+            cadence.due(&[target("A", "YORK", 30)], at(0)),
+            [] as [&TrackedStopTarget; 0]
+        );
     }
 
     #[test]

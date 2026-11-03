@@ -2174,7 +2174,7 @@ mod tests {
             model.service_days.len(),
             model.service_day_count(),
         );
-        assert!(!model.trips.is_empty());
+        assert_ne!(model.trips, []);
     }
 
     // --- TfL's export (the TfL design §3, §5) --------------------------------

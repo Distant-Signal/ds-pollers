@@ -485,7 +485,7 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("530"), "{text}");
         assert!(!text.contains("wrong-password"), "{text}");
-        assert!(bytes.is_empty());
+        assert_eq!(bytes, [] as [u8; 0]);
         assert!(!format!("{:?}", login("wrong-password")).contains("wrong-password"));
     }
 
