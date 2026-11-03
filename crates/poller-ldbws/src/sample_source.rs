@@ -234,7 +234,7 @@ mod tests {
 
     /// Plan 4.5: with pins and custom lines, the list computed here equals
     /// the api's for every combination of the LEG-18 knobs.
-    #[sqlx::test(migrations = "../ds-store/migrations")]
+    #[sqlx::test(migrator = "ds_store::migrate::MIGRATOR")]
     #[ignore = "needs DATABASE_URL (a role that can create databases)"]
     async fn the_db_selection_equals_the_api_s(pool: sqlx::PgPool) {
         let catalogue = ds_lines::embedded().unwrap().to_vec();
