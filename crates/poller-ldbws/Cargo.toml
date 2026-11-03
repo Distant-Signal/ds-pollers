@@ -7,22 +7,22 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-health-http = { path = "../health-http" }
+health-http = { workspace = true }
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
-common = { path = "../common" }
+common = { workspace = true, features = ["default"] }
 # The line catalogue, embedded (`--lines-dir` defaults to it).
-ds-lines = { path = "../ds-lines" }
-ds-runtime = { path = "../ds-runtime" }
+ds-lines = { workspace = true }
+ds-runtime = { workspace = true, features = ["default"] }
 dotenvy = "0.15.7"
 # The sample-station read (ingest architecture plan 4.5): the selection,
 # the views' readers, the pool and the schema gate.
-ds-store = { path = "../ds-store" }
+ds-store = { workspace = true }
 # The stream sink (ingest architecture plan 3a.7): the
 # station-samples stream producer, and its Redis client. Both already in
 # the tree; ingest-stream is DB-free.
-ingest-stream = { path = "../ingest-stream" }
+ingest-stream = { workspace = true }
 metrics = "0.24"
 redis = { version = "1.8", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls", "gzip"] }

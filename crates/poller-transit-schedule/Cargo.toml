@@ -14,14 +14,14 @@ license.workspace = true
 anyhow = "1.0.102"
 chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive", "env"] }
-common = { path = "../common" }
-ds-runtime = { path = "../ds-runtime" }
+common = { workspace = true, features = ["default"] }
+ds-runtime = { workspace = true, features = ["default"] }
 # GTFS's CSV files, streamed (line-catalogue-validator's version).
 csv = "1.4"
 dotenvy = "0.15.7"
-health-http = { path = "../health-http" }
+health-http = { workspace = true }
 # The `ds:ingest:transit-<network>` producer.
-ingest-stream = { path = "../ingest-stream" }
+ingest-stream = { workspace = true }
 metrics = "0.24"
 # SIRI-SX, streamed (the version poller-incidents uses).
 quick-xml = "0.41.0"
@@ -45,7 +45,7 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 # The core reference data its rail-link tests check against (crs-tiploc.csv).
-ds-lines = { path = "../ds-lines" }
+ds-lines = { workspace = true }
 tempfile = "3"
 wiremock = "0.6"
 

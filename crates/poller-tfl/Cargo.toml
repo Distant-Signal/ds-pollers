@@ -7,15 +7,15 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-health-http = { path = "../health-http" }
+health-http = { workspace = true }
 # The snapshot producer for `ds:ingest:tfl` (ingest plan 3c.2): the only
 # sink since release B.
-ingest-stream = { path = "../ingest-stream" }
+ingest-stream = { workspace = true }
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
-common = { path = "../common" }
-ds-runtime = { path = "../ds-runtime" }
+common = { workspace = true, features = ["default"] }
+ds-runtime = { workspace = true, features = ["default"] }
 dotenvy = "0.15.7"
 metrics = "0.24"
 # Reading the stops stream back (the feed guard's baseline): the version
