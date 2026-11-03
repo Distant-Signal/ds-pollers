@@ -33,6 +33,7 @@ Stdlib only; needs cargo on PATH.
 """
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -66,6 +67,21 @@ FORBIDDEN: Mapping[str, Sequence[str]] = {
 
 class CargoError(Exception):
     """cargo failed; its stderr has already been shown."""
+
+
+def workspace_crates() -> set[str]:
+    """Return the workspace members' package names (`cargo metadata`)."""
+    result = subprocess.run(
+        ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],  # noqa: S607  # cargo from PATH
+        check=False,
+        stdout=subprocess.PIPE,
+        text=True,
+        cwd=ROOT,
+    )
+    if result.returncode != 0:
+        msg = "metadata"
+        raise CargoError(msg)
+    return {package["name"] for package in json.loads(result.stdout)["packages"]}
 
 
 def cargo_tree(crate: str) -> str:
@@ -161,7 +177,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(err))
 
     findings: list[str] = []
+    members: set[str] | None = None
     for crate in FORBIDDEN:
+        if crate not in tree_files:
+            # ds-store and ds-migrate are git dependencies on ds-core, which
+            # checks them itself (`cargo tree --all-features` takes only
+            # workspace members).
+            try:
+                members = members if members is not None else workspace_crates()
+            except CargoError:
+                sys.stdout.write("::error::cargo metadata failed\n")
+                return 2
+            if crate not in members:
+                sys.stdout.write(
+                    f"{crate}: not in this workspace (ds-core checks it)\n"
+                )
+                continue
         try:
             tree = (
                 tree_files[crate].read_text(encoding="utf-8")

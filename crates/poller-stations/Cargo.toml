@@ -7,17 +7,17 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-health-http = { path = "../health-http" }
+health-http = { workspace = true }
 anyhow = "1.0.102"
 # The startup cursor (`ingest_freshness.fetched_at`).
 chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive", "env"] }
-common = { path = "../common" }
-ds-runtime = { path = "../ds-runtime" }
+common = { workspace = true, features = ["default"] }
+ds-runtime = { workspace = true, features = ["default"] }
 dotenvy = "0.15.7"
 # The db sink (ingest architecture plan 2b.1): `reference::upsert_stations`,
 # `freshness::last_stations_fetch`, the pool and the schema gate.
-ds-store = { path = "../ds-store" }
+ds-store = { workspace = true }
 metrics = "0.24"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls", "gzip"] }
 serde = { version = "1.0.228", features = ["derive"] }
