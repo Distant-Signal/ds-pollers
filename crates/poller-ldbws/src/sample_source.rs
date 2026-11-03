@@ -13,7 +13,7 @@ use ds_store::reads::sample_stations::SampleSelection;
 /// `pg_stat_activity.application_name`.
 const APPLICATION_NAME: &str = "distant-signal-poller-ldbws";
 /// Spec §6.6: pool 1, role limit 2. One read per cycle.
-const DEFAULT_MAX_CONNECTIONS: u32 = 1;
+pub(crate) const DEFAULT_MAX_CONNECTIONS: u32 = 1;
 
 /// What the station-list read needs. Release D (ingest phase 5) removed the
 /// `SAMPLE_STATIONS_SOURCE` switch (`db` only since release B).
@@ -147,8 +147,8 @@ mod tests {
         assert!(!format!("{db:?}").contains(":pw@"));
     }
 
-    /// The chart sets `DATABASE_URL` (templates/poller-deployments.yaml).
-    /// Release D (ingest phase 5, Q8) removed `SAMPLE_STATIONS_SOURCE` and
+    /// The chart sets `DATABASE_URL` (checked by
+    /// scripts/check-config-defaults-chart.py). Release D (ingest phase 5, Q8) removed `SAMPLE_STATIONS_SOURCE` and
     /// `INGEST_SINK`: nothing reads them and the chart renders neither.
     #[test]
     fn the_read_uses_the_chart_s_env_name() {
@@ -172,13 +172,6 @@ mod tests {
                 "{name:?} was removed in release D"
             );
         }
-        let template = std::fs::read_to_string(
-            common::manifest_dir!()
-                .join("../../charts/distant-signal/templates/poller-deployments.yaml"),
-        )
-        .unwrap();
-        assert!(!template.contains("SAMPLE_STATIONS_SOURCE"));
-        assert!(!template.contains("INGEST_SINK"));
     }
 
     #[test]

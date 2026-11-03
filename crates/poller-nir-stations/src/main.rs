@@ -25,8 +25,14 @@ use reqwest::Client;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// What `--print-config-defaults` prints (`ds_runtime::service_args`).
+fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
+    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-nir-stations")
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    ds_runtime::service_args::exit_if_print_config_defaults(config_defaults);
     ds_runtime::logging::exit_code(run().await)
 }
 

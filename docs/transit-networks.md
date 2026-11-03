@@ -565,8 +565,9 @@ For `<n>` (`[a-z0-9-]`):
    `transit-<n>` spec with the three transit schemas.
    `INGEST_WRITER_STREAMS` gains `transit-<n>:off`: update the CI
    expectations that list it (`.github/workflows/ci.yml`,
-   `scripts/check-ingest-phase0-chart.py`) and
-   `crates/ingest-stream/tests/chart_values.rs`.
+   `scripts/check-ingest-phase0-chart.py`), and the stream's entries in
+   `values.yaml`'s `ingestStreamBacklog`/`ingestStreamStalled` maps, which
+   `scripts/check-config-defaults-chart.py` compares with `budget.rs`.
 4. **Redis:** an `optional` line `poller-transit-<n>` in
    `charts/distant-signal/files/redis-users.acl.tpl`, the
    `pollerTransit<N>` client value, `scripts/render-redis-acl.py` and

@@ -33,8 +33,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// 1, so the Job retries). Inside the chart's `activeDeadlineSeconds`.
 const ONCE_FLUSH_GRACE: Duration = Duration::from_secs(120);
 
+/// What `--print-config-defaults` prints (`ds_runtime::service_args`).
+fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
+    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-tocs")
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    ds_runtime::service_args::exit_if_print_config_defaults(config_defaults);
     ds_runtime::logging::exit_code(run().await)
 }
 
