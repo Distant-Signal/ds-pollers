@@ -79,8 +79,8 @@ mod tests {
 
     /// `reference-data/crs-tiploc.csv`: (crs, tiploc) -> name.
     fn crs_tiploc() -> Vec<(String, String, String)> {
-        let path = common::manifest_dir!().join("../../reference-data/crs-tiploc.csv");
-        let mut reader = csv::Reader::from_path(path).unwrap();
+        let mut reader =
+            csv::Reader::from_reader(ds_lines::reference_data::CRS_TIPLOC_CSV.as_bytes());
         reader
             .records()
             .map(|r| {

@@ -44,6 +44,8 @@ tracing = "0.1.44"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+# The core reference data its rail-link tests check against (crs-tiploc.csv).
+ds-lines = { path = "../ds-lines" }
 tempfile = "3"
 wiremock = "0.6"
 
