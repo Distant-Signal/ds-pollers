@@ -1,0 +1,20 @@
+[package]
+name = "poller-lifecycle"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.102"
+ds-runtime = { workspace = true, features = ["default"] }
+health-http = { workspace = true }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "test-util"] }
+
+[lints]
+workspace = true

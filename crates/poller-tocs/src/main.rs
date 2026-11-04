@@ -35,7 +35,9 @@ const ONCE_FLUSH_GRACE: Duration = Duration::from_secs(120);
 
 /// What `--print-config-defaults` prints (`ds_runtime::service_args`).
 fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
-    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-tocs")
+    poller_lifecycle::config_defaults(
+        ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-tocs"),
+    )
 }
 
 #[tokio::main]
@@ -50,14 +52,15 @@ async fn run() -> anyhow::Result<()> {
     ds_runtime::logging::init("poller-tocs");
 
     let config = Config::parse();
-    let progress = health_http::spawn_liveness(&config.health);
+    let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
+    let once = common::poller_loop::RunOnce::from_env()?.is_some();
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let stream = stream_sink(&config)?;
-    let cycle = || poll_once(&client, &config, &stream);
+    let cycle = || lifecycle.track(poll_once(&client, &config, &stream));
 
     // The startup cursor is the stream's newest entry (spec §11.3).
-    let result = common::poller_loop::run_poll_loop_with_cursor(
+    let poll_loop = common::poller_loop::run_poll_loop_with_cursor(
         "tocs",
         || async { Ok(stream.last_produced_at().await?) },
         poll_interval,
@@ -65,11 +68,16 @@ async fn run() -> anyhow::Result<()> {
         config.metrics_port,
         &progress,
         cycle,
-    )
-    .await;
-    // The loop returns only in once mode, or on a fatal error: exit only
-    // once the snapshot is in the stream.
-    common::poller_loop::finish_once(result, stream.shutdown(ONCE_FLUSH_GRACE)).await
+    );
+    // The loop returns in once mode, on a fatal error or at SIGTERM: exit
+    // only once the snapshot is in the stream (a run fails without it).
+    let result = lifecycle.run(Box::pin(poll_loop), once).await;
+    let grace = if once {
+        ONCE_FLUSH_GRACE
+    } else {
+        poller_lifecycle::FLUSH_GRACE
+    };
+    common::poller_loop::finish_once(result, stream.shutdown(grace)).await
 }
 
 /// The `ds:ingest:reference` producer. One part per snapshot (about 40

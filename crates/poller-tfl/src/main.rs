@@ -155,7 +155,9 @@ fn require_non_empty_key(key: &str) -> anyhow::Result<()> {
 
 /// What `--print-config-defaults` prints (`ds_runtime::service_args`).
 fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
-    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-tfl")
+    poller_lifecycle::config_defaults(
+        ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-tfl"),
+    )
 }
 
 #[tokio::main]
@@ -174,7 +176,7 @@ async fn run() -> anyhow::Result<()> {
     let config = Config::parse();
     let once = common::poller_loop::RunOnce::from_env()?.is_some();
     config.check_jobs(once)?;
-    let progress = health_http::spawn_liveness(&config.health);
+    let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
     // `clap` treats a present-but-empty env var as a supplied value, so an
     // orchestrator (e.g. `docker-compose.yml`'s `TFL_APP_KEY: ${TFL_APP_KEY}`)
     // that leaves the shell variable unset still gets `Config::parse()` to
@@ -211,7 +213,7 @@ async fn run() -> anyhow::Result<()> {
         return daily_once(&client, &config, &progress, stops, routes).await;
     }
 
-    let cycle = || poll_once(&client, &config, &stream);
+    let cycle = || lifecycle.track(poll_once(&client, &config, &stream));
 
     // The startup cursor is the stream's newest entry (spec §11.3).
     let status_loop = async {
@@ -242,7 +244,7 @@ async fn run() -> anyhow::Result<()> {
             false,
             config.metrics_port,
             &progress,
-            || release_after(stops_once(&client, &config, stops)),
+            || lifecycle.track(release_after(stops_once(&client, &config, stops))),
         )
         .await
     };
@@ -257,14 +259,40 @@ async fn run() -> anyhow::Result<()> {
             false,
             config.metrics_port,
             &progress,
-            || release_after(routes_once(&client, &config, routes)),
+            || lifecycle.track(release_after(routes_once(&client, &config, routes))),
         )
         .await
     };
-    tokio::select! {
-        result = status_loop => result,
-        result = stops_loop => result,
-        result = routes_loop => result,
+    let loops = async {
+        tokio::select! {
+            result = status_loop => result,
+            result = stops_loop => result,
+            result = routes_loop => result,
+        }
+    };
+    // Not once mode (that returned above). At SIGTERM a cycle in flight
+    // finishes first, then each producer gets a moment to flush its
+    // snapshot; one left unsent is re-fetched at once by the next pod,
+    // whose cursor never saw it.
+    // Boxed: the three loops' state is about 120 KB (clippy::large_futures).
+    let result = lifecycle.run(Box::pin(loops), false).await;
+    flush(stream, "tfl").await;
+    if let Some(stops) = stops {
+        flush(stops.stream, "tfl-stops").await;
+    }
+    if let Some(routes) = routes {
+        flush(routes.stream, "tfl-routes").await;
+    }
+    result
+}
+
+/// Flushes a long-running producer at exit, warning about what is left.
+async fn flush(stream: SnapshotStream, what: &'static str) {
+    if !stream.shutdown(poller_lifecycle::FLUSH_GRACE).await {
+        tracing::warn!(
+            stream = what,
+            "a snapshot was still unsent at exit; the next start fetches a fresh one"
+        );
     }
 }
 

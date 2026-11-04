@@ -74,6 +74,16 @@ impl SampleSink {
         Ok(self.stream.cursor().await?)
     }
 
+    /// Closes the producer at exit, waiting up to `grace` for an unsent
+    /// snapshot (a cycle that gave up waiting for Redis leaves one).
+    pub(crate) async fn shutdown(&self, grace: Duration) {
+        if !self.stream.shutdown(grace).await {
+            tracing::warn!(
+                "a station samples snapshot was still unsent at exit; the next start samples afresh"
+            );
+        }
+    }
+
     /// Delivers one cycle's samples and tracked-stop boards, waiting up to
     /// `budget` for the XADD.
     pub(crate) async fn deliver(

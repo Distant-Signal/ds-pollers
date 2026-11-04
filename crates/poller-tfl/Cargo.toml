@@ -7,7 +7,9 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-health-http = { workspace = true }
+# Readiness after the first successful cycle, and the SIGTERM drain
+# (docs/redeploy-safety.md).
+poller-lifecycle = { path = "../poller-lifecycle" }
 # The snapshot producer for `ds:ingest:tfl` (ingest plan 3c.2): the only
 # sink since release B.
 ingest-stream = { workspace = true }
