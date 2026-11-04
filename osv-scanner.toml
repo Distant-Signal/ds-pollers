@@ -1,0 +1,54 @@
+# Time-boxed exceptions for .github/workflows/dependency-scan.yml, for the
+# lockfiles in the repo root (Cargo.lock, uv.lock). frontend/ has its own
+# osv-scanner.toml. Every entry needs a reason and an ignoreUntil, so the
+# finding is reported again at expiry: as a blocking error if it is
+# CVSS >= 9.0 with a fixed version by then, otherwise as a non-blocking
+# warning (see that workflow's header).
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0369"
+ignoreUntil = 2026-12-18T00:00:00Z
+reason = """\
+zip 8.6.0 (GHSA-4684-h2q9-2vcp, Unix permissions applied through symlinks \
+by ZipArchive::extract()/ZipStreamReader::extract()). Unreachable: no code in \
+this workspace calls extract() or creates symlinks, and the only zip 8 user, \
+gtfs-structures 0.50 (via poller-irish-rail-gtfs), only reads entries in \
+memory (by_index, name). Our own crates are on zip 9. gtfs-structures still \
+requires zip ^8.6; the upstream zip 9 fix is tracked as DS-58 \
+(work log). Accepted by the user 2026-10-19; at expiry, bump \
+gtfs-structures and `cargo update -p zip` if a release has shipped, \
+otherwise review again.\
+"""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0367"
+ignoreUntil = 2026-12-18T00:00:00Z
+reason = """\
+zip 8.6.0 (GHSA-vv5m-jxxh-4627, SUID/SGID bits kept by \
+ZipArchive::extract() and stream extraction). Unreachable: no code in this \
+workspace calls extract(), and the only zip 8 user, gtfs-structures 0.50 \
+(via poller-irish-rail-gtfs), only reads entries in memory (by_index, \
+name). Our own crates are on zip 9. gtfs-structures still requires zip \
+^8.6; the upstream zip 9 fix is tracked as DS-58 (work log). \
+Accepted by the user 2026-10-19; at expiry, bump gtfs-structures and \
+`cargo update -p zip` if a release has shipped, otherwise review again.\
+"""
+
+[[IgnoredVulns]]
+id = "GHSA-m665-v7pm-7grj"
+ignoreUntil = 2026-12-18T00:00:00Z
+reason = """\
+zip 8.6.0 ("zip cloaking": local and central headers that disagree, so \
+two parsers see different entries; file overwrite or RCE on extraction). \
+The only zip 8 user is gtfs-structures 0.50 (via poller-irish-rail-gtfs), \
+which only reads entries in memory (Gtfs::from_reader); nothing in this \
+workspace extracts to disk. Our own crates are on zip 9.0.5, which is \
+fixed. Residual risk: the poller's zip-bomb pre-check reads the archive \
+with zip 9 while gtfs-structures parses it with zip 8, so a crafted \
+archive could pass the check and inflate differently. The feed is \
+fetched over HTTPS from Irish Rail's published GTFS, a trusted source. \
+Even gtfs-structures 0.52 still requires zip ^8.6. Accepted by the user \
+2026-10-30 (DS-189), with DS-58 (move off zip 8). At expiry, bump \
+gtfs-structures and `cargo update -p zip` if a release has shipped, \
+otherwise review again.\
+"""
