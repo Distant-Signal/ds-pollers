@@ -77,7 +77,7 @@ jobs:
             dockerfile: docker/poller-tocs.Dockerfile
           - service: poller-transit-schedule
             dockerfile: docker/poller-transit-schedule.Dockerfile
-    uses: Distant-Signal/ci/.github/workflows/image.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+    uses: Distant-Signal/ci/.github/workflows/image.yml@f405ba7d7d51df62ad597f8fc1e56070abafca64 # main
     with:
       service: ${{ matrix.service }}
       dockerfile: ${{ matrix.dockerfile }}
