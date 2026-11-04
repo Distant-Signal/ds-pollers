@@ -4,9 +4,9 @@ Transit networks are tram, light-rail and metro networks with their own
 timetable pages under `/transit`: Manchester Metrolink (`metrolink`),
 Nottingham Express Transit (`net`) and TfL's Underground, DLR and London
 Trams (`tfl`, see [TfL](#tfl-underground-dlr-and-london-trams)). Design:
-[the transit networks spec](superpowers/specs/2026-10-09-transit-networks-design.md)
-and [the NET addendum](superpowers/specs/2026-10-24-nottingham-net-design.md);
-plan: [the transit networks plan](superpowers/plans/2026-10-09-transit-networks-plan.md).
+[the transit networks spec](https://github.com/Distant-Signal/distant-signal/blob/main/docs/superpowers/specs/2026-10-09-transit-networks-design.md)
+and [the NET addendum](https://github.com/Distant-Signal/distant-signal/blob/main/docs/superpowers/specs/2026-10-24-nottingham-net-design.md);
+plan: [the transit networks plan](https://github.com/Distant-Signal/distant-signal/blob/main/docs/superpowers/plans/2026-10-09-transit-networks-plan.md).
 This runbook is written for Metrolink; NET's differences, and its own
 rollout, are in [Nottingham Express Transit](#nottingham-express-transit-net).
 
@@ -127,7 +127,7 @@ Each step is its own Ranma-Config change. Wait for each to settle.
 
 `/Trips/plan` can ride a network's trams anywhere in a journey (rail into
 Piccadilly, the tram to Victoria, rail on). Design:
-[the transit trip planning spec](superpowers/specs/2026-10-24-transit-trip-planning-design.md);
+[the transit trip planning spec](https://github.com/Distant-Signal/distant-signal/blob/main/docs/superpowers/specs/2026-10-24-transit-trip-planning-design.md);
 code: `crates/api/src/data/transit_planning.rs`. Off by default:
 
 | Value | Default | What it does |
@@ -349,7 +349,7 @@ alert maps first (NET design §11).
 
 ## TfL: Underground, DLR and London Trams (tfl)
 
-Design: [the TfL transit design](superpowers/specs/2026-10-30-tfl-transit-design.md).
+Design: [the TfL transit design](https://github.com/Distant-Signal/distant-signal/blob/main/docs/superpowers/specs/2026-10-30-tfl-transit-design.md).
 The timetable is TfL's weekly Journey Planner export,
 `https://tfl.gov.uk/tfl/syndication/feeds/journey-planner-timetables.zip`
 (about 141 MB, anonymous, no login), a zip of zips: the network file's
@@ -457,7 +457,7 @@ Dead-letter reasons particular to transit (prefixes of the record's
 - `invalid_transit_row`: an id outside its grammar. A producer bug.
 
 Re-inject with the script in
-[docs/ingest-streams-deadletter.md](ingest-streams-deadletter.md), with
+[docs/ingest-streams-deadletter.md](https://github.com/Distant-Signal/ds-ingest/blob/main/docs/ingest-streams-deadletter.md), with
 `320` as the MAXLEN:
 
 ```sh
