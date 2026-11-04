@@ -75,12 +75,11 @@ async fn run() -> anyhow::Result<()> {
     };
 
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
-    // The startup cursor is the newest `ioi-stations/1` entry: both
-    // snapshots are produced together every cycle (see poll_once), on
-    // this poller's own stream (poller-irish-rail-gtfs has its own).
+    // The startup cursor is the older of the newest `ioi-stations/1` and
+    // `ioi-lines/1` entries (`Sinks::cursor`).
     let poll_loop = common::poller_loop::run_poll_loop_with_cursor(
         "nir-stations",
-        || async { Ok(sinks.stations.last_produced_at().await?) },
+        || sinks.cursor(),
         poll_interval,
         config.metrics_enabled,
         config.metrics_port,
@@ -109,6 +108,27 @@ impl Sinks {
             }
         }
     }
+
+    /// The startup cursor: the older of the two schemas' newest entries on
+    /// `ds:ingest:ioi-nir`. A cycle queues stations, then lines, so a pod stopped
+    /// between the two XADDs leaves stations newer than lines. Reading
+    /// stations alone would then call the data fresh and leave lines a
+    /// whole interval (a day) behind; this re-sends both instead (a
+    /// duplicate stations snapshot, which the writer's guard absorbs).
+    async fn cursor(&self) -> anyhow::Result<Option<chrono::DateTime<Utc>>> {
+        let stations = self.stations.last_produced_at().await?;
+        let lines = self.lines.last_produced_at().await?;
+        Ok(older_cursor(stations, lines))
+    }
+}
+
+/// The older of two schemas' cursors; `None` ("poll now") when either has
+/// never been written.
+fn older_cursor(
+    a: Option<chrono::DateTime<Utc>>,
+    b: Option<chrono::DateTime<Utc>>,
+) -> Option<chrono::DateTime<Utc>> {
+    Some(a?.min(b?))
 }
 
 async fn poll_once(client: &Client, config: &Config, sinks: &Sinks) -> anyhow::Result<()> {
@@ -183,5 +203,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use chrono::TimeZone;
+
+    use super::*;
+
+    fn at(hour: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 4, hour, 0, 0)
+            .single()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_cursor_is_the_older_schema_so_lines_left_behind_are_re_sent() {
+        // Stations reached the stream at 04:00 but the pod stopped before
+        // lines did: lines' newest is the 03:00 run, and so is the cursor.
+        assert_eq!(older_cursor(Some(at(4)), Some(at(3))), Some(at(3)));
+        assert_eq!(older_cursor(Some(at(3)), Some(at(4))), Some(at(3)));
+        assert_eq!(older_cursor(Some(at(4)), Some(at(4))), Some(at(4)));
+    }
+
+    #[test]
+    fn a_schema_never_written_means_poll_now() {
+        assert_eq!(older_cursor(Some(at(4)), None), None);
+        assert_eq!(older_cursor(None, Some(at(4))), None);
+        assert_eq!(older_cursor(None, None), None);
     }
 }
