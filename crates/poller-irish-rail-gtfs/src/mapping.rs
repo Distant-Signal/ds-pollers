@@ -19,6 +19,11 @@
 //! only appear in the live API's `getAllStationsXML`) -- so there is
 //! nothing to filter out even if this crate wanted to.
 //!
+//! Lines keep the route's colours (`route_color`/`route_text_color` as
+//! `#RRGGBB`), short name and agency name, and a corridor the feed splits
+//! into directional routes (`DUB-BFT-I` inbound, `DUB-BFT-O` outbound) is
+//! published as one line (`DUB-BFT`) by [`merge_directions`].
+//!
 //! The per-item sanity checks (GitHub issue #1's evaluation, done in-poller
 //! instead of adding gtfs-analyzer) live here too: see [`FeedIssue`] for
 //! what is repaired or dropped, and `feed_guard` for the whole-feed
@@ -124,7 +129,7 @@ pub(crate) fn map_feed(gtfs: &Gtfs) -> MappedFeed {
     let mut issues = FeedIssues::default();
     let stations = map_stations(gtfs, &mut issues);
     let kept: HashSet<&str> = stations.iter().map(|s| s.id.as_str()).collect();
-    let lines = map_lines(gtfs, &kept, &mut issues);
+    let lines = merge_directions(map_lines(gtfs, &kept, &mut issues));
     MappedFeed {
         stations,
         lines,
@@ -191,6 +196,7 @@ pub(crate) fn map_stations(gtfs: &Gtfs, issues: &mut FeedIssues) -> Vec<IslandOf
                 network: IslandOfIrelandNetwork::RepublicOfIreland,
                 latitude: coordinates.map(|(lat, _)| lat),
                 longitude: coordinates.map(|(_, lon)| lon),
+                raw_name: None,
             })
         })
         .collect()
@@ -225,6 +231,7 @@ pub(crate) fn map_lines(
             .push(trip);
     }
 
+    let agencies = AgencyNames::new(gtfs);
     gtfs.routes
         .values()
         .filter_map(|route| {
@@ -251,11 +258,10 @@ pub(crate) fn map_lines(
                 return None;
             }
 
-            let name = route
-                .long_name
-                .clone()
-                .filter(|n| !n.is_empty())
-                .or_else(|| route.short_name.clone())
+            let short_name = non_blank(route.short_name.as_ref()).map(|n| n.trim().to_owned());
+            let name = non_blank(route.long_name.as_ref())
+                .map(|n| n.trim().to_owned())
+                .or_else(|| short_name.clone())
                 .unwrap_or_else(|| route.id.clone());
 
             Some(IslandOfIrelandLineDefinition {
@@ -263,9 +269,115 @@ pub(crate) fn map_lines(
                 name,
                 network: IslandOfIrelandNetwork::RepublicOfIreland,
                 stations,
+                short_name,
+                agency: agencies.name(route.agency_id.as_deref()),
+                color: route.color.map(|c| hex(c.r, c.g, c.b)),
+                text_color: route.text_color.map(|c| hex(c.r, c.g, c.b)),
+                replaces: Vec::new(),
             })
         })
         .collect()
+}
+
+/// `agency.txt`'s names, by `agency_id`. A route without an `agency_id`
+/// belongs to the feed's only agency (GTFS allows omitting it then).
+struct AgencyNames<'a> {
+    by_id: HashMap<&'a str, &'a str>,
+    only: Option<&'a str>,
+}
+
+impl<'a> AgencyNames<'a> {
+    fn new(gtfs: &'a Gtfs) -> Self {
+        let named = || gtfs.agencies.iter().filter(|a| !a.name.trim().is_empty());
+        Self {
+            by_id: named()
+                .filter_map(|a| Some((a.id.as_deref()?, a.name.trim())))
+                .collect(),
+            only: match gtfs.agencies.as_slice() {
+                [only] if !only.name.trim().is_empty() => Some(only.name.trim()),
+                _ => None,
+            },
+        }
+    }
+
+    fn name(&self, agency_id: Option<&str>) -> Option<String> {
+        agency_id
+            .and_then(|id| self.by_id.get(id).copied())
+            .or(self.only)
+            .map(str::to_owned)
+    }
+}
+
+/// A GTFS colour as `#RRGGBB`.
+fn hex(r: u8, g: u8, b: u8) -> String {
+    format!("#{r:02X}{g:02X}{b:02X}")
+}
+
+/// The direction a route id's suffix names: `-I` inbound, `-O` outbound.
+fn direction(id: &str) -> Option<(&str, Direction)> {
+    let (base, suffix) = id.rsplit_once('-')?;
+    let direction = match suffix {
+        "I" => Direction::Inbound,
+        "O" => Direction::Outbound,
+        _ => return None,
+    };
+    (!base.is_empty()).then_some((base, direction))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Direction {
+    Outbound,
+    Inbound,
+}
+
+/// Publishes each corridor the feed splits into directional routes
+/// (`DUB-BFT-I`, `DUB-BFT-O`) as one line under the base id (`DUB-BFT`),
+/// one row per corridor being what a line list shows. The outbound route
+/// (`-O`, away from Dublin: "Dublin - Belfast") is the representative: its
+/// name, stopping pattern and colours become the line's, with the inbound
+/// route's colours and agency as a fallback; with only one direction in
+/// the feed, that one is used. The merged line `replaces` both directional
+/// ids, so the writer deletes their earlier rows. A base id that is also a
+/// route of its own is left alone (no merge, nothing guessed). The output
+/// is sorted by id, so one feed always maps to the same snapshot.
+pub(crate) fn merge_directions(
+    lines: Vec<IslandOfIrelandLineDefinition>,
+) -> Vec<IslandOfIrelandLineDefinition> {
+    let plain: HashSet<String> = lines
+        .iter()
+        .filter(|l| direction(&l.id).is_none())
+        .map(|l| l.id.clone())
+        .collect();
+    let mut merged: BTreeMap<String, Vec<(Direction, IslandOfIrelandLineDefinition)>> =
+        BTreeMap::new();
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        match direction(&line.id) {
+            Some((base, dir)) if !plain.contains(base) => {
+                merged.entry(base.to_owned()).or_default().push((dir, line));
+            }
+            _ => out.push(line),
+        }
+    }
+    for (base, mut directions) in merged {
+        directions.sort_by_key(|(dir, _)| *dir);
+        let replaces: Vec<String> = directions.iter().map(|(_, l)| l.id.clone()).collect();
+        let mut lines = directions.into_iter().map(|(_, l)| l);
+        let Some(mut line) = lines.next() else {
+            continue;
+        };
+        for other in lines {
+            line.color = line.color.or(other.color);
+            line.text_color = line.text_color.or(other.text_color);
+            line.agency = line.agency.or(other.agency);
+            line.short_name = line.short_name.or(other.short_name);
+        }
+        line.id = base;
+        line.replaces = replaces;
+        out.push(line);
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
 }
 
 #[cfg(test)]
@@ -285,12 +397,24 @@ mod tests {
     /// `Gtfs` struct literal (whose exact field set could drift from what
     /// the crate actually requires).
     fn feed(stops: &str, routes: &str, trips: &str, stop_times: &str) -> Gtfs {
+        feed_with(
+            AGENCY,
+            &format!("{ROUTES_HEADER}{routes}"),
+            stops,
+            trips,
+            stop_times,
+        )
+    }
+
+    /// [`feed`] with the caller's `agency.txt` and whole `routes.txt`
+    /// (header included), for the colour and agency columns.
+    fn feed_with(agency: &str, routes: &str, stops: &str, trips: &str, stop_times: &str) -> Gtfs {
         use std::io::Write;
 
         let files: [(&str, String); 6] = [
-            ("agency.txt", AGENCY.to_owned()),
+            ("agency.txt", agency.to_owned()),
             ("stops.txt", format!("{STOPS_HEADER}{stops}")),
-            ("routes.txt", format!("{ROUTES_HEADER}{routes}")),
+            ("routes.txt", routes.to_owned()),
             ("trips.txt", format!("{TRIPS_HEADER}{trips}")),
             ("stop_times.txt", format!("{STOP_TIMES_HEADER}{stop_times}")),
             ("calendar.txt", CALENDAR.to_owned()),
@@ -347,6 +471,94 @@ mod tests {
             route.stations,
             vec!["STOP_A".to_string(), "STOP_B".to_string()]
         );
+    }
+
+    /// The shape of the real feed's corridor split (friction research §1:
+    /// `DUB-BFT-I` "Belfast - Dublin", `DUB-BFT-O` "Dublin - Belfast"),
+    /// with colours, beside an ordinary single-row route.
+    fn corridor_feed() -> Gtfs {
+        feed_with(
+            "agency_id,agency_name,agency_url,agency_timezone\n\
+             7778020,Iarnród Éireann / Irish Rail,https://example.invalid,Europe/Dublin\n",
+            "route_id,agency_id,route_short_name,route_long_name,route_type,route_color,route_text_color\n\
+             DUB-BFT-I,7778020,,Belfast - Dublin,2,00A651,FFFFFF\n\
+             DUB-BFT-O,7778020,,Dublin - Belfast,2,00a651,ffffff\n\
+             DUB-SLG,7778020,,Dublin - Sligo,2,,\n",
+            "DUB,Dublin Connolly,53.35,-6.25,,\nDDK,Dundalk,54.0,-6.41,,\nBFT,Belfast,54.59,-5.94,,\nSLG,Sligo,54.27,-8.48,,\n",
+            "DUB-BFT-I,WEEKDAY,IN_1\nDUB-BFT-O,WEEKDAY,OUT_1\nDUB-BFT-O,WEEKDAY,OUT_EXPRESS\nDUB-SLG,WEEKDAY,SLG_1\n",
+            "IN_1,08:00:00,08:00:00,BFT,1\nIN_1,09:00:00,09:00:00,DDK,2\nIN_1,10:00:00,10:00:00,DUB,3\n\
+             OUT_1,08:00:00,08:00:00,DUB,1\nOUT_1,09:00:00,09:00:00,DDK,2\nOUT_1,10:00:00,10:00:00,BFT,3\n\
+             OUT_EXPRESS,08:00:00,08:00:00,DUB,1\nOUT_EXPRESS,10:00:00,10:00:00,BFT,2\n\
+             SLG_1,08:00:00,08:00:00,DUB,1\nSLG_1,11:00:00,11:00:00,SLG,2\n",
+        )
+    }
+
+    #[test]
+    fn directional_routes_merge_into_one_corridor_with_its_colours() {
+        let mapped = map_feed(&corridor_feed());
+        let ids: Vec<&str> = mapped.lines.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(ids, ["DUB-BFT", "DUB-SLG"]);
+
+        let enterprise = &mapped.lines[0];
+        assert_eq!(enterprise.name, "Dublin - Belfast");
+        assert_eq!(enterprise.stations, ["DUB", "DDK", "BFT"]);
+        assert_eq!(enterprise.replaces, ["DUB-BFT-O", "DUB-BFT-I"]);
+        assert_eq!(enterprise.color.as_deref(), Some("#00A651"));
+        assert_eq!(enterprise.text_color.as_deref(), Some("#FFFFFF"));
+        assert_eq!(
+            enterprise.agency.as_deref(),
+            Some("Iarnród Éireann / Irish Rail")
+        );
+        assert_eq!(enterprise.short_name, None);
+
+        let sligo = &mapped.lines[1];
+        assert_eq!(
+            (sligo.color.as_deref(), sligo.text_color.as_deref()),
+            (None, None)
+        );
+        assert!(sligo.replaces.is_empty());
+        assert_eq!(
+            sligo.agency.as_deref(),
+            Some("Iarnród Éireann / Irish Rail")
+        );
+    }
+
+    fn line(id: &str, color: Option<&str>) -> IslandOfIrelandLineDefinition {
+        IslandOfIrelandLineDefinition {
+            id: id.into(),
+            name: id.into(),
+            network: IslandOfIrelandNetwork::RepublicOfIreland,
+            stations: vec![id.into()],
+            short_name: None,
+            agency: None,
+            color: color.map(Into::into),
+            text_color: None,
+            replaces: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_lone_direction_is_renamed_to_its_corridor() {
+        let merged = merge_directions(vec![line("GAL-I", Some("#123456"))]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "GAL");
+        assert_eq!(merged[0].stations, ["GAL-I"]);
+        assert_eq!(merged[0].replaces, ["GAL-I"]);
+    }
+
+    #[test]
+    fn the_outbound_route_takes_the_inbound_colour_when_it_has_none() {
+        let merged = merge_directions(vec![line("X-I", Some("#111111")), line("X-O", None)]);
+        assert_eq!(merged[0].stations, ["X-O"]);
+        assert_eq!(merged[0].color.as_deref(), Some("#111111"));
+    }
+
+    #[test]
+    fn a_base_id_that_is_its_own_route_is_not_merged() {
+        let merged = merge_directions(vec![line("X", None), line("X-I", None), line("Y-IO", None)]);
+        let ids: Vec<&str> = merged.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(ids, ["X", "X-I", "Y-IO"]);
+        assert!(merged.iter().all(|l| l.replaces.is_empty()));
     }
 
     #[test]
