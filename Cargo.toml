@@ -9,6 +9,7 @@ members = [
     "crates/poller-irish-rail-gtfs",
     "crates/poller-irish-rail-live",
     "crates/poller-ldbws",
+    "crates/poller-lifecycle",
     "crates/poller-nir-stations",
     "crates/poller-stations",
     "crates/poller-tfl",

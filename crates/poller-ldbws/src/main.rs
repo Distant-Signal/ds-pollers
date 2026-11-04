@@ -105,9 +105,11 @@ const CYCLE_TIME_BUDGET: Duration = Duration::from_secs(45);
 
 /// What `--print-config-defaults` prints (`ds_runtime::service_args`).
 fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
-    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-ldbws")
-        .postgres_pool(sample_source::DEFAULT_MAX_CONNECTIONS)
-        .db_role(ds_store::schema::DbRole::LdbwsRo.key())
+    poller_lifecycle::config_defaults(
+        ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-ldbws")
+            .postgres_pool(sample_source::DEFAULT_MAX_CONNECTIONS)
+            .db_role(ds_store::schema::DbRole::LdbwsRo.key()),
+    )
 }
 
 #[tokio::main]
@@ -123,7 +125,8 @@ async fn run() -> anyhow::Result<()> {
 
     let mut config = Config::parse();
     config.reads.validate()?;
-    let progress = health_http::spawn_liveness(&config.health);
+    let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
+    let once = common::poller_loop::RunOnce::from_env()?.is_some();
     // Ingest plan 4.5: the catalogue, Postgres and the schema gate before
     // the first cycle.
     config.reads.connect(&progress).await?;
@@ -177,8 +180,9 @@ async fn run() -> anyhow::Result<()> {
     let sink = SampleSink::from_config(&config)?;
     tracing::info!("producing station samples to ds:ingest:station-samples");
 
-    common::poller_loop::run_poll_loop_with_policy_and_cursor(
-        &retry_policy(poll_interval),
+    let policy = retry_policy(poll_interval);
+    let poll_loop = common::poller_loop::run_poll_loop_with_policy_and_cursor(
+        &policy,
         "ldbws",
         || sink.last_fetched(),
         poll_interval,
@@ -196,7 +200,7 @@ async fn run() -> anyhow::Result<()> {
             let sink = &sink;
             let client = &client;
             let config = &config;
-            async move {
+            lifecycle.track(async move {
                 let mut history = std::mem::take(&mut *platform_history.borrow_mut());
                 let mut rotation_state = rotation.replace(Rotation::new(std::time::Instant::now()));
                 // The placeholder carries the same limits, so even a cycle
@@ -232,10 +236,14 @@ async fn run() -> anyhow::Result<()> {
                 *cadence.borrow_mut() = cadence_state;
                 *arrivals_cadence.borrow_mut() = arrivals_cadence_state;
                 result
-            }
+            })
         },
-    )
-    .await
+    );
+    // At SIGTERM a cycle in flight finishes (it waits for its own XADD),
+    // so the next pod's cursor is a whole snapshot.
+    let result = lifecycle.run(Box::pin(poll_loop), once).await;
+    sink.shutdown(poller_lifecycle::FLUSH_GRACE).await;
+    result
 }
 
 /// Logs which tracked-stop lanes are on, and refuses to start the arrivals

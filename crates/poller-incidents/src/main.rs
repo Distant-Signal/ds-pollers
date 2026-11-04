@@ -28,9 +28,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What `--print-config-defaults` prints (`ds_runtime::service_args`).
 fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
-    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-incidents")
-        .postgres_pool(DEFAULT_MAX_CONNECTIONS)
-        .db_role(ds_store::schema::DbRole::Incidents.key())
+    poller_lifecycle::config_defaults(
+        ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-incidents")
+            .postgres_pool(DEFAULT_MAX_CONNECTIONS)
+            .db_role(ds_store::schema::DbRole::Incidents.key()),
+    )
 }
 
 #[tokio::main]
@@ -52,7 +54,8 @@ async fn run() -> anyhow::Result<()> {
 
     let config = Config::parse();
     config.validate()?;
-    let progress = health_http::spawn_liveness(&config.health);
+    let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
+    let once = common::poller_loop::RunOnce::from_env()?.is_some();
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let budget = common::poller_loop::post_retry_budget(poll_interval);
@@ -65,8 +68,10 @@ async fn run() -> anyhow::Result<()> {
         row_heartbeat = config.incidents_row_heartbeat,
         "writing incident snapshots to Postgres"
     );
-    // Plan 4.6: the startup cursor is the freshness row.
-    common::poller_loop::run_poll_loop_with_source(
+    // Plan 4.6: the startup cursor is the freshness row. At SIGTERM a
+    // snapshot being written finishes (its text-changed XADD and removal
+    // inference included) before the pod exits.
+    let poll_loop = common::poller_loop::run_poll_loop_with_source(
         "incidents",
         common::ingest::CursorSource::db(|| ds_store::freshness::last_incidents_fetch(&sink.pool)),
         poll_interval,
@@ -74,9 +79,11 @@ async fn run() -> anyhow::Result<()> {
         false,
         config.metrics_port,
         &progress,
-        || poll_once(&client, &config, &sink),
-    )
-    .await
+        || lifecycle.track(poll_once(&client, &config, &sink)),
+    );
+    let result = lifecycle.run(Box::pin(poll_loop), once).await;
+    sink.pool.close().await;
+    result
 }
 
 /// The DB sink's dependencies, in startup order: Postgres (waited for, as

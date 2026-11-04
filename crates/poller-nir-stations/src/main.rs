@@ -27,7 +27,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What `--print-config-defaults` prints (`ds_runtime::service_args`).
 fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
-    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-nir-stations")
+    poller_lifecycle::config_defaults(
+        ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-nir-stations"),
+    )
 }
 
 #[tokio::main]
@@ -42,7 +44,8 @@ async fn run() -> anyhow::Result<()> {
     ds_runtime::logging::init("poller-nir-stations");
 
     let config = Config::parse();
-    let progress = health_http::spawn_liveness(&config.health);
+    let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
+    let once = common::poller_loop::RunOnce::from_env()?.is_some();
     // `.user_agent(...)` is NOT optional -- see config::USER_AGENT's own
     // doc comment and this plan's Global Constraints. Every request this
     // client makes to admin.opendatani.gov.uk 403s without it.
@@ -75,16 +78,18 @@ async fn run() -> anyhow::Result<()> {
     // The startup cursor is the newest `ioi-stations/1` entry: both
     // snapshots are produced together every cycle (see poll_once), on
     // this poller's own stream (poller-irish-rail-gtfs has its own).
-    common::poller_loop::run_poll_loop_with_cursor(
+    let poll_loop = common::poller_loop::run_poll_loop_with_cursor(
         "nir-stations",
         || async { Ok(sinks.stations.last_produced_at().await?) },
         poll_interval,
         config.metrics_enabled,
         config.metrics_port,
         &progress,
-        || poll_once(&client, &config, &sinks),
-    )
-    .await
+        || lifecycle.track(poll_once(&client, &config, &sinks)),
+    );
+    let result = lifecycle.run(Box::pin(poll_loop), once).await;
+    sinks.flush().await;
+    result
 }
 
 /// The two schemas this poller produces, one latest-snapshot producer each
@@ -92,6 +97,18 @@ async fn run() -> anyhow::Result<()> {
 struct Sinks {
     stations: SnapshotStream,
     lines: SnapshotStream,
+}
+
+impl Sinks {
+    /// Closes both producers at exit, each waiting up to
+    /// `poller_lifecycle::FLUSH_GRACE` for an unsent snapshot.
+    async fn flush(self) {
+        for (schema, stream) in [("ioi-stations", self.stations), ("ioi-lines", self.lines)] {
+            if !stream.shutdown(poller_lifecycle::FLUSH_GRACE).await {
+                tracing::warn!(schema, "a snapshot was still unsent at exit");
+            }
+        }
+    }
 }
 
 async fn poll_once(client: &Client, config: &Config, sinks: &Sinks) -> anyhow::Result<()> {

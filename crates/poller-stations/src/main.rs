@@ -37,9 +37,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What `--print-config-defaults` prints (`ds_runtime::service_args`).
 fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
-    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-stations")
-        .postgres_pool(DEFAULT_MAX_CONNECTIONS)
-        .db_role(ds_store::schema::DbRole::Stations.key())
+    poller_lifecycle::config_defaults(
+        ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-stations")
+            .postgres_pool(DEFAULT_MAX_CONNECTIONS)
+            .db_role(ds_store::schema::DbRole::Stations.key()),
+    )
 }
 
 #[tokio::main]
@@ -60,7 +62,7 @@ async fn run() -> anyhow::Result<()> {
     if config.metrics.metrics_enabled {
         ds_runtime::metrics::install(config.metrics_port)?;
     }
-    let progress = health_http::spawn_liveness(&config.health);
+    let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let retry_budget = common::poller_loop::post_retry_budget(poll_interval);
@@ -72,11 +74,14 @@ async fn run() -> anyhow::Result<()> {
         retry_budget,
         backoff: ingest::POST_RETRY_BACKOFF,
     };
-    // The loop returns only in once mode (`RUN_ONCE`, a scheduled Job;
-    // `common::poller_loop`) or on a fatal error. Its write is one awaited
-    // transaction inside the cycle, so the data is committed by now; close
-    // the pool so the session ends cleanly before the exit.
-    let result = run_with(&client, &config, &progress, &sink).await;
+    let once = common::poller_loop::RunOnce::from_env()?.is_some();
+    // The loop returns in once mode (`RUN_ONCE`, a scheduled Job;
+    // `common::poller_loop`), on a fatal error or at SIGTERM (after the
+    // cycle in flight). Its write is one awaited transaction inside the
+    // cycle, so the data is committed by now; close the pool so the session
+    // ends cleanly before the exit.
+    let poll_loop = run_with(&client, &config, &progress, &lifecycle, &sink);
+    let result = lifecycle.run(Box::pin(poll_loop), once).await;
     sink.pool.close().await;
     result
 }
@@ -102,6 +107,7 @@ async fn run_with(
     client: &Client,
     config: &Config,
     progress: &ds_runtime::progress::Progress,
+    lifecycle: &poller_lifecycle::Lifecycle,
     sink: &DbSink,
 ) -> anyhow::Result<()> {
     common::poller_loop::run_poll_loop_with_source(
@@ -112,7 +118,7 @@ async fn run_with(
         false,
         config.metrics_port,
         progress,
-        || poll_once(client, config, sink),
+        || lifecycle.track(poll_once(client, config, sink)),
     )
     .await
 }

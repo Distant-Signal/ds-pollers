@@ -7,7 +7,9 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-health-http = { workspace = true }
+# Readiness after the first successful cycle, and the SIGTERM drain
+# (docs/redeploy-safety.md).
+poller-lifecycle = { path = "../poller-lifecycle" }
 anyhow = "1.0.102"
 # The startup cursor (`ingest_freshness.fetched_at`).
 chrono = "0.4.44"

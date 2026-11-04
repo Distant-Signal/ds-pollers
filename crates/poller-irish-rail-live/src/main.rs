@@ -73,7 +73,9 @@ fn build_client() -> reqwest::Result<Client> {
 
 /// What `--print-config-defaults` prints (`ds_runtime::service_args`).
 fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
-    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-irish-rail-live")
+    poller_lifecycle::config_defaults(
+        ds_runtime::service_args::ConfigDefaults::for_config::<Config>("poller-irish-rail-live"),
+    )
 }
 
 #[tokio::main]
@@ -88,7 +90,8 @@ async fn run() -> anyhow::Result<()> {
     ds_runtime::logging::init("poller-irish-rail-live");
 
     let config = Config::parse();
-    let progress = health_http::spawn_liveness(&config.health);
+    let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
+    let once = common::poller_loop::RunOnce::from_env()?.is_some();
     let client = build_client()?;
     let redis = config
         .redis
@@ -104,16 +107,20 @@ async fn run() -> anyhow::Result<()> {
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
 
     // The startup cursor is the newest `ioi-station-samples/1` entry.
-    common::poller_loop::run_poll_loop_with_cursor(
+    let poll_loop = common::poller_loop::run_poll_loop_with_cursor(
         "irish-rail-live",
         || async { Ok(samples.last_produced_at().await?) },
         poll_interval,
         config.metrics.metrics_enabled,
         config.metrics_port,
         &progress,
-        || poll_once(&client, &config, &samples),
-    )
-    .await
+        || lifecycle.track(poll_once(&client, &config, &samples)),
+    );
+    let result = lifecycle.run(Box::pin(poll_loop), once).await;
+    if !samples.shutdown(poller_lifecycle::FLUSH_GRACE).await {
+        tracing::warn!("a samples snapshot was still unsent at exit; the next start polls afresh");
+    }
+    result
 }
 
 async fn poll_once(
