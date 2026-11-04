@@ -17,7 +17,11 @@
 //! this crate's real, live-fetch-confirmed departure-board schema.
 //! Deliberately does NOT depend on Tier A's `island_of_ireland_stations`
 //! catalogue (this plan's Judgment Call #1): it discovers its own station
-//! codes from `api.irishrail.ie`'s own `getAllStationsXML` each cycle.
+//! codes from `api.irishrail.ie`'s own `getAllStationsXML` each cycle, and
+//! forwards that list too, as `ioi-live-stations/1`, whenever it changes
+//! (and at least hourly, [`StationListSink`]): the ingest-writer matches it
+//! to the catalogue, so a catalogue station's departures can be found
+//! from its id.
 
 mod config;
 mod schema;
@@ -26,6 +30,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use clap::Parser;
+use common::island_of_ireland::IslandOfIrelandLiveStation;
 use config::Config;
 use ingest_stream::SchemaId;
 use ingest_stream::snapshot::SnapshotStream;
@@ -97,6 +102,7 @@ async fn run() -> anyhow::Result<()> {
         .redis
         .client("the ingest stream")
         .map_err(anyhow::Error::msg)?;
+    let redis_for_list = redis.clone();
     let samples = SnapshotStream::spawn(
         redis,
         ingest_stream::streams::IOI_LIVE,
@@ -104,6 +110,13 @@ async fn run() -> anyhow::Result<()> {
         "poller-irish-rail-live",
         500,
     );
+    let station_list = StationListSink::new(SnapshotStream::spawn(
+        redis_for_list,
+        ingest_stream::streams::IOI_LIVE,
+        SchemaId::new("ioi-live-stations", 1)?,
+        "poller-irish-rail-live",
+        500,
+    ));
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
 
     // The startup cursor is the newest `ioi-station-samples/1` entry.
@@ -114,25 +127,86 @@ async fn run() -> anyhow::Result<()> {
         config.metrics.metrics_enabled,
         config.metrics_port,
         &progress,
-        || lifecycle.track(poll_once(&client, &config, &samples)),
+        || lifecycle.track(poll_once(&client, &config, &samples, &station_list)),
     );
     let result = lifecycle.run(Box::pin(poll_loop), once).await;
     if !samples.shutdown(poller_lifecycle::FLUSH_GRACE).await {
         tracing::warn!("a samples snapshot was still unsent at exit; the next start polls afresh");
     }
+    if !station_list
+        .stream
+        .shutdown(poller_lifecycle::FLUSH_GRACE)
+        .await
+    {
+        tracing::warn!("a station list snapshot was still unsent at exit");
+    }
     result
+}
+
+/// How often the station list is re-sent even when unchanged, so a
+/// snapshot the writer could not apply (one sent before it knew the
+/// schema, say) is not the last one it sees.
+const STATION_LIST_RESEND: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+
+/// The `ioi-live-stations/1` producer: sends `getAllStationsXML`'s list
+/// when it differs from the last one sent, or [`STATION_LIST_RESEND`]
+/// after it. The list rarely changes, so this is about one entry an hour
+/// rather than one every cycle.
+struct StationListSink {
+    stream: SnapshotStream,
+    last: tokio::sync::Mutex<Option<(Vec<IslandOfIrelandLiveStation>, chrono::DateTime<Utc>)>>,
+}
+
+impl StationListSink {
+    fn new(stream: SnapshotStream) -> Self {
+        Self {
+            stream,
+            last: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Queues `stations` unless the same list was queued less than
+    /// [`STATION_LIST_RESEND`] before `now`. A failure is logged, not
+    /// returned: the departure boards matter more than the list, and the
+    /// next cycle tries again.
+    async fn offer(&self, stations: &[IslandOfIrelandLiveStation], now: chrono::DateTime<Utc>) {
+        let mut last = self.last.lock().await;
+        if !should_send(last.as_ref(), stations, now) {
+            return;
+        }
+        match self.stream.publish(stations, now).await {
+            Ok(()) => *last = Some((stations.to_vec(), now)),
+            Err(err) => tracing::warn!(error = %err, "failed to queue the station list"),
+        }
+    }
+}
+
+/// Whether [`StationListSink::offer`] sends `stations` given the last list
+/// sent and when.
+fn should_send(
+    last: Option<&(Vec<IslandOfIrelandLiveStation>, chrono::DateTime<Utc>)>,
+    stations: &[IslandOfIrelandLiveStation],
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    !stations.is_empty()
+        && last.is_none_or(|(sent, at)| {
+            sent.as_slice() != stations || now - *at >= STATION_LIST_RESEND
+        })
 }
 
 async fn poll_once(
     client: &Client,
     config: &Config,
     stream: &SnapshotStream,
+    station_list: &StationListSink,
 ) -> anyhow::Result<()> {
     // The snapshot's `produced_at` (decision D13): the cycle's start. Each
     // sample also carries its own `polled_at`, the writer's observed time.
     let fetched_at = Utc::now();
+    let mut live_stations = Vec::new();
     let station_codes = if config.station_codes_override.is_empty() {
-        fetch_all_station_codes(client, config).await?
+        live_stations = fetch_all_stations(client, config).await?;
+        live_stations.iter().map(|s| s.code.clone()).collect()
     } else {
         config.station_codes_override.clone()
     };
@@ -150,6 +224,7 @@ async fn poll_once(
     }
 
     stream.publish(&samples, fetched_at).await?;
+    station_list.offer(&live_stations, fetched_at).await;
     Ok(())
 }
 
@@ -208,7 +283,10 @@ async fn sample_all_stations(
     }
 }
 
-async fn fetch_all_station_codes(client: &Client, config: &Config) -> anyhow::Result<Vec<String>> {
+async fn fetch_all_stations(
+    client: &Client,
+    config: &Config,
+) -> anyhow::Result<Vec<IslandOfIrelandLiveStation>> {
     let url = format!("{}/getAllStationsXML", config.irish_rail_base_url);
     let body = client
         .get(&url)
@@ -414,6 +492,30 @@ mod tests {
             samples.len() < station_codes.len(),
             "a budget-cut cycle must not have sampled every station: {samples:?}"
         );
+    }
+
+    fn live(code: &str) -> IslandOfIrelandLiveStation {
+        IslandOfIrelandLiveStation {
+            code: code.into(),
+            name: code.into(),
+            alias: None,
+            latitude: None,
+            longitude: None,
+        }
+    }
+
+    #[test]
+    fn the_station_list_is_sent_when_it_changes_or_an_hour_passes() {
+        let t0: chrono::DateTime<Utc> = "2026-11-04T12:00:00Z".parse().unwrap();
+        let list = vec![live("AAA"), live("BBB")];
+        assert!(should_send(None, &list, t0));
+        // Nothing to send (an override, or an empty upstream list).
+        assert!(!should_send(None, &[], t0));
+        let sent = (list.clone(), t0);
+        let soon = t0 + chrono::TimeDelta::minutes(5);
+        assert!(!should_send(Some(&sent), &list, soon));
+        assert!(should_send(Some(&sent), &[live("AAA")], soon));
+        assert!(should_send(Some(&sent), &list, t0 + STATION_LIST_RESEND));
     }
 
     #[tokio::test]

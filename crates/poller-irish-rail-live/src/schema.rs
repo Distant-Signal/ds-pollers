@@ -45,7 +45,8 @@
 
 use anyhow::Result;
 use common::island_of_ireland::{
-    IslandOfIrelandDeparture, IslandOfIrelandNetwork, IslandOfIrelandStationSample,
+    IslandOfIrelandDeparture, IslandOfIrelandLiveStation, IslandOfIrelandNetwork,
+    IslandOfIrelandStationSample,
 };
 use serde::Deserialize;
 
@@ -114,23 +115,62 @@ pub(crate) struct ArrayOfObjStation {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
+#[expect(
+    clippy::struct_field_names,
+    reason = "named after the upstream XML elements (StationCode, StationDesc, ...)"
+)]
 pub(crate) struct ObjStation {
     pub station_code: String,
-    // Real, confirmed field (`getAllStationsXML`'s own `StationDesc`),
-    // kept here for schema-completeness/documentation even though
-    // `parse_all_stations` only extracts `station_code` today -- not
-    // dead code by accident, just unused.
-    #[expect(dead_code, reason = "kept for schema completeness; see above")]
     #[serde(default)]
     pub station_desc: Option<String>,
+    /// Blank for most stations (`<StationAlias />`).
+    #[serde(default)]
+    pub station_alias: Option<String>,
+    /// Read as text: an empty or malformed value leaves the position
+    /// unknown instead of failing the whole list.
+    #[serde(default)]
+    pub station_latitude: Option<String>,
+    #[serde(default)]
+    pub station_longitude: Option<String>,
 }
 
-pub(crate) fn parse_all_stations(xml: &str) -> Result<Vec<String>> {
+/// `value` trimmed, or `None` when blank.
+fn non_blank(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+}
+
+/// A coordinate, when it parses and is not the `0` the feed uses for
+/// "unknown".
+fn coordinate(value: Option<&str>) -> Option<f64> {
+    value
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v != 0.0)
+}
+
+/// Every station `getAllStationsXML` lists, as the catalogue's live
+/// station type: the code (trimmed), name, alias and position. A row with
+/// a blank code is dropped; one with a blank name keeps its code as its
+/// name. Both coordinates or neither.
+pub(crate) fn parse_all_stations(xml: &str) -> Result<Vec<IslandOfIrelandLiveStation>> {
     let response: ArrayOfObjStation = quick_xml::de::from_str(xml)?;
     Ok(response
         .station
         .into_iter()
-        .map(|s| s.station_code)
+        .filter_map(|s| {
+            let code = non_blank(Some(&s.station_code))?;
+            let position = coordinate(s.station_latitude.as_deref())
+                .zip(coordinate(s.station_longitude.as_deref()));
+            Some(IslandOfIrelandLiveStation {
+                name: non_blank(s.station_desc.as_deref()).unwrap_or_else(|| code.clone()),
+                code,
+                alias: non_blank(s.station_alias.as_deref()),
+                latitude: position.map(|p| p.0),
+                longitude: position.map(|p| p.1),
+            })
+        })
         .collect())
 }
 
@@ -306,9 +346,61 @@ mod tests {
         </ArrayOfObjStation>"#;
 
     #[test]
-    fn parses_a_real_captured_all_stations_excerpt_into_a_code_list() {
-        let codes = parse_all_stations(REAL_ALL_STATIONS_EXCERPT)
+    fn parses_a_real_captured_all_stations_excerpt() {
+        let stations = parse_all_stations(REAL_ALL_STATIONS_EXCERPT)
             .expect("real all-stations excerpt must parse");
-        assert_eq!(codes, vec!["BFSTC".to_string(), "CNLLY".to_string()]);
+        assert_eq!(
+            stations,
+            vec![
+                IslandOfIrelandLiveStation {
+                    code: "BFSTC".into(),
+                    name: "Belfast".into(),
+                    alias: None,
+                    latitude: Some(54.6123),
+                    longitude: Some(-5.91744),
+                },
+                IslandOfIrelandLiveStation {
+                    code: "CNLLY".into(),
+                    name: "Dublin Connolly".into(),
+                    alias: Some("Connolly".into()),
+                    latitude: Some(53.3531),
+                    longitude: Some(-6.24591),
+                },
+            ]
+        );
+    }
+
+    /// Shaped like the real list's odd rows: a junction (a name, no
+    /// alias), a padded code, a missing position and a blank code.
+    #[test]
+    fn odd_all_stations_rows_degrade_instead_of_failing() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+            <ArrayOfObjStation xmlns="http://api.irishrail.ie/realtime/">
+              <objStation>
+                <StationDesc>City Junction</StationDesc>
+                <StationAlias>Dublin Belfast</StationAlias>
+                <StationLatitude>0</StationLatitude>
+                <StationLongitude>0</StationLongitude>
+                <StationCode>CTJN </StationCode>
+              </objStation>
+              <objStation>
+                <StationDesc />
+                <StationAlias />
+                <StationLatitude />
+                <StationLongitude>-6.1</StationLongitude>
+                <StationCode>ZZZ</StationCode>
+              </objStation>
+              <objStation>
+                <StationDesc>Nowhere</StationDesc>
+                <StationCode>  </StationCode>
+              </objStation>
+            </ArrayOfObjStation>"#;
+        let stations = parse_all_stations(xml).expect("must parse");
+        assert_eq!(stations.len(), 2);
+        assert_eq!(stations[0].code, "CTJN");
+        assert_eq!(stations[0].alias.as_deref(), Some("Dublin Belfast"));
+        assert_eq!((stations[0].latitude, stations[0].longitude), (None, None));
+        assert_eq!(stations[1].name, "ZZZ");
+        assert_eq!((stations[1].latitude, stations[1].longitude), (None, None));
     }
 }
