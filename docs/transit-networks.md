@@ -543,7 +543,12 @@ only the open data download.
 ## Adding a network
 
 Each network is compiled in and has its own stream, user and switches.
-For `<n>` (`[a-z0-9-]`):
+For `<n>` (`[a-z0-9-]`). Since repo split phase 5 the chart, its values,
+the chart scripts and docs/redis-acl.md are in
+[Distant-Signal/ds-deploy](https://github.com/Distant-Signal/ds-deploy),
+and the ACL, grants and `common`/`ingest_stream` code in
+[Distant-Signal/ds-core](https://github.com/Distant-Signal/ds-core): the
+steps below that name them are PRs there.
 
 1. **Network file:** `crates/poller-transit-schedule/networks/<n>.toml`
    (its `adapter`, `gtfs` or `txc`, with the matching `gtfs_route_names`
@@ -611,14 +616,14 @@ once the writer no longer consumes it.
 
 ## Alerts
 
-- [DistantSignalTransitFeedRefused](alerts.md#distantsignaltransitfeedrefused)
-- [DistantSignalTransitUnmappedLineRef](alerts.md#distantsignaltransitunmappedlineref)
-- [DistantSignalIngestSourceStale](alerts.md#distantsignalingestsourcestale)
+- [DistantSignalTransitFeedRefused](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/alerts.md#distantsignaltransitfeedrefused)
+- [DistantSignalTransitUnmappedLineRef](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/alerts.md#distantsignaltransitunmappedlineref)
+- [DistantSignalIngestSourceStale](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/alerts.md#distantsignalingestsourcestale)
   for `transit-metrolink-timetable` (36 h) and
   `transit-metrolink-situations` (30 min), only while the stream applies.
-- [DistantSignalIngestStreamBacklog](alerts.md#distantsignalingeststreambacklog),
-  [DistantSignalIngestStreamStalled](alerts.md#distantsignalingeststreamstalled)
-  and [DistantSignalIngestDeadLetters](alerts.md#distantsignalingestdeadletters)
+- [DistantSignalIngestStreamBacklog](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/alerts.md#distantsignalingeststreambacklog),
+  [DistantSignalIngestStreamStalled](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/alerts.md#distantsignalingeststreamstalled)
+  and [DistantSignalIngestDeadLetters](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/alerts.md#distantsignalingestdeadletters)
   for `ds:ingest:transit-metrolink`.
 
 Thirty minutes after the last situations snapshot the pages show "Status
