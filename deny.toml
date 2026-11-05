@@ -27,6 +27,15 @@ ignore = [
     # lopdf. PDF tickets are parsed in api's resource-limited child process
     # (data::ticket_subprocess), so a parser bug can't take the server down.
     { id = "RUSTSEC-2026-0192", reason = "only via pdf-extract, which runs in the sandboxed ticket-parse child" },
+    # zip 8.6.0, only via gtfs-structures (poller-irish-rail-gtfs), which
+    # still requires zip ^8.6 and only reads entries in memory: all four
+    # are in ZipArchive::extract(), which nothing calls. Fixed in zip 9,
+    # which our own crates use. The reasoning and the 2026-12-18 review
+    # date are in osv-scanner.toml (DS-58, DS-350).
+    { id = "RUSTSEC-2026-0367", reason = "zip 8 extract() only, never called; see osv-scanner.toml" },
+    { id = "RUSTSEC-2026-0368", reason = "zip 8 extract() only, never called; see osv-scanner.toml" },
+    { id = "RUSTSEC-2026-0369", reason = "zip 8 extract() only, never called; see osv-scanner.toml" },
+    { id = "RUSTSEC-2026-0429", reason = "zip 8 extract() only, never called; see osv-scanner.toml" },
 ]
 
 [licenses]
