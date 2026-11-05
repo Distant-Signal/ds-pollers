@@ -52,3 +52,87 @@ Even gtfs-structures 0.52 still requires zip ^8.6. Accepted by the user \
 gtfs-structures and `cargo update -p zip` if a release has shipped, \
 otherwise review again.\
 """
+
+# The five zip 8.6.0 advisories below are all fixed only in zip 9.0.0, and
+# share one exposure: gtfs-structures 0.50 (via poller-irish-rail-gtfs) is the
+# only zip 8 user, and every gtfs-structures release up to 0.52 (and its main
+# branch) still requires zip ^8.6. It enables only zip's `deflate` feature
+# (so no `legacy-zip` or `aes-crypto` code is compiled) and only reads
+# entries in memory: ZipArchive::new, by_index, name, then a csv reader over
+# the entry (GtfsReader::read_from_reader). Nothing in this workspace calls
+# extract() on either zip major; our own crates are on zip 9, which is fixed.
+# Same expiry as the zip 8 entries above, so they are reviewed together
+# (DS-58, move off zip 8). Recorded under DS-350.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0429"
+ignoreUntil = 2026-12-18T00:00:00Z
+reason = """\
+zip 8.6.0 (GHSA-q7v9-x93c-xqv3, CVSS 7.5: ZipArchive::extract() aborts \
+the process allocating a symlink-target buffer sized from the declared \
+uncompressed size). Unreachable: the bug is in extract()'s symlink branch, \
+and the only zip 8 user, gtfs-structures 0.50 (via \
+poller-irish-rail-gtfs), never calls extract(); it reads entries in memory \
+(by_index, then a csv reader), which streams rather than pre-allocating \
+from the declared size. The poller also bounds every entry's inflated \
+size with zip 9 first (reject_gtfs_zip_bomb). No zip 8 fix exists and \
+gtfs-structures 0.52 still requires zip ^8.6 (DS-58). At expiry, bump \
+gtfs-structures and `cargo update -p zip` if a release has shipped, \
+otherwise review again.\
+"""
+
+[[IgnoredVulns]]
+id = "GHSA-9hj8-73fh-9963"
+ignoreUntil = 2026-12-18T00:00:00Z
+reason = """\
+zip 8.6.0 (CVSS 7.5: the legacy Shrink/Reduce/Implode decoders reserve \
+memory from an attacker-declared ZIP64 size and panic). Not compiled: \
+those decoders exist only with zip's `legacy-zip` feature, and the only \
+zip 8 user, gtfs-structures 0.50 (via poller-irish-rail-gtfs), enables \
+`deflate` alone (`cargo tree -e features -i zip@8.6.0`). An entry using a \
+legacy method is rejected as unsupported, and the poller's zip 9 \
+pre-check (reject_gtfs_zip_bomb) supports the same methods only. No zip 8 \
+fix exists and gtfs-structures 0.52 still requires zip ^8.6 (DS-58). At \
+expiry, bump gtfs-structures and `cargo update -p zip` if a release has \
+shipped, otherwise review again.\
+"""
+
+[[IgnoredVulns]]
+id = "GHSA-hjqx-j4rw-g7xv"
+ignoreUntil = 2026-12-18T00:00:00Z
+reason = """\
+zip 8.6.0 (CVSS 7.4: ZipArchive::extract() validates symlink targets \
+lexically, so an archive can write outside the extraction directory). \
+Unreachable: nothing in this workspace extracts an archive to disk, and \
+the only zip 8 user, gtfs-structures 0.50 (via poller-irish-rail-gtfs), \
+reads entries in memory (by_index, name) and never calls extract() or \
+creates files from entry names. No zip 8 fix exists and gtfs-structures \
+0.52 still requires zip ^8.6 (DS-58). At expiry, bump gtfs-structures and \
+`cargo update -p zip` if a release has shipped, otherwise review again.\
+"""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0368"
+ignoreUntil = 2026-12-18T00:00:00Z
+reason = """\
+zip 8.6.0 (GHSA-4v9h-p7m9-rh26: ZipArchive::extract() creates symlinks \
+whose targets point outside the destination). Unreachable: no code in this \
+workspace calls extract() or creates symlinks, and the only zip 8 user, \
+gtfs-structures 0.50 (via poller-irish-rail-gtfs), only reads entries in \
+memory (by_index, name). No zip 8 fix exists and gtfs-structures 0.52 \
+still requires zip ^8.6 (DS-58). At expiry, bump gtfs-structures and \
+`cargo update -p zip` if a release has shipped, otherwise review again.\
+"""
+
+[[IgnoredVulns]]
+id = "GHSA-8hxf-qr8p-62x4"
+ignoreUntil = 2026-12-18T00:00:00Z
+reason = """\
+zip 8.6.0 (CVSS 6.5: an AES-encrypted entry's HMAC is skipped on a \
+premature EOF). Not compiled: AES entries need zip's `aes-crypto` feature, \
+and the only zip 8 user, gtfs-structures 0.50 (via \
+poller-irish-rail-gtfs), enables `deflate` alone; the GTFS feed is not \
+encrypted. No zip 8 fix exists and gtfs-structures 0.52 still requires \
+zip ^8.6 (DS-58). At expiry, bump gtfs-structures and `cargo update -p \
+zip` if a release has shipped, otherwise review again.\
+"""
