@@ -20,12 +20,15 @@
 //!   synthetic XML.
 //! - `Traincode`'s value carries a trailing space in the real feed (e.g.
 //!   `"A912 "`) -- `From<&ObjStationData>` trims it.
-//! - The real response has many more fields than this crate models
+//! - The real response has more fields than this crate models
 //!   (`Servertime`, `Stationfullname`, `Stationcode`, `Querytime`,
-//!   `Traindate`, `Origintime`, `Destinationtime`, `Lastlocation`,
 //!   `Direction`, `Traintype`, `Locationtype`) -- left unmapped, and
 //!   harmlessly ignored by `quick_xml::de` (no `deny_unknown_fields` is
-//!   set anywhere in this module).
+//!   set anywhere in this module). `Traindate`, `Origintime`,
+//!   `Destinationtime` and `Lastlocation` are mapped (2026-11-05, DS-369):
+//!   `Traindate` is what tells one day's train from the next one with the
+//!   same code, and the writer keeps a history by it (distant-signal's
+//!   docs/superpowers/specs/2026-11-05-irish-rail-train-tracking-design.md).
 //! - `Late` is genuinely signed in the wild (a real live poll during this
 //!   crate's implementation observed `Late = -2` for an Enterprise service
 //!   running early), confirming `i32`, not `u32`.
@@ -75,6 +78,22 @@ pub struct ObjStationData {
     pub status: String,
     #[serde(default)]
     pub duein: Option<String>,
+    /// `"05 Sep 2026"`: the day the train started.
+    #[serde(default)]
+    pub traindate: Option<String>,
+    #[serde(default)]
+    pub origintime: Option<String>,
+    #[serde(default)]
+    pub destinationtime: Option<String>,
+    /// `"Departed Dundalk"`, or empty (`<Lastlocation />`).
+    #[serde(default)]
+    pub lastlocation: Option<String>,
+}
+
+/// `Traindate` (`"05 Sep 2026"`) as a date; `None` when blank or not in
+/// that shape, so an odd value costs the history that train, not the board.
+fn train_date(raw: Option<&str>) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(raw?.trim(), "%d %b %Y").ok()
 }
 
 impl From<&ObjStationData> for IslandOfIrelandDeparture {
@@ -93,6 +112,10 @@ impl From<&ObjStationData> for IslandOfIrelandDeparture {
             late_minutes: d.late,
             status: d.status.clone(),
             due_in_minutes: d.duein.as_deref().and_then(|s| s.parse().ok()),
+            train_date: train_date(d.traindate.as_deref()),
+            origin_time: non_blank(d.origintime.as_deref()),
+            destination_time: non_blank(d.destinationtime.as_deref()),
+            last_location: non_blank(d.lastlocation.as_deref()),
         }
     }
 }
@@ -264,6 +287,66 @@ mod tests {
 
         assert_eq!(departures[1].train_code, "A123");
         assert_eq!(departures[1].status, "No Information");
+
+        // The board fields the history keys and reads.
+        let sep_5 = chrono::NaiveDate::from_ymd_opt(2026, 9, 5);
+        assert_eq!(departures[0].train_date, sep_5);
+        assert_eq!(departures[0].origin_time.as_deref(), Some("15:50"));
+        assert_eq!(departures[0].destination_time.as_deref(), Some("17:58"));
+        assert_eq!(
+            departures[0].last_location.as_deref(),
+            Some("Departed Dundalk")
+        );
+        // `<Lastlocation />`: no report yet, not an empty string.
+        assert_eq!(departures[1].train_date, sep_5);
+        assert_eq!(departures[1].last_location, None);
+    }
+
+    /// A `Traindate` that isn't `dd Mon yyyy`, or is missing, leaves the
+    /// date unknown and the rest of the row intact.
+    #[test]
+    fn an_odd_or_missing_train_date_is_unknown_not_an_error() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+            <ArrayOfObjStationData xmlns="http://api.irishrail.ie/realtime/">
+              <objStationData>
+                <Traincode>E101 </Traincode>
+                <Traindate>2026-09-05</Traindate>
+                <Origin>Malahide</Origin>
+                <Destination>Bray</Destination>
+                <Origintime>  </Origintime>
+                <Status>En Route</Status>
+                <Late>1</Late>
+              </objStationData>
+              <objStationData>
+                <Traincode>E102</Traincode>
+                <Origin>Bray</Origin>
+                <Destination>Howth</Destination>
+                <Status>No Information</Status>
+                <Late>0</Late>
+              </objStationData>
+            </ArrayOfObjStationData>"#;
+        let departures = parse_station_departures(xml).expect("must parse");
+        assert_eq!(departures.len(), 2);
+        assert_eq!(departures[0].train_date, None);
+        assert_eq!(departures[0].origin_time, None);
+        assert_eq!(departures[0].late_minutes, 1);
+        assert_eq!(departures[1].train_date, None);
+        assert_eq!(departures[1].last_location, None);
+    }
+
+    /// Across midnight the date is the train's start day, as sent.
+    #[test]
+    fn train_date_reads_the_feeds_day_month_year() {
+        assert_eq!(
+            train_date(Some("31 Dec 2026")),
+            chrono::NaiveDate::from_ymd_opt(2026, 12, 31)
+        );
+        assert_eq!(
+            train_date(Some(" 01 Jan 2027 ")),
+            chrono::NaiveDate::from_ymd_opt(2027, 1, 1)
+        );
+        assert_eq!(train_date(Some("")), None);
+        assert_eq!(train_date(None), None);
     }
 
     /// A real captured response for an Enterprise service running early
