@@ -185,6 +185,77 @@ pub(crate) fn map_stations(
     Ok(stations)
 }
 
+/// Display names that the generic tidy-up in [`display_name`] would get
+/// wrong, keyed by the raw CSV `NAME`: a misspelling in the source
+/// ("HOLLYWOOD" is Holywood, County Down), renamed stations, and
+/// abbreviations.
+const NAME_OVERRIDES: &[(&str, &str)] = &[
+    ("HOLLYWOOD RAIL HALT", "Holywood"),
+    // The CSV's own Comment says "Remnamed": Belfast Central has been
+    // Lanyon Place since 2018.
+    ("BELFAST - CENTRAL RAIL STATION", "Lanyon Place"),
+    ("L'DERRY RAIL STATION", "Derry~Londonderry"),
+    ("PORTRUSH DHU VARREN RAIL HALT", "Dhu Varren"),
+    ("COLERAINE UNIVERSITY RAIL HALT", "University"),
+];
+
+/// The name shown for a raw `OpenDataNI` `NAME`: an override from
+/// [`NAME_OVERRIDES`], or the name without its `RAIL HALT`/`RAIL
+/// STATION`/`STATION`/`HALT` type suffix and the `BELFAST - ` prefix the
+/// city's stations carry ("BELFAST - BOTANIC RAIL STATION" is Botanic, as
+/// Translink names it), in title case ("HELEN'S BAY RAIL HALT" is
+/// "Helen's Bay").
+pub(crate) fn display_name(raw: &str) -> String {
+    let raw = raw.trim();
+    if let Some((_, name)) = NAME_OVERRIDES.iter().find(|(from, _)| *from == raw) {
+        return (*name).to_owned();
+    }
+    let mut bare = raw;
+    for suffix in ["RAIL HALT", "RAIL STATION", "STATION", "HALT"] {
+        if let Some(stripped) = bare.strip_suffix(suffix)
+            && !stripped.trim().is_empty()
+        {
+            bare = stripped.trim_end();
+            break;
+        }
+    }
+    if let Some(rest) = bare.strip_prefix("BELFAST - ")
+        && !rest.trim().is_empty()
+    {
+        bare = rest.trim_start();
+    }
+    title_case(bare)
+}
+
+/// Title case for an all-caps name: each word's first letter upper case,
+/// the rest lower case, where a word starts after a space, hyphen or slash
+/// (not an apostrophe: "HELEN'S" is "Helen's"); "and" and "of" stay lower
+/// case inside a name.
+fn title_case(name: &str) -> String {
+    let words: Vec<String> = name
+        .split_whitespace()
+        .enumerate()
+        .map(|(index, word)| {
+            let lower = word.to_lowercase();
+            if index > 0 && matches!(lower.as_str(), "and" | "of") {
+                return lower;
+            }
+            let mut out = String::with_capacity(lower.len());
+            let mut start = true;
+            for ch in lower.chars() {
+                if start {
+                    out.extend(ch.to_uppercase());
+                } else {
+                    out.push(ch);
+                }
+                start = matches!(ch, '-' | '/');
+            }
+            out
+        })
+        .collect();
+    words.join(" ")
+}
+
 /// Pushes `row` onto `stations` as an `IslandOfIrelandStation`, unless its
 /// `slugify`'d id has already been claimed by an earlier row in this same
 /// reload.
@@ -218,12 +289,17 @@ fn push_station_if_id_is_new(
         );
         return;
     }
+    // The id stays the raw name's slug ("HOLLYWOOD RAIL HALT" is still
+    // `nir-hollywood`): ids are stored keys, and the upsert never deletes.
+    let name = display_name(&row.name);
+    let raw_name = (name != row.name).then_some(row.name);
     stations.push(IslandOfIrelandStation {
         id,
-        name: row.name,
+        name,
         network: IslandOfIrelandNetwork::NorthernIreland,
         latitude: Some(row.lat),
         longitude: Some(row.long),
+        raw_name,
     });
 }
 
@@ -254,12 +330,30 @@ fn push_station_if_id_is_new(
 /// Translink's own 2023 survey. Both are skipped below rather than
 /// invented -- no real `island_of_ireland_stations.id` exists for either
 /// today.
+/// The fields every NIR line shares: the operator, and no colours (the
+/// map's colours are not published as data, so none are invented).
+fn nir_line() -> IslandOfIrelandLineDefinition {
+    IslandOfIrelandLineDefinition {
+        id: String::new(),
+        name: String::new(),
+        network: IslandOfIrelandNetwork::NorthernIreland,
+        stations: Vec::new(),
+        short_name: None,
+        agency: Some(NIR_AGENCY.to_owned()),
+        color: None,
+        text_color: None,
+        replaces: Vec::new(),
+    }
+}
+
+/// The operator of every NIR line.
+const NIR_AGENCY: &str = "NI Railways";
+
 pub(crate) fn map_lines() -> Vec<IslandOfIrelandLineDefinition> {
     vec![
         IslandOfIrelandLineDefinition {
             id: "nir-bangor-line".to_string(),
             name: "Bangor Line".to_string(),
-            network: IslandOfIrelandNetwork::NorthernIreland,
             stations: [
                 "BELFAST - CENTRAL RAIL STATION",
                 "BELFAST - BRIDGE END RAIL HALT",
@@ -276,11 +370,11 @@ pub(crate) fn map_lines() -> Vec<IslandOfIrelandLineDefinition> {
             .iter()
             .map(|n| slugify(n))
             .collect(),
+            ..nir_line()
         },
         IslandOfIrelandLineDefinition {
             id: "nir-larne-line".to_string(),
             name: "Larne Line".to_string(),
-            network: IslandOfIrelandNetwork::NorthernIreland,
             stations: [
                 "BELFAST - YORKGATE RAIL STATION",
                 "WHITEABBEY RAIL HALT",
@@ -300,6 +394,7 @@ pub(crate) fn map_lines() -> Vec<IslandOfIrelandLineDefinition> {
             .iter()
             .map(|n| slugify(n))
             .collect(),
+            ..nir_line()
         },
         // Shares its first four stops (Yorkgate through Greenisland) with
         // the Larne Line above -- a real, shared trunk, not a data error
@@ -310,7 +405,6 @@ pub(crate) fn map_lines() -> Vec<IslandOfIrelandLineDefinition> {
         IslandOfIrelandLineDefinition {
             id: "nir-londonderry-line".to_string(),
             name: "Derry~Londonderry Line".to_string(),
-            network: IslandOfIrelandNetwork::NorthernIreland,
             stations: [
                 "BELFAST - YORKGATE RAIL STATION",
                 "WHITEABBEY RAIL HALT",
@@ -339,6 +433,7 @@ pub(crate) fn map_lines() -> Vec<IslandOfIrelandLineDefinition> {
             .iter()
             .map(|n| slugify(n))
             .collect(),
+            ..nir_line()
         },
         // Decision 2 (see this plan's own header section): a genuinely
         // distinct NIR-only local/stopping line, confirmed via Translink's
@@ -351,7 +446,6 @@ pub(crate) fn map_lines() -> Vec<IslandOfIrelandLineDefinition> {
         IslandOfIrelandLineDefinition {
             id: "nir-portadown-newry-line".to_string(),
             name: "Portadown/Newry Line".to_string(),
-            network: IslandOfIrelandNetwork::NorthernIreland,
             stations: [
                 "BELFAST - CENTRAL RAIL STATION",
                 "BELFAST - BOTANIC RAIL STATION",
@@ -373,6 +467,7 @@ pub(crate) fn map_lines() -> Vec<IslandOfIrelandLineDefinition> {
             .iter()
             .map(|n| slugify(n))
             .collect(),
+            ..nir_line()
         },
     ]
 }
@@ -424,7 +519,7 @@ mod tests {
     fn map_stations_excludes_border_and_decision_1_belfast_rows() {
         let stations = map_stations(&stations_fixture(), &halts_fixture()).unwrap();
         assert!(!stations.iter().any(|s| s.id == "nir-belfast-europa-gvs"));
-        assert!(!stations.iter().any(|s| s.name == "LISBURN RAIL STATION"));
+        assert!(!stations.iter().any(|s| s.name == "Lisburn"));
         assert!(stations.iter().any(|s| s.id == "nir-belfast-central"));
         assert!(stations.iter().any(|s| s.id == "nir-bangor"));
     }
@@ -432,7 +527,7 @@ mod tests {
     #[test]
     fn map_stations_filters_disused_halts() {
         let stations = map_stations(&stations_fixture(), &halts_fixture()).unwrap();
-        assert!(!stations.iter().any(|s| s.name.contains("KNOCKMORE")));
+        assert!(!stations.iter().any(|s| s.name.contains("Knockmore")));
         assert!(stations.iter().any(|s| s.id == "nir-moira"));
     }
 
@@ -480,7 +575,7 @@ mod tests {
         assert!(stations.iter().any(|s| s.id == "nir-belfast-central"));
         assert!(stations.iter().any(|s| s.id == "nir-bangor"));
         assert!(
-            !stations.iter().any(|s| s.name == "BROKEN ROW"),
+            !stations.iter().any(|s| s.name == "Broken Row"),
             "the malformed row itself must not appear"
         );
     }
@@ -518,6 +613,47 @@ mod tests {
     }
 
     #[test]
+    fn display_names_are_tidied_and_overridden() {
+        for (raw, shown) in [
+            ("HOLLYWOOD RAIL HALT", "Holywood"),
+            ("BANGOR RAIL STATION", "Bangor"),
+            ("BANGOR WEST RAIL HALT", "Bangor West"),
+            ("HELEN'S BAY RAIL HALT", "Helen's Bay"),
+            ("BELFAST - BOTANIC RAIL STATION", "Botanic"),
+            ("BELFAST - CITY HOSPITAL RAIL HALT", "City Hospital"),
+            ("BELFAST - CENTRAL RAIL STATION", "Lanyon Place"),
+            ("LARNE HARBOUR RAIL STATION", "Larne Harbour"),
+            ("L'DERRY RAIL STATION", "Derry~Londonderry"),
+            ("PORTRUSH DHU VARREN RAIL HALT", "Dhu Varren"),
+            ("BELFAST - SYDENHAM RAIL HALT", "Sydenham"),
+            ("BALLYCARRY HALT", "Ballycarry"),
+            // Nothing left to strip down to: kept whole.
+            ("STATION", "Station"),
+        ] {
+            assert_eq!(display_name(raw), shown, "{raw}");
+        }
+    }
+
+    #[test]
+    fn stations_carry_their_display_name_and_raw_name() {
+        let stations_csv = format!(
+            "\u{FEFF}{STATIONS_CSV_HEADER}\
+             30,HOLLYWOOD RAIL HALT,HALT,0,0,,54.64,-5.84\n"
+        )
+        .into_bytes();
+        let stations = map_stations(&stations_csv, &halts_fixture()).unwrap();
+        let holywood = stations
+            .iter()
+            .find(|s| s.id == "nir-hollywood")
+            .expect("id kept");
+        assert_eq!(holywood.name, "Holywood");
+        assert_eq!(holywood.raw_name.as_deref(), Some("HOLLYWOOD RAIL HALT"));
+        let moira = stations.iter().find(|s| s.id == "nir-moira").unwrap();
+        assert_eq!(moira.name, "Moira");
+        assert_eq!(moira.raw_name.as_deref(), Some("MOIRA RAIL HALT"));
+    }
+
+    #[test]
     fn map_lines_returns_four_lines_with_non_empty_station_lists() {
         let lines = map_lines();
         assert_eq!(lines.len(), 4);
@@ -532,6 +668,9 @@ mod tests {
                 "{} must only reference nir- station ids",
                 line.id
             );
+            assert_eq!(line.network, IslandOfIrelandNetwork::NorthernIreland);
+            assert_eq!(line.agency.as_deref(), Some(NIR_AGENCY));
+            assert!(!line.id.is_empty() && !line.name.is_empty());
         }
     }
 
