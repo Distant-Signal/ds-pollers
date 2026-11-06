@@ -516,7 +516,7 @@ mod tests {
             (sligo.color.as_deref(), sligo.text_color.as_deref()),
             (None, None)
         );
-        assert!(sligo.replaces.is_empty());
+        assert_eq!(sligo.replaces, Vec::<String>::new());
         assert_eq!(
             sligo.agency.as_deref(),
             Some("Iarnród Éireann / Irish Rail")
