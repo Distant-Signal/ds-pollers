@@ -147,7 +147,7 @@ mod tests {
         assert_eq!(skipped, ["PWESF"]);
         assert_eq!(fetch.len(), list().len() - 1);
         let (fetch, skipped) = board_codes_with(&list(), &[]);
-        assert!(skipped.is_empty());
+        assert_eq!(skipped, Vec::<String>::new());
         assert_eq!(fetch.len(), list().len());
     }
 
