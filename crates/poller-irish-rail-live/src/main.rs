@@ -1,8 +1,8 @@
 //! `poller-irish-rail-live`: polls `api.irishrail.ie`'s legacy realtime XML
-//! service for every station it lists, and forwards raw per-station
-//! departure-board samples to the `ds:ingest:ioi-live` stream as
-//! `ioi-station-samples/1` (ingest plan 3c.2, decision D8), which the
-//! ingest-writer applies. The api's
+//! service for every station it lists (one code per station: see
+//! [`aliases`]), and forwards raw per-station departure-board samples to
+//! the `ds:ingest:ioi-live` stream as `ioi-station-samples/1` (ingest
+//! plan 3c.2, decision D8), which the ingest-writer applies. The api's
 //! `/private/island-of-ireland-station-samples` route it used to call was
 //! deleted (phase 5 runbook Q9). Tier B of
 //! docs/superpowers/specs/2026-09-05-ireland-rail-support-design.md; see
@@ -23,6 +23,7 @@
 //! to the catalogue, so a catalogue station's departures can be found
 //! from its id.
 
+mod aliases;
 mod config;
 mod schema;
 
@@ -204,16 +205,20 @@ async fn poll_once(
     // sample also carries its own `polled_at`, the writer's observed time.
     let fetched_at = Utc::now();
     let mut live_stations = Vec::new();
-    let station_codes = if config.station_codes_override.is_empty() {
+    // One board per station: the live list's alias codes are skipped
+    // (DS-373, `aliases`). An operator's override list is fetched as given.
+    let (station_codes, alias_codes) = if config.station_codes_override.is_empty() {
         live_stations = fetch_all_stations(client, config).await?;
-        live_stations.iter().map(|s| s.code.clone()).collect()
+        aliases::board_codes(&live_stations)
     } else {
-        config.station_codes_override.clone()
+        (config.station_codes_override.clone(), Vec::new())
     };
     tracing::info!(
         count = station_codes.len(),
+        aliases_skipped = alias_codes.len(),
         "fetched station code list to sample"
     );
+    tracing::debug!(codes = ?alias_codes, "alias codes not sampled");
 
     let samples =
         sample_stations_within_budget(client, config, &station_codes, CYCLE_TIME_BUDGET).await;
