@@ -14,7 +14,7 @@ use std::time::Duration;
 use common::IncidentSnapshot;
 use common::ingest::{self, DataRejected};
 use common::matcher::LineMatcher;
-use ds_store::incidents::{self, IncidentSnapshotOutcome, RowHeartbeat};
+use ds_store::incidents::{self, IncidentSnapshotOutcome, PartialSnapshot, RowHeartbeat};
 use sqlx::PgPool;
 
 /// The sink's error vocabulary (spec §9.1), for the retry decision.
@@ -96,6 +96,17 @@ pub(crate) struct DbSink<P> {
     pub budget: Duration,
 }
 
+/// Publishes the text-changed ids of the chunks that committed before
+/// `apply_snapshot` failed (its [`PartialSnapshot`] context), if any. The
+/// error itself is left to the caller to classify.
+async fn publish_partial<P: TextChangedPublisher>(publisher: &P, err: &anyhow::Error) {
+    if let Some(partial) = err.downcast_ref::<PartialSnapshot>()
+        && !partial.text_changed_ids.is_empty()
+    {
+        publisher.publish(partial.text_changed_ids.clone()).await;
+    }
+}
+
 impl<P: TextChangedPublisher> DbSink<P> {
     /// One attempt: apply, publish, infer (`ds_store::incidents`' module
     /// docs). A retry after a failed inference publishes nothing twice:
@@ -116,8 +127,17 @@ impl<P: TextChangedPublisher> DbSink<P> {
             &snapshot.incidents,
             self.heartbeat,
         )
-        .await
-        .map_err(SinkError::from_db)?;
+        .await;
+        let applied = match applied {
+            Ok(applied) => applied,
+            Err(err) => {
+                // Some chunks may have committed before one failed: publish
+                // their ids now, as a retry finds them stored and reports
+                // them no more.
+                publish_partial(&self.publisher, &err).await;
+                return Err(SinkError::from_db(err));
+            }
+        };
         // After every chunk has committed, before the inference (whose
         // failure must not drop these).
         if !applied.text_changed_ids.is_empty() {
@@ -251,6 +271,53 @@ mod tests {
         let rendered = format!("{err:#}");
         assert!(rendered.contains("data rejected"), "{rendered}");
         assert!(rendered.contains("SQLSTATE 23505"), "{rendered}");
+    }
+
+    /// Records what it is asked to publish.
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<Vec<String>>>);
+
+    impl TextChangedPublisher for Recorder {
+        async fn publish(&self, incident_ids: Vec<String>) {
+            self.0.lock().unwrap().push(incident_ids);
+        }
+    }
+
+    fn partial_error(ids: &[&str], cause: anyhow::Error) -> anyhow::Error {
+        cause.context(PartialSnapshot {
+            committed_chunks: 1,
+            text_changed_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_partial_snapshot_publishes_the_committed_ids() {
+        let recorder = Recorder::default();
+        let err = partial_error(&["A", "B"], db_error("57014"));
+        publish_partial(&recorder, &err).await;
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            vec![vec!["A".to_owned(), "B".to_owned()]]
+        );
+        // The classification still sees through the added context.
+        assert!(matches!(SinkError::from_db(err), SinkError::Timeout(_)));
+    }
+
+    #[tokio::test]
+    async fn a_partial_snapshot_keeps_a_rejection_a_rejection() {
+        let err = partial_error(&["A"], db_error("23505"));
+        let recorder = Recorder::default();
+        publish_partial(&recorder, &err).await;
+        assert_eq!(recorder.0.lock().unwrap().len(), 1);
+        assert!(matches!(SinkError::from_db(err), SinkError::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn nothing_is_published_without_committed_ids_or_a_partial_error() {
+        let recorder = Recorder::default();
+        publish_partial(&recorder, &partial_error(&[], db_error("57014"))).await;
+        publish_partial(&recorder, &db_error("57014")).await;
+        assert!(recorder.0.lock().unwrap().is_empty());
     }
 
     #[test]
