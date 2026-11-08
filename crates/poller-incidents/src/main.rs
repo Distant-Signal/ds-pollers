@@ -64,6 +64,7 @@ async fn run() -> anyhow::Result<()> {
         ds_runtime::metrics::install(config.metrics_port)?;
     }
     let sink = db_sink(&config, &progress, budget).await?;
+    lifecycle.sink_connected();
     tracing::info!(
         row_heartbeat = config.incidents_row_heartbeat,
         "writing incident snapshots to Postgres"

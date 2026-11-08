@@ -212,6 +212,8 @@ async fn run() -> anyhow::Result<()> {
     if once {
         return daily_once(&client, &config, &progress, stops, routes).await;
     }
+    // The producers are lazy: a Redis outage shows as failed cycles.
+    lifecycle.sink_connected();
 
     let cycle = || lifecycle.track(poll_once(&client, &config, &stream));
 

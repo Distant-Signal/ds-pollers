@@ -245,6 +245,8 @@ async fn run() -> anyhow::Result<()> {
         ),
     };
 
+    // The producers are lazy: a Redis outage shows as failed cycles.
+    lifecycle.sink_connected();
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     // The startup cursor is the older of the newest `ioi-stations/1` and
     // `ioi-lines/1` entries (`Sinks::cursor`).

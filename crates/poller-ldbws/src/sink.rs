@@ -17,7 +17,10 @@
 //! stations and its snapshot supersedes this one losslessly.
 //!
 //! The readiness side of spec §7.5 (`stream_unavailable`) is the cycle
-//! failure here: a poller's `/healthz` is its loop's progress.
+//! failure here: `poller-lifecycle` makes the pod unready after
+//! `UNREADY_AFTER_FAILURES` failed cycles in a row, and ready again at the
+//! next success. Liveness (`/livez`) is the loop's progress, which a failed
+//! cycle keeps, so a Redis outage never restarts the pod.
 
 use std::time::Duration;
 

@@ -118,6 +118,8 @@ async fn run() -> anyhow::Result<()> {
         "poller-irish-rail-live",
         500,
     ));
+    // The producers are lazy: a Redis outage shows as failed cycles.
+    lifecycle.sink_connected();
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
 
     // The startup cursor is the newest `ioi-station-samples/1` entry.

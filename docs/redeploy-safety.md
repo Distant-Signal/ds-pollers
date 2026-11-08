@@ -111,7 +111,11 @@ alerts cover that case. Coverage is adequate, so no alert was added.
    - `/healthz` is now ready only after the pod's first successful cycle,
      or after `POLLER_READY_FALLBACK_SECS` (default 480) in any case, so
      an upstream outage cannot stall a rollout for ever (`poller-lifecycle`,
-     #4);
+     #4). The fallback counts from when the sink connected (Postgres and the
+     schema gate for a database writer), so a pod still waiting on either
+     is never ready. Readiness then follows the cycles: three failed cycles
+     in a row make the pod unready until the next success. `/livez` is
+     unaffected, so a failing or quiet poller is never restarted for it;
    - the chart runs these Deployments with a surge (`pollers.<name>.rollout:
      surge`): RollingUpdate, `maxSurge: 1`, `maxUnavailable: 0`, with a
      readiness probe on `/healthz` (Distant-Signal/ds-deploy#24). The old

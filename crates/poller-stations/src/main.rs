@@ -68,6 +68,7 @@ async fn run() -> anyhow::Result<()> {
     let retry_budget = common::poller_loop::post_retry_budget(poll_interval);
 
     let pool = connect_database(&config, &progress).await?;
+    lifecycle.sink_connected();
     tracing::info!("writing stations to Postgres directly");
     let sink = DbSink {
         pool,
