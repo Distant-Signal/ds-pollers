@@ -57,6 +57,8 @@ async fn run() -> anyhow::Result<()> {
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let stream = stream_sink(&config)?;
+    // The producer is lazy: a Redis outage shows as failed cycles.
+    lifecycle.sink_connected();
     let cycle = || lifecycle.track(poll_once(&client, &config, &stream));
 
     // The startup cursor is the stream's newest entry (spec §11.3).
