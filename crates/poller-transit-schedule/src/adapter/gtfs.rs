@@ -15,7 +15,9 @@
 //!    id becomes the station's `NaPTAN` `MET` code (`940G…` to `9400…`,
 //!    spec §6.3).
 //! 5. `calendar.txt` and `calendar_dates.txt`: each service's dates from
-//!    yesterday (GTFS times run past 24:00) to today plus the horizon.
+//!    yesterday (GTFS times run past 24:00) to today plus the horizon. The
+//!    trips of a service with no day in that window are dropped (BODS keeps
+//!    expired services in the file for a while).
 //! 6. Folding: each trip becomes a pattern (line, direction, the calls'
 //!    platforms and offsets from the first departure) plus its start time.
 //! 7. Each line's station order per direction: its longest pattern's,
@@ -327,6 +329,16 @@ pub(crate) fn parse<R: Read + Seek>(
         .ok_or_else(|| malformed("date range"))?;
     let services: BTreeSet<&str> = trips.iter().map(|t| t.service_id.as_str()).collect();
     let service_days = read_service_days(&mut archive, cap, &services, from, to)?;
+    // A service with no day in the horizon (BODS keeps expired services in
+    // the file for days) can never run: drop its trips, so their patterns go
+    // too and the guard's trip count means trips that can run. Without this,
+    // BODS pruning an expired service reads as a sharp drop.
+    let live: BTreeSet<&str> = service_days.iter().map(|s| s.service_id.as_str()).collect();
+    for (trip, trip_calls) in trips.iter().zip(calls.iter_mut()) {
+        if !live.contains(trip.service_id.as_str()) {
+            trip_calls.clear();
+        }
+    }
 
     let mut source_feed_version = None;
     each_row(&mut archive, "feed_info.txt", cap, |cols, rec| {
@@ -766,7 +778,7 @@ mod tests {
 
     #[test]
     fn the_fixture_parses_to_the_networks_rows_only() {
-        let model = fixture("2026-10-19");
+        let model = fixture("2026-10-15");
         // 14 Blue, 14 Green and 4 replacement-bus trips; not the other
         // operator's 2.
         assert_eq!(model.trips.len(), 32);
@@ -835,11 +847,11 @@ mod tests {
         assert_ne!(model.lines[0].directions, []);
         assert_eq!(model.lines[2].directions, []);
         // The horizon: yesterday to today + 60.
-        assert_eq!(model.horizon.from.to_string(), "2026-10-18");
-        assert_eq!(model.horizon.to.to_string(), "2026-12-18");
+        assert_eq!(model.horizon.from.to_string(), "2026-10-14");
+        assert_eq!(model.horizon.to.to_string(), "2026-12-14");
         assert!(model.service_day_count() > 0);
         // Deterministic.
-        assert_eq!(fixture("2026-10-19"), model);
+        assert_eq!(fixture("2026-10-15"), model);
     }
 
     #[test]
@@ -969,6 +981,46 @@ mod tests {
     }
 
     #[test]
+    fn trips_of_a_service_with_no_day_in_the_horizon_are_dropped() {
+        // S runs through 2026-12-31; OLD ended on 2026-10-10, before the
+        // horizon (2026-10-14 to 2026-12-14), and FUTURE starts after it.
+        let calendar = format!(
+            "{CALENDAR}OLD,1,1,1,1,1,1,1,20260901,20261010\n\
+             FUTURE,1,1,1,1,1,1,1,20270101,20270301\n"
+        );
+        let stop_times = format!(
+            "{STOP_TIMES}\
+             T3,09:00:00,09:00:00,9400ZZMAAAA1,1,0,1\n\
+             T3,09:20:00,09:20:00,9400ZZMABBB1,2,1,0\n\
+             T4,09:00:00,09:00:00,9400ZZMABBB1,1,0,1\n\
+             T4,09:30:00,09:30:00,9400ZZMAAAA1,2,1,0\n"
+        );
+        let bytes = zip(&[
+            ("agency.txt", AGENCY),
+            ("routes.txt", ROUTES),
+            (
+                "trips.txt",
+                "route_id,service_id,trip_id,trip_headsign,direction_id\n\
+                 R1,S,T1,,0\nR1,S,T2,,0\nR1,OLD,T3,,0\nR1,FUTURE,T4,,1\n",
+            ),
+            ("stop_times.txt", &stop_times),
+            ("stops.txt", STOPS),
+            ("calendar.txt", &calendar),
+        ]);
+        let model = parse(Cursor::new(bytes), &metrolink(), &options("2026-10-15")).unwrap();
+        let ids: Vec<&str> = model.trips.iter().map(|t| t.trip_id.as_str()).collect();
+        assert_eq!(ids, ["T1", "T2"]);
+        // the expired and the not-yet-started services leave no pattern.
+        assert_eq!(model.patterns.len(), 1);
+        let services: Vec<&str> = model
+            .service_days
+            .iter()
+            .map(|s| s.service_id.as_str())
+            .collect();
+        assert_eq!(services, ["S"]);
+    }
+
+    #[test]
     fn an_unmapped_route_refuses_the_feed() {
         let routes = "route_id,agency_id,route_short_name,route_type\n\
             R1,A1,Orange Line,0\nR9,A2,99,3\n";
@@ -1060,6 +1112,6 @@ mod tests {
             model.service_days.len(),
             model.service_day_count(),
         );
-        assert!(model.trips.len() > 10_000);
+        assert!(model.trips.len() > 1_000);
     }
 }

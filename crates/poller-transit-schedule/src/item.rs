@@ -253,7 +253,7 @@ mod tests {
             Cursor::new(FIXTURE),
             &NetworkConfig::load("metrolink").unwrap(),
             &GtfsOptions {
-                today: NaiveDate::from_ymd_opt(2026, 10, 19).unwrap(),
+                today: NaiveDate::from_ymd_opt(2026, 10, 15).unwrap(),
                 horizon_days: 60,
                 max_entry_bytes: gtfs::MAX_ENTRY_BYTES,
             },
