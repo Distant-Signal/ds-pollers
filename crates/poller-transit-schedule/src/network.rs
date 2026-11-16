@@ -33,8 +33,8 @@ pub(crate) enum AdapterKind {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum OverrideRule {
-    /// Only a later document of the same `ServiceCode` takes over (TNDS,
-    /// NET design §4.4).
+    /// Only a later document of the same `ServiceCode` takes over, for its
+    /// own period (TNDS, NET design §4.4).
     #[default]
     ServiceCode,
     /// Also: on each date, only the active document with the shortest
