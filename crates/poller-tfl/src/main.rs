@@ -183,7 +183,7 @@ async fn run() -> anyhow::Result<()> {
     // succeed with `tfl_app_key = ""` rather than failing — silently sending
     // every request unauthenticated instead of refusing to start. Catch that
     // here, before the client is built.
-    require_non_empty_key(&config.tfl_app_key)?;
+    require_non_empty_key(config.tfl_app_key.expose())?;
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let stream = stream_sink(&config)?;

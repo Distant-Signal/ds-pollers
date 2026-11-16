@@ -1,4 +1,5 @@
 use clap::Parser;
+use ds_runtime::secret::Secret;
 
 /// CLI/env configuration for the `poller-tfl` service.
 ///
@@ -23,9 +24,10 @@ pub(crate) struct Config {
     pub tfl_base_url: String,
 
     /// `TfL` subscription key from api-portal.tfl.gov.uk, sent as the
-    /// `Ocp-Apim-Subscription-Key` header (see `main.rs`).
-    #[arg(long, env)]
-    pub tfl_app_key: String,
+    /// `Ocp-Apim-Subscription-Key` header (see `main.rs`). A `Secret`, with
+    /// its environment value hidden from `--help`.
+    #[arg(long, env, hide_env_values = true)]
+    pub tfl_app_key: Secret,
 
     /// Comma-separated `TfL` modes to poll, passed straight through to `TfL`'s
     /// own comma-separated `{modes}` path segment.
@@ -193,6 +195,21 @@ mod config_debug_tests {
             !debug_output.contains("redis-password"),
             "the Redis password must never appear in Debug output: {debug_output}"
         );
+    }
+
+    /// `--help` must not print the live key from the environment.
+    #[test]
+    fn help_hides_the_keys_environment_value() {
+        use clap::CommandFactory;
+        let command = Config::command();
+        let key = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "tfl_app_key")
+            .expect("the key argument");
+        assert!(key.is_hide_env_values_set());
+        let config = Config::try_parse_from(["poller-tfl", "--tfl-app-key", "super-secret"])
+            .expect("parses");
+        assert_eq!(config.tfl_app_key.expose(), "super-secret");
     }
 
     #[test]
