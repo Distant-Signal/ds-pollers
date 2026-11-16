@@ -187,33 +187,22 @@ async fn run() -> anyhow::Result<()> {
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let stream = stream_sink(&config)?;
-
-    let stops = if config.tfl_stops_enabled && config.jobs.daily() {
-        Some(daily_sink(
-            &config,
-            common::tfl_stops::SCHEMA,
-            "TFL_STOPS_ENABLED",
-        )?)
-    } else {
-        tracing::info!("the stops job is off (TFL_STOPS_ENABLED)");
-        None
-    };
-    let routes = if config.tfl_routes_enabled && config.jobs.daily() {
-        Some(daily_sink(
-            &config,
-            common::tfl_routes::SCHEMA,
-            "TFL_ROUTES_ENABLED",
-        )?)
-    } else {
-        tracing::info!("the route-sequences job is off (TFL_ROUTES_ENABLED)");
-        None
-    };
+    let (stops, routes) = daily_sinks(&config)?;
 
     if once {
         return daily_once(&client, &config, &progress, stops, routes).await;
     }
     // The producers are lazy: a Redis outage shows as failed cycles.
     lifecycle.sink_connected();
+    // Once, for every loop: with `TFL_JOBS=daily` there is no status loop.
+    if config.metrics.metrics_enabled {
+        ds_runtime::metrics::install(config.metrics_port)?;
+    }
+    // Each loop beats its own progress, so `/livez` sees one that hangs.
+    // The daily jobs beat theirs before each TfL call too: their runs can
+    // outlast the stall window (TfL's 429 waits), which the status loop's
+    // idle beats used to cover.
+    let loop_progress = poller_lifecycle::LoopProgress::spawn(&progress);
 
     let last_reports = LastReports::default();
     let cycle = || lifecycle.track(poll_once(&client, &config, &stream, &last_reports));
@@ -228,26 +217,30 @@ async fn run() -> anyhow::Result<()> {
             "tfl",
             || async { Ok(stream.last_produced_at().await?) },
             poll_interval,
-            config.metrics.metrics_enabled,
+            // Installed above.
+            false,
             config.metrics_port,
-            &progress,
+            &loop_progress.add(),
             cycle,
         )
         .await
     };
+    // Each daily job has its own failure streak, so the status poll's
+    // successes do not hide a failing job.
     let stops_loop = async {
         let Some(stops) = &stops else {
             return std::future::pending().await;
         };
+        let tracker = lifecycle.tracker();
+        let beats = loop_progress.add();
         common::poller_loop::run_poll_loop_with_cursor(
             "tfl-stops",
             || async { Ok(stops.stream.last_produced_at().await?) },
             Duration::from_secs(config.tfl_stops_interval_secs),
-            // The status loop installs the exporter.
             false,
             config.metrics_port,
-            &progress,
-            || lifecycle.track(release_after(stops_once(&client, &config, stops))),
+            &beats,
+            || tracker.track(release_after(stops_once(&client, &config, stops, &beats))),
         )
         .await
     };
@@ -255,14 +248,16 @@ async fn run() -> anyhow::Result<()> {
         let Some(routes) = &routes else {
             return std::future::pending().await;
         };
+        let tracker = lifecycle.tracker();
+        let beats = loop_progress.add();
         common::poller_loop::run_poll_loop_with_cursor(
             "tfl-routes",
             || async { Ok(routes.stream.last_produced_at().await?) },
             Duration::from_secs(config.tfl_stops_interval_secs),
             false,
             config.metrics_port,
-            &progress,
-            || lifecycle.track(release_after(routes_once(&client, &config, routes))),
+            &beats,
+            || tracker.track(release_after(routes_once(&client, &config, routes, &beats))),
         )
         .await
     };
@@ -287,6 +282,31 @@ async fn run() -> anyhow::Result<()> {
         flush(routes.stream, "tfl-routes").await;
     }
     result
+}
+
+/// The stops and routes jobs' producers, each `None` while its job is off.
+fn daily_sinks(config: &Config) -> anyhow::Result<(Option<DailySink>, Option<DailySink>)> {
+    let stops = if config.tfl_stops_enabled && config.jobs.daily() {
+        Some(daily_sink(
+            config,
+            common::tfl_stops::SCHEMA,
+            "TFL_STOPS_ENABLED",
+        )?)
+    } else {
+        tracing::info!("the stops job is off (TFL_STOPS_ENABLED)");
+        None
+    };
+    let routes = if config.tfl_routes_enabled && config.jobs.daily() {
+        Some(daily_sink(
+            config,
+            common::tfl_routes::SCHEMA,
+            "TFL_ROUTES_ENABLED",
+        )?)
+    } else {
+        tracing::info!("the route-sequences job is off (TFL_ROUTES_ENABLED)");
+        None
+    };
+    Ok((stops, routes))
 }
 
 /// Flushes a long-running producer at exit, warning about what is left.
@@ -322,7 +342,7 @@ async fn daily_once(
             false,
             config.metrics_port,
             progress,
-            || release_after(stops_once(client, config, &stops)),
+            || release_after(stops_once(client, config, &stops, progress)),
         )
         .await;
         results.push(
@@ -337,7 +357,7 @@ async fn daily_once(
             false,
             config.metrics_port,
             progress,
-            || release_after(routes_once(client, config, &routes)),
+            || release_after(routes_once(client, config, &routes, progress)),
         )
         .await;
         results.push(
@@ -415,7 +435,15 @@ async fn release_after(job: impl Future<Output = anyhow::Result<()>>) -> anyhow:
     result
 }
 
-async fn stops_once(client: &Client, config: &Config, sink: &DailySink) -> anyhow::Result<()> {
+/// `progress` is beaten before each `TfL` call (each bounded by its retry
+/// policy): a run is one loop iteration of `/livez`'s stall window, and a
+/// slow but moving run (`TfL` asking for waits) must not read as a hang.
+async fn stops_once(
+    client: &Client,
+    config: &Config,
+    sink: &DailySink,
+    progress: &ds_runtime::progress::Progress,
+) -> anyhow::Result<()> {
     let fetched_at = Utc::now();
     let base = config.tfl_base_url.trim_end_matches('/');
     let modes = common::tfl_stops::MODES.join(",");
@@ -424,6 +452,7 @@ async fn stops_once(client: &Client, config: &Config, sink: &DailySink) -> anyho
         if page > 1 {
             tokio::time::sleep(STOPS_CALL_GAP).await;
         }
+        progress.beat();
         let url = format!("{base}/StopPoint/Mode/{modes}?page={page}");
         let body = fetch_json(client, &url, config, "stops").await?;
         let parsed = stops::parse_page(&body)?;
@@ -444,6 +473,7 @@ async fn stops_once(client: &Client, config: &Config, sink: &DailySink) -> anyho
     let mut hubs = std::collections::BTreeMap::new();
     for chunk in stops::hub_codes(&found).chunks(stops::HUB_BATCH) {
         tokio::time::sleep(STOPS_CALL_GAP).await;
+        progress.beat();
         let url = format!("{base}/StopPoint/{}", chunk.join(","));
         let body = fetch_json(client, &url, config, "stop-hubs").await?;
         hubs.extend(stops::hub_rail(stops::parse_page(&body)?.stop_points));
@@ -489,7 +519,13 @@ async fn stops_once(client: &Client, config: &Config, sink: &DailySink) -> anyho
 /// each line's routes in both directions, through the feed guard (on the
 /// route count), published as one snapshot. A line with no route at all
 /// fails the run: the snapshot replaces every line's routes.
-async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyhow::Result<()> {
+/// `progress` as [`stops_once`]'s.
+async fn routes_once(
+    client: &Client,
+    config: &Config,
+    sink: &DailySink,
+    progress: &ds_runtime::progress::Progress,
+) -> anyhow::Result<()> {
     let fetched_at = Utc::now();
     let base = config.tfl_base_url.trim_end_matches('/');
     let modes = common::tfl_stops::MODES.join(",");
@@ -508,6 +544,7 @@ async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyh
         for direction in common::tfl_routes::DIRECTIONS {
             tokio::time::sleep(STOPS_CALL_GAP).await;
             // `parse_lines` kept only lower-case slugs: safe in a path.
+            progress.beat();
             let url = format!("{base}/Line/{line}/Route/Sequence/{direction}");
             let body = fetch_json(client, &url, config, "route-sequence").await?;
             let parsed = routes::parse_sequence(line, direction, &body)?;
@@ -535,7 +572,7 @@ async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyh
             "refusing the TfL route sequences: {refusal}"
         ))));
     }
-    let rows = with_running_times(client, config, rows).await;
+    let rows = with_running_times(client, config, rows, progress).await;
     let timed = rows.iter().filter(|r| r.step_seconds.is_some()).count();
     tracing::info!(
         lines = lines.len(),
@@ -577,6 +614,7 @@ async fn with_running_times(
     client: &Client,
     config: &Config,
     mut rows: Vec<common::tfl_routes::TflLineRoute>,
+    progress: &ds_runtime::progress::Progress,
 ) -> Vec<common::tfl_routes::TflLineRoute> {
     let base = config.tfl_base_url.trim_end_matches('/');
     let mut samples = routes::StepSamples::default();
@@ -592,6 +630,7 @@ async fn with_running_times(
             continue;
         }
         tokio::time::sleep(STOPS_CALL_GAP).await;
+        progress.beat();
         // Line ids are slugs and stop ids `NaPTAN` ids (both checked by
         // `routes::parse_sequence`): safe in a path.
         let url = format!("{base}/Line/{}/Timetable/{first}/to/{last}", route.line_id);
