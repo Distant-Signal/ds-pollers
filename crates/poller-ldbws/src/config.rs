@@ -72,8 +72,10 @@ pub(crate) struct Config {
     /// requests in any rolling hour, spread evenly across the hour's
     /// cycles (see `budget.rs`). Stations a cycle cannot afford are
     /// skipped (counted in `ldbws_budget_skipped_polls_total`) and the
-    /// rotation picks them up first next cycle. 0, the default, means no
-    /// budget.
+    /// rotation picks them up first next cycle. The tracked-stop lane's
+    /// requests count against the same rolling hour (not the per-cycle
+    /// share; the lane has its own cap), so set this to cover both. 0, the
+    /// default, means no budget.
     #[arg(long, env, default_value_t = 0)]
     pub hourly_request_budget: u32,
 
@@ -98,8 +100,9 @@ pub(crate) struct Config {
 
     /// The tracked-stop lane's own budget: at most this many requests a
     /// cycle, soonest departure first; the rest wait for the next cycle.
-    /// Separate from `HOURLY_REQUEST_BUDGET`, which caps the station
-    /// rotation.
+    /// Within `HOURLY_REQUEST_BUDGET` when that is set: the lane's requests
+    /// count against its rolling hour, and the lane stops when the hour is
+    /// spent.
     #[arg(long, env, default_value_t = 20)]
     pub tracked_stop_max_requests_per_cycle: u32,
 

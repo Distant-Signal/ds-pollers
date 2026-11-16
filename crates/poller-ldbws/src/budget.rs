@@ -4,8 +4,13 @@
 //! then always succeeds and nothing is tracked, so the poller behaves
 //! exactly as it did before the knob existed.
 //!
-//! When set, two limits apply to every `GetDepBoardWithDetails` request,
-//! numRows fallback retries included:
+//! When set, it covers every `GetDepBoardWithDetails` request: the station
+//! rotation's, numRows fallback retries included, and the tracked-stop
+//! lane's (DS-127), which count against the rolling hour only
+//! ([`RequestBudget::try_acquire_hourly`]; the lane has its own per-cycle
+//! cap). The arrivals sub-lane (`GetArrBoardWithDetails`, DS-152) is a
+//! separate RDM product with its own key and is not counted. Two limits
+//! apply to the rotation:
 //!
 //! - **Per cycle** (the spreading limit): each cycle may make at most
 //!   `ceil(budget * poll_interval_secs / 3600)` requests, its even share of
@@ -100,13 +105,7 @@ impl RequestBudget {
         if self.is_unlimited() {
             return Ok(());
         }
-        while self
-            .window
-            .front()
-            .is_some_and(|made| now.saturating_duration_since(*made) >= HOUR)
-        {
-            self.window.pop_front();
-        }
+        self.expire(now);
         if self.window.len() >= self.hourly_limit {
             return Err(BudgetLimit::Hour);
         }
@@ -124,6 +123,35 @@ impl RequestBudget {
             self.used_this_cycle += 1;
         }
         Ok(())
+    }
+
+    /// Uses up one request at `now` against the rolling hour only: the
+    /// tracked-stop lane's requests (DS-127). That lane has its own
+    /// per-cycle cap (`TRACKED_STOP_MAX_REQUESTS_PER_CYCLE`) and runs after
+    /// the rotation has taken its cycle share, so the share does not bind
+    /// it; the hourly limit does, and the requests it records there leave
+    /// that much less of the hour to the rotation.
+    pub(crate) fn try_acquire_hourly(&mut self, now: Instant) -> Result<(), BudgetLimit> {
+        if self.is_unlimited() {
+            return Ok(());
+        }
+        self.expire(now);
+        if self.window.len() >= self.hourly_limit {
+            return Err(BudgetLimit::Hour);
+        }
+        self.window.push_back(now);
+        Ok(())
+    }
+
+    /// Drops the requests made an hour or more before `now`.
+    fn expire(&mut self, now: Instant) {
+        while self
+            .window
+            .front()
+            .is_some_and(|made| now.saturating_duration_since(*made) >= HOUR)
+        {
+            self.window.pop_front();
+        }
     }
 }
 
@@ -185,6 +213,37 @@ mod tests {
             budget.try_acquire(after_first_expires),
             Err(BudgetLimit::Hour)
         );
+    }
+
+    #[test]
+    fn the_tracked_lane_counts_against_the_hour_but_not_the_cycle_share() {
+        let mut budget = RequestBudget::new(4, 60); // 1 per cycle, 4 an hour
+        let now = Instant::now();
+        // The rotation takes its cycle share ...
+        assert_eq!(budget.try_acquire(now), Ok(()));
+        assert_eq!(budget.try_acquire(now), Err(BudgetLimit::Cycle));
+        // ... and the tracked lane still has the rest of the hour ...
+        assert_eq!(budget.try_acquire_hourly(now), Ok(()));
+        assert_eq!(budget.try_acquire_hourly(now), Ok(()));
+        assert_eq!(budget.try_acquire_hourly(now), Ok(()));
+        // ... but never more than the hour.
+        assert_eq!(budget.try_acquire_hourly(now), Err(BudgetLimit::Hour));
+        // Its requests leave the rotation none of this hour.
+        budget.start_cycle();
+        let next = now + Duration::from_secs(60);
+        assert_eq!(budget.try_acquire(next), Err(BudgetLimit::Hour));
+        // Freed as they age out.
+        assert_eq!(budget.try_acquire_hourly(now + HOUR), Ok(()));
+    }
+
+    #[test]
+    fn the_default_budget_never_refuses_the_tracked_lane() {
+        let mut budget = RequestBudget::new(0, 60);
+        let now = Instant::now();
+        for _ in 0..10_000 {
+            assert_eq!(budget.try_acquire_hourly(now), Ok(()));
+        }
+        assert!(budget.window.is_empty());
     }
 
     #[test]
