@@ -119,6 +119,14 @@ struct StationsResponse<'a> {
 /// per-station isolation `poller-ldbws` does for its own batch. A
 /// genuinely invalid JSON document still fails outright at the envelope
 /// parse, which is not recoverable per element.
+///
+/// **Nor does one bad CRS code.** `stations.crs` is `CHAR(3)`: a code that
+/// is not three ASCII letters or digits once trimmed (a four-character one,
+/// say) would fail the whole write with SQLSTATE 22001, which the sink
+/// treats as a data rejection, so every station would wait a day for the
+/// same failure. Such entries are skipped here instead. Every skip is
+/// counted in `poller_stations_skipped_entries_total` (`reason`
+/// `malformed` or `invalid_crs`).
 pub(crate) fn parse_stations(json: &[u8]) -> Result<Vec<StationRecord<'_>>> {
     let response: StationsResponse<'_> = serde_json::from_slice(json)?;
     Ok(response
@@ -130,21 +138,65 @@ pub(crate) fn parse_stations(json: &[u8]) -> Result<Vec<StationRecord<'_>>> {
                 tracing::warn!(
                     error = %err,
                     station = raw.get(),
-                    "skipping malformed station entry rather than failing the whole batch"
+                    "skipping station entry rather than failing the whole batch"
                 );
+                metrics::counter!(
+                    ds_runtime::metrics::metric_name("poller_stations_skipped_entries_total"),
+                    "reason" => err.reason(),
+                )
+                .increment(1);
                 None
             }
         })
         .collect())
 }
 
-fn parse_station(raw: &RawValue) -> serde_json::Result<StationRecord<'_>> {
-    let station: RdmStation = serde_json::from_str(raw.get())?;
-    let mut accessibility: BTreeMap<String, &RawValue> = serde_json::from_str(raw.get())?;
+/// Why [`parse_station`] skipped an entry.
+#[derive(Debug)]
+enum StationError {
+    /// Not a `Station` object we can read (a missing `crsCode`, say).
+    Malformed(serde_json::Error),
+    /// A `crsCode` that is not three ASCII letters or digits once trimmed.
+    InvalidCrs(String),
+}
+
+impl StationError {
+    /// The `reason` label on `poller_stations_skipped_entries_total`.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Malformed(_) => "malformed",
+            Self::InvalidCrs(_) => "invalid_crs",
+        }
+    }
+}
+
+impl std::fmt::Display for StationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(err) => write!(f, "malformed station entry: {err}"),
+            Self::InvalidCrs(code) => write!(f, "crsCode {code:?} is not a 3-character CRS code"),
+        }
+    }
+}
+
+/// `code` trimmed, if that is three ASCII letters or digits (what fits
+/// `stations.crs CHAR(3)`).
+fn valid_crs(code: &str) -> Option<&str> {
+    let code = code.trim();
+    (code.len() == 3 && code.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(code)
+}
+
+fn parse_station(raw: &RawValue) -> Result<StationRecord<'_>, StationError> {
+    let station: RdmStation = serde_json::from_str(raw.get()).map_err(StationError::Malformed)?;
+    let crs = valid_crs(&station.crs_code)
+        .ok_or_else(|| StationError::InvalidCrs(station.crs_code.clone()))?
+        .to_owned();
+    let mut accessibility: BTreeMap<String, &RawValue> =
+        serde_json::from_str(raw.get()).map_err(StationError::Malformed)?;
     accessibility.retain(|key, _| !MODELED_KEYS.contains(&key.as_str()));
     let location = station.location.as_ref();
     Ok(StationRecord {
-        crs: station.crs_code,
+        crs,
         name: station.name,
         latitude: location.and_then(|l| l.latitude),
         longitude: location.and_then(|l| l.longitude),
@@ -280,9 +332,10 @@ mod tests {
     /// the growing serialized POST body).
     #[test]
     fn parsing_and_serializing_a_large_feed_stays_near_the_body_size() {
+        let letter = |i: usize| char::from(b'A' + u8::try_from(i % 26).unwrap());
         let station = |i: usize| {
             serde_json::json!({
-                "crsCode": format!("C{i:02}"),
+                "crsCode": format!("C{}{}", letter(i / 26), letter(i)),
                 "name": format!("Station {i}"),
                 "location": { "latitude": 51.5, "longitude": -0.1 },
                 "stationOperator": { "operatorCode": "NR" },
@@ -340,6 +393,28 @@ mod tests {
         );
         let codes: Vec<&str> = stations.iter().map(|s| s.crs.as_str()).collect();
         assert_eq!(codes, vec!["EUS", "ABC"]);
+    }
+
+    /// `stations.crs` is `CHAR(3)`: one over-long code used to fail the
+    /// whole write (SQLSTATE 22001) and so the whole day's refresh.
+    #[test]
+    fn a_station_with_an_invalid_crs_is_skipped_not_the_whole_batch() {
+        let json = r#"
+            {
+                "stations": [
+                    { "crsCode": "EUS", "name": "London Euston" },
+                    { "crsCode": "ABCD", "name": "Four Characters" },
+                    { "crsCode": "A-B", "name": "Punctuation" },
+                    { "crsCode": "", "name": "Empty" },
+                    { "crsCode": "ÉU", "name": "Not ASCII" },
+                    { "crsCode": " KGX ", "name": "London Kings Cross" }
+                ]
+            }
+        "#;
+
+        let stations = parse_stations(json.as_bytes()).unwrap();
+        let codes: Vec<&str> = stations.iter().map(|s| s.crs.as_str()).collect();
+        assert_eq!(codes, vec!["EUS", "KGX"]);
     }
 
     #[test]
