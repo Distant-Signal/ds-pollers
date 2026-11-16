@@ -631,3 +631,13 @@ once the writer no longer consumes it.
 
 Thirty minutes after the last situations snapshot the pages show "Status
 unavailable" instead of line statuses, before the stale alert fires.
+
+A day without service (Metrolink, NET and the Tube run nothing on
+Christmas Day) is not a refusal: when the timetable has no service today
+but some in the next 3 days, the producer logs "no service today in the
+timetable; not sending it until a day with service" and sends it at the
+next daily cycle (the writer refuses a commit with no service on its day).
+The timetable freshness can then pass 36 hours on that day, so expect
+`DistantSignalIngestSourceStale` for `transit-<network>-timetable` on
+Christmas Day; it clears with the next day's commit. No service for 4 days
+running is still refused (`reason="no_service_today"`).

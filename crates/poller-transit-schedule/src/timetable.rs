@@ -3,7 +3,8 @@
 //! 1. download the network's GTFS or `TransXChange` zip to the work dir
 //!    and parse it on the blocking pool ([`fetch_model`]);
 //! 2. apply the `NaPTAN` names (a failure is counted, never fatal);
-//! 3. the feed guard against the last commit on the stream;
+//! 3. the feed guard against the last commit on the stream (a feed with no
+//!    service today but some soon, as on Christmas Day, waits a day);
 //! 4. build the item (parts, then the commit) with the rail links;
 //! 5. skip it if the last commit has the same content and is under
 //!    [`SKIP_UNCHANGED_FOR`] old (a restart) and no refresh request is
@@ -224,6 +225,49 @@ pub(crate) async fn cursor(ctx: &Context) -> anyhow::Result<Option<DateTime<Utc>
     )
 }
 
+/// The feed guard: whether to send the timetable now (`false`: hold it
+/// back for a day), or the refusal.
+fn guard(
+    ctx: &Context,
+    model: &TransitModel,
+    counts: common::transit::TimetableCounts,
+    last: Option<&Baseline>,
+    today: chrono::NaiveDate,
+) -> anyhow::Result<bool> {
+    match feed_guard::check(
+        model,
+        counts,
+        last.map(|b| b.commit.counts),
+        today,
+        ctx.config.feed_max_drop_fraction,
+    ) {
+        Ok(feed_guard::Verdict::Publish) => Ok(true),
+        Ok(feed_guard::Verdict::NoServiceUntil(day)) => {
+            // A day without service (Christmas Day): the writer refuses a
+            // commit with no service on its day, so hold the feed back
+            // until the next daily cycle, without a refusal or an alert.
+            tracing::info!(
+                network = %ctx.network.id,
+                %today,
+                next_service = %day,
+                "no service today in the timetable; not sending it until a day with service"
+            );
+            Ok(false)
+        }
+        Err(refusal) => {
+            count(ctx, FEED_REFUSED, [("reason", refusal.reason())]);
+            // A refusal of the data itself: the same feed is refused again,
+            // so the loop waits a whole interval instead of re-downloading it
+            // on the failed-cycle backoff, and a once-mode run exits 3 (its
+            // Job fails without retrying; common::poller_loop).
+            Err(anyhow::Error::new(common::ingest::DataRejected(format!(
+                "network {}: the timetable was refused ({refusal}); the previous version stays active",
+                ctx.network.id
+            ))))
+        }
+    }
+}
+
 /// One timetable cycle.
 pub(crate) async fn poll_once(ctx: &Context) -> anyhow::Result<()> {
     let produced_at = Utc::now();
@@ -243,22 +287,8 @@ pub(crate) async fn poll_once(ctx: &Context) -> anyhow::Result<()> {
     let counts = feed_guard::counts(&model);
     let last = baseline(ctx).await;
     let today = common::transit::service_date(produced_at);
-    if let Err(refusal) = feed_guard::check(
-        &model,
-        counts,
-        last.as_ref().map(|b| b.commit.counts),
-        today,
-        ctx.config.feed_max_drop_fraction,
-    ) {
-        count(ctx, FEED_REFUSED, [("reason", refusal.reason())]);
-        // A refusal of the data itself: the same feed is refused again, so
-        // the loop waits a whole interval instead of re-downloading it on the
-        // failed-cycle backoff, and a once-mode run exits 3 (its Job fails
-        // without retrying; common::poller_loop).
-        return Err(anyhow::Error::new(common::ingest::DataRejected(format!(
-            "network {}: the timetable was refused ({refusal}); the previous version stays active",
-            ctx.network.id
-        ))));
+    if !guard(ctx, &model, counts, last.as_ref(), today)? {
+        return Ok(());
     }
     for (kind, rows) in [
         ("lines", counts.lines),
