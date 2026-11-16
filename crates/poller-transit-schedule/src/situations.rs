@@ -28,6 +28,10 @@ pub(crate) const MAX_ARCHIVE_BYTES: u64 = 50 * 1024 * 1024;
 pub(crate) const SITUATIONS_CURRENT: &str = "transit_situations_current";
 /// `transit_situation_unmapped_line_refs_total{network, ref}`.
 pub(crate) const UNMAPPED_LINE_REFS: &str = "transit_situation_unmapped_line_refs_total";
+/// `transit_situations_skipped_total{network, owner}`: situations in the
+/// file skipped for an unreadable time (`owner` is `network` for the
+/// network's own, else `other`).
+pub(crate) const SITUATIONS_SKIPPED: &str = "transit_situations_skipped_total";
 
 /// The archive, or `None` when it is unchanged (HTTP 304).
 async fn download(ctx: &Context) -> Result<Option<Vec<u8>>, FeedError> {
@@ -66,6 +70,25 @@ async fn download(ctx: &Context) -> Result<Option<Vec<u8>>, FeedError> {
         *slot = new_etag;
     }
     Ok(Some(body))
+}
+
+/// Counts (and, for the network's own, logs) the situations skipped for an
+/// unreadable time.
+fn record_skipped(network: &str, found: &sirisx::Situations) {
+    let ours = found.skipped_ours.len();
+    for (owner, n) in [("network", ours), ("other", found.skipped - ours)] {
+        if n > 0 {
+            metrics::counter!(metric_name(SITUATIONS_SKIPPED), "network" => network.to_owned(), "owner" => owner)
+                .increment(u64::try_from(n).unwrap_or(u64::MAX));
+        }
+    }
+    if ours > 0 {
+        tracing::warn!(
+            %network,
+            situations = ?found.skipped_ours,
+            "skipped the network's situations with an unreadable time"
+        );
+    }
 }
 
 /// One situations cycle.
@@ -117,6 +140,7 @@ pub(crate) async fn poll_once(ctx: &Context) -> Result<()> {
         metrics::counter!(metric_name(UNMAPPED_LINE_REFS), "network" => network.clone(), "ref" => line_ref.clone())
             .increment(*n);
     }
+    record_skipped(&network, &found);
     let mut scopes: BTreeMap<&'static str, usize> =
         [("line", 0), ("stop", 0), ("network", 0)].into();
     for situation in &found.situations {
@@ -136,6 +160,7 @@ pub(crate) async fn poll_once(ctx: &Context) -> Result<()> {
         %network,
         seen = found.seen,
         kept = found.situations.len(),
+        skipped = found.skipped,
         unmapped_line_refs = found.unmapped_line_refs.len(),
         "parsed SIRI-SX"
     );

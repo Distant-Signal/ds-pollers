@@ -13,6 +13,12 @@
 //! `siri_line_refs`, and an unmapped one is kept raw and counted; stop
 //! refs fold to their station (`9400ZZMAPIC1` to `9400ZZMAPIC`); text is
 //! whitespace-collapsed and capped. The set is sorted by situation id.
+//!
+//! The file holds every operator's situations, so one bad situation (a
+//! `StartTime` or `EndTime` that is not RFC 3339 with an offset) is skipped
+//! and counted ([`Situations::skipped`]), never fatal to the document:
+//! otherwise one operator's typo would fail every network's situations on
+//! every cycle.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Read, Seek};
@@ -47,6 +53,8 @@ struct Raw {
     validity: Vec<Period>,
     publication: Vec<Period>,
     consequences: Vec<RawConsequence>,
+    /// The first time it could not read, if any: the situation is skipped.
+    bad_time: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -74,6 +82,10 @@ pub(crate) struct Situations {
     pub unmapped_line_refs: BTreeMap<String, u64>,
     /// Every situation in the file.
     pub seen: usize,
+    /// Situations skipped for an unreadable time, any operator's.
+    pub skipped: usize,
+    /// The ids of the network's own skipped situations.
+    pub skipped_ours: Vec<String>,
 }
 
 fn malformed(what: impl std::fmt::Display) -> FeedError {
@@ -89,10 +101,10 @@ fn clean(text: &str) -> String {
     out
 }
 
-fn time(text: &str) -> Result<DateTime<Utc>, FeedError> {
+fn time(text: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(text.trim())
+        .ok()
         .map(|t| t.with_timezone(&Utc))
-        .map_err(|_| malformed(format!("time {text:?}")))
 }
 
 /// Reads the archive's XML entry and returns the network's situations.
@@ -244,11 +256,16 @@ pub(crate) fn parse_xml<R: BufRead>(
                     ("Uri", "InfoLink") if raw.info_url.is_none() => {
                         raw.info_url = Some(value).filter(|v| v.starts_with("https://"));
                     }
-                    ("StartTime", "ValidityPeriod" | "PublicationWindow") => {
-                        period.0 = Some(time(&value)?);
-                    }
-                    ("EndTime", "ValidityPeriod" | "PublicationWindow") => {
-                        period.1 = Some(time(&value)?);
+                    ("StartTime" | "EndTime", "ValidityPeriod" | "PublicationWindow") => {
+                        let parsed = time(&value);
+                        if parsed.is_none() && raw.bad_time.is_none() {
+                            raw.bad_time = Some(value);
+                        }
+                        if name == "StartTime" {
+                            period.0 = parsed;
+                        } else {
+                            period.1 = parsed;
+                        }
                     }
                     ("ValidityPeriod" | "PublicationWindow", _) => {
                         if let (Some(start), end) = period {
@@ -273,6 +290,13 @@ pub(crate) fn parse_xml<R: BufRead>(
         buf.clear();
     }
     for raw in raws {
+        if raw.bad_time.is_some() {
+            out.skipped += 1;
+            if is_ours(&raw, network) {
+                out.skipped_ours.push(raw.number);
+            }
+            continue;
+        }
         if let Some(situation) = normalise(raw, network, &mut out.unmapped_line_refs) {
             out.situations.push(situation);
         }
@@ -300,21 +324,25 @@ fn station_of(stop: &str, prefix: &str) -> Option<String> {
     )
 }
 
+/// Whether `raw` is the network's situation (the module's filter).
+fn is_ours(raw: &Raw, network: &NetworkConfig) -> bool {
+    let filter = &network.situations;
+    if !filter.participant_refs.contains(&raw.participant) || raw.number.is_empty() {
+        return false;
+    }
+    raw.consequences.iter().any(|c| {
+        c.modes.iter().any(|m| filter.vehicle_modes.contains(m))
+            || c.stops.iter().any(|s| network.has_prefix(s))
+            || c.operators.iter().any(|o| filter.operator_refs.contains(o))
+    })
+}
+
 fn normalise(
     raw: Raw,
     network: &NetworkConfig,
     unmapped: &mut BTreeMap<String, u64>,
 ) -> Option<TransitSituation> {
-    let filter = &network.situations;
-    if !filter.participant_refs.contains(&raw.participant) || raw.number.is_empty() {
-        return None;
-    }
-    let ours = raw.consequences.iter().any(|c| {
-        c.modes.iter().any(|m| filter.vehicle_modes.contains(m))
-            || c.stops.iter().any(|s| network.has_prefix(s))
-            || c.operators.iter().any(|o| filter.operator_refs.contains(o))
-    });
-    if !ours {
+    if !is_ours(&raw, network) {
         return None;
     }
     let mut line_ids = BTreeSet::new();
@@ -477,6 +505,32 @@ mod tests {
         }
         let out = parse_archive(Cursor::new(zip_bytes), &metrolink()).unwrap();
         assert_eq!(out.situations, a);
+    }
+
+    #[test]
+    fn a_situation_with_an_unreadable_time_is_skipped_not_fatal() {
+        // Another operator's offset-less StartTime, and one of ours with a
+        // bad EndTime: both skipped, the rest kept.
+        let other = r"<PtSituationElement><ParticipantRef>Other</ParticipantRef>
+            <SituationNumber>other-1</SituationNumber>
+            <ValidityPeriod><StartTime>2026-10-14T08:00:00</StartTime></ValidityPeriod>
+            <Summary>x</Summary></PtSituationElement>";
+        let ours = r"<PtSituationElement><ParticipantRef>TfGM</ParticipantRef>
+            <SituationNumber>tfgm-bad</SituationNumber>
+            <ValidityPeriod><StartTime>2026-10-14T08:00:00Z</StartTime>
+            <EndTime>soon</EndTime></ValidityPeriod>
+            <Summary>x</Summary>
+            <Consequences><Consequence><Affects><Networks><AffectedNetwork>
+            <VehicleMode>tram</VehicleMode></AffectedNetwork></Networks></Affects>
+            </Consequence></Consequences></PtSituationElement>";
+        let marker = "<PtSituationElement>";
+        let at = FIXTURE.find(marker).unwrap();
+        let xml = format!("{}{other}{ours}{}", &FIXTURE[..at], &FIXTURE[at..]);
+        let out = parse_xml(Cursor::new(xml), &metrolink()).unwrap();
+        assert_eq!(out.seen, 7);
+        assert_eq!(out.skipped, 2);
+        assert_eq!(out.skipped_ours, ["tfgm-bad"]);
+        assert_eq!(out.situations, parse().situations);
     }
 
     #[test]
