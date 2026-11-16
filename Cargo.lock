@@ -2425,6 +2425,7 @@ dependencies = [
  "health-http",
  "ingest-stream",
  "metrics",
+ "poller-lifecycle",
  "quick-xml",
  "redis",
  "reqwest",
