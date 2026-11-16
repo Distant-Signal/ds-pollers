@@ -215,7 +215,8 @@ async fn run() -> anyhow::Result<()> {
     // The producers are lazy: a Redis outage shows as failed cycles.
     lifecycle.sink_connected();
 
-    let cycle = || lifecycle.track(poll_once(&client, &config, &stream));
+    let last_reports = LastReports::default();
+    let cycle = || lifecycle.track(poll_once(&client, &config, &stream, &last_reports));
 
     // The startup cursor is the stream's newest entry (spec §11.3).
     let status_loop = async {
@@ -692,16 +693,49 @@ fn stream_sink(config: &Config) -> anyhow::Result<SnapshotStream> {
     ))
 }
 
+/// Each `TfL` line's last published report, by id: what stands in for a
+/// malformed entry ([`schema::complete_snapshot`]).
+type LastReports = std::sync::Mutex<std::collections::HashMap<String, common::LineStatusReport>>;
+
 async fn poll_once(
     client: &Client,
     config: &Config,
     stream: &SnapshotStream,
+    last: &LastReports,
 ) -> anyhow::Result<()> {
     // The snapshot's `produced_at` on the stream (decision D13): when it
     // was fetched, not when it is sent.
     let fetched_at = Utc::now();
     let body = fetch_status_json(client, config).await?;
-    let reports = schema::parse_line_status(&body, fetched_at)?;
+    let parsed = schema::parse_line_status(&body, fetched_at)?;
+    let skipped = parsed.skipped.len();
+    let completed = {
+        let mut last = last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        schema::complete_snapshot(parsed, &mut last)
+    };
+    let reports = match completed {
+        Ok((reports, completed)) => {
+            // A malformed repeat of a line that parsed left nothing out.
+            if !completed.carried_forward.is_empty() {
+                count_skipped(completed.carried_forward.len(), "carried_forward");
+                tracing::warn!(
+                    lines = ?completed.carried_forward,
+                    "malformed TfL line status entries; their lines keep their last status"
+                );
+            }
+            reports
+        }
+        Err(err) => {
+            count_skipped(skipped, "refused");
+            // TfL's data, not a fault here: the next interval (no
+            // in-cycle retry), and nothing is published, so nothing pruned.
+            return Err(anyhow::Error::new(common::ingest::DataRejected(format!(
+                "{err:#}"
+            ))));
+        }
+    };
 
     // Never publish an empty snapshot. The writer prunes TfL rows that are
     // missing from the snapshot it applies, so an empty one would read as
@@ -718,6 +752,17 @@ async fn poll_once(
 
     stream.publish(&reports, fetched_at).await?;
     Ok(())
+}
+
+/// `distant_signal_tfl_line_status_skipped_total{outcome}`: malformed line
+/// status entries, by what became of their lines (`carried_forward`: the
+/// last good report stood in; `refused`: the snapshot was not published).
+fn count_skipped(entries: usize, outcome: &'static str) {
+    metrics::counter!(
+        ds_runtime::metrics::metric_name("tfl_line_status_skipped_total"),
+        "outcome" => outcome
+    )
+    .increment(u64::try_from(entries).unwrap_or(u64::MAX));
 }
 
 async fn fetch_status_json(client: &Client, config: &Config) -> anyhow::Result<String> {
