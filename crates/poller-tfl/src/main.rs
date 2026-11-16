@@ -192,7 +192,10 @@ async fn run() -> anyhow::Result<()> {
     if once {
         return daily_once(&client, &config, &progress, stops, routes).await;
     }
-    // The producers are lazy: a Redis outage shows as failed cycles.
+    // The producers are lazy and `publish` never waits for Redis, so a
+    // Redis outage does not fail a cycle (`poller_cycle_total` stays
+    // `success`): `watch_sink` below makes the pod unready instead, while a
+    // producer's last XADD failed.
     lifecycle.sink_connected();
     // Once, for every loop: with `TFL_JOBS=daily` there is no status loop.
     if config.metrics.metrics_enabled {
@@ -261,11 +264,18 @@ async fn run() -> anyhow::Result<()> {
         )
         .await
     };
+    let status_on = config.jobs.status();
+    let sink = lifecycle.watch_sink(|| {
+        (!status_on || stream.is_available())
+            && stops.as_ref().is_none_or(|s| s.stream.is_available())
+            && routes.as_ref().is_none_or(|s| s.stream.is_available())
+    });
     let loops = async {
         tokio::select! {
             result = status_loop => result,
             result = stops_loop => result,
             result = routes_loop => result,
+            never = sink => match never {},
         }
     };
     // Not once mode (that returned above). At SIGTERM a cycle in flight
