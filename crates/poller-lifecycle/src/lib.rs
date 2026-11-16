@@ -20,6 +20,20 @@
 //! cycle and a quiet wait both keep, so a pod whose upstream is down is
 //! never restarted for it.
 //!
+//! **Several loops in one process** (poller-tfl's status poll and daily
+//! jobs). Each loop wraps its cycles in its own [`Tracker`]
+//! ([`Lifecycle::tracker`]), so each has its own failure streak: the pod is
+//! unready while any loop has failed [`UNREADY_AFTER_FAILURES`] cycles in a
+//! row, and one loop's successes no longer hide another's failures. The
+//! cycles in flight are counted, so SIGTERM waits for every loop's cycle,
+//! not only the one that started last. Each loop also beats its own
+//! [`Progress`] ([`LoopProgress`]), so `/livez` follows the slowest loop:
+//! one loop's idle beats no longer hide another loop hanging.
+//!
+//! **A sink that can go away** (a stream producer's Redis): with
+//! [`Lifecycle::watch_sink`] the pod is also unready while the sink says it
+//! cannot write, as poller-transit-schedule's readiness does.
+//!
 //! **SIGTERM** (a rollout, a drain). The loop is not cancelled mid-cycle: a
 //! cycle in flight may finish for up to [`DRAIN_GRACE`], no new one starts,
 //! then [`Lifecycle::run`] returns and the caller flushes its stream
@@ -35,7 +49,8 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use ds_runtime::service_args::HealthArgs;
@@ -67,6 +82,12 @@ pub const FLUSH_GRACE: Duration = Duration::from_secs(5);
 /// The readiness gauge, `distant_signal_poller_ready`.
 const READY_GAUGE: &str = "poller_ready";
 
+/// How often [`Lifecycle::watch_sink`] asks the sink whether it can write.
+pub const SINK_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often [`LoopProgress`] folds the loops' progress into `/livez`'s.
+const LOOP_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The pod's readiness and its in-flight cycle. Cheap to clone.
 #[derive(Clone)]
 pub struct Lifecycle {
@@ -79,16 +100,37 @@ struct Inner {
     fallback: Duration,
     /// [`Lifecycle::sink_connected`] was called (the fallback is running).
     sink_connected: AtomicBool,
-    /// A cycle has succeeded: the fallback no longer applies.
-    succeeded: AtomicBool,
-    /// Failed cycles since the last success (or the fallback).
-    failures: AtomicU32,
-    /// A cycle is running.
-    in_flight: AtomicBool,
+    /// What readiness is computed from.
+    cycles: Mutex<Cycles>,
+    /// Cycles running (at most one per loop).
+    in_flight: AtomicUsize,
     /// SIGTERM came: start no new cycle.
     stopping: AtomicBool,
     /// Notified whenever a cycle ends.
     cycle_ended: Notify,
+}
+
+/// The cycles' outcomes, as readiness sees them.
+struct Cycles {
+    /// A cycle has succeeded: the fallback no longer applies.
+    succeeded: bool,
+    /// A cycle has succeeded or the fallback elapsed: the pod may be ready.
+    may_be_ready: bool,
+    /// Per loop ([`Tracker`]; index 0 is [`Lifecycle::track`]'s): failed
+    /// cycles since its last success (or the fallback).
+    failures: Vec<u32>,
+    /// [`Lifecycle::watch_sink`]'s last answer (true without one).
+    sink_available: bool,
+}
+
+impl Cycles {
+    /// Ready: a success (or the fallback), no loop on a failure streak, and
+    /// a sink that can write.
+    fn ready(&self) -> bool {
+        self.may_be_ready
+            && self.sink_available
+            && self.failures.iter().all(|&f| f < UNREADY_AFTER_FAILURES)
+    }
 }
 
 impl Lifecycle {
@@ -101,9 +143,13 @@ impl Lifecycle {
                 ready,
                 fallback,
                 sink_connected: AtomicBool::new(false),
-                succeeded: AtomicBool::new(false),
-                failures: AtomicU32::new(0),
-                in_flight: AtomicBool::new(false),
+                cycles: Mutex::new(Cycles {
+                    succeeded: false,
+                    may_be_ready: false,
+                    failures: vec![0],
+                    sink_available: true,
+                }),
+                in_flight: AtomicUsize::new(0),
                 stopping: AtomicBool::new(false),
                 cycle_ended: Notify::new(),
             }),
@@ -147,7 +193,8 @@ impl Lifecycle {
         let this = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(fallback).await;
-            if !this.inner.succeeded.load(Ordering::Acquire) {
+            let succeeded = this.cycles().succeeded;
+            if !succeeded {
                 tracing::warn!(
                     fallback_secs = fallback.as_secs(),
                     "no successful cycle yet; ready anyway, so a rollout is not held for ever"
@@ -160,11 +207,21 @@ impl Lifecycle {
     /// The fallback: ready, with the failure streak started afresh, unless
     /// a cycle has already succeeded (readiness then follows the cycles).
     fn fallback_elapsed(&self, why: &'static str) {
-        if self.inner.succeeded.load(Ordering::Acquire) {
+        let mut cycles = self.cycles();
+        if cycles.succeeded {
             return;
         }
-        self.inner.failures.store(0, Ordering::Release);
-        self.set_ready(true, why);
+        cycles.may_be_ready = true;
+        cycles.failures.iter_mut().for_each(|f| *f = 0);
+        self.set_ready(cycles.ready(), why);
+    }
+
+    /// The readiness state. Never held across an await.
+    fn cycles(&self) -> MutexGuard<'_, Cycles> {
+        self.inner
+            .cycles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn set_ready(&self, ready: bool, why: &'static str) {
@@ -178,22 +235,21 @@ impl Lifecycle {
         }
     }
 
-    /// A cycle's outcome: a success makes the pod ready and ends any
-    /// failure streak; [`UNREADY_AFTER_FAILURES`] failures in a row make it
-    /// unready.
-    fn cycle_ended(&self, ok: bool) {
+    /// Loop `index`'s cycle ended: a success makes the pod ready (unless
+    /// another loop is on a failure streak, or the sink cannot write) and
+    /// ends that loop's streak; [`UNREADY_AFTER_FAILURES`] failures in a row
+    /// make it unready.
+    fn cycle_ended(&self, index: usize, ok: bool) {
+        let mut cycles = self.cycles();
         if ok {
-            self.inner.succeeded.store(true, Ordering::Release);
-            self.inner.failures.store(0, Ordering::Release);
-            self.set_ready(true, "successful cycle");
+            cycles.succeeded = true;
+            cycles.may_be_ready = true;
+            cycles.failures[index] = 0;
+            self.set_ready(cycles.ready(), "successful cycle");
             return;
         }
-        let failures = self
-            .inner
-            .failures
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
-        if failures >= UNREADY_AFTER_FAILURES {
+        cycles.failures[index] = cycles.failures[index].saturating_add(1);
+        if cycles.failures[index] >= UNREADY_AFTER_FAILURES {
             self.set_ready(false, "consecutive failed cycles");
         }
     }
@@ -202,8 +258,17 @@ impl Lifecycle {
     /// towards [`UNREADY_AFTER_FAILURES`] when it fails, and lets
     /// [`Lifecycle::run`] wait for it at SIGTERM. After SIGTERM it never
     /// starts the cycle (it waits until the loop is dropped). Wrap every
-    /// loop's cycle in it: `|| lifecycle.track(poll_once(..))`.
+    /// loop's cycle in it: `|| lifecycle.track(poll_once(..))`. A process
+    /// with several loops gives each other loop its own
+    /// [`Lifecycle::tracker`].
     pub async fn track<C>(&self, cycle: C) -> anyhow::Result<()>
+    where
+        C: Future<Output = anyhow::Result<()>>,
+    {
+        self.track_as(0, cycle).await
+    }
+
+    async fn track_as<C>(&self, index: usize, cycle: C) -> anyhow::Result<()>
     where
         C: Future<Output = anyhow::Result<()>>,
     {
@@ -214,8 +279,45 @@ impl Lifecycle {
             let _in_flight = InFlight::enter(&self.inner);
             cycle.await
         };
-        self.cycle_ended(result.is_ok());
+        self.cycle_ended(index, result.is_ok());
         result
+    }
+
+    /// A [`Tracker`] for another loop of this process, with its own failure
+    /// streak (see the module docs).
+    pub fn tracker(&self) -> Tracker {
+        let mut cycles = self.cycles();
+        cycles.failures.push(0);
+        Tracker {
+            lifecycle: self.clone(),
+            index: cycles.failures.len() - 1,
+        }
+    }
+
+    /// Keeps the pod unready while `available` says the sink cannot write
+    /// (a stream producer's `is_available`: its last XADD failed), asking
+    /// every [`SINK_CHECK_INTERVAL`]. Never returns: drive it alongside the
+    /// loops (it borrows the producer, so it is not spawned).
+    pub async fn watch_sink<F>(&self, available: F) -> std::convert::Infallible
+    where
+        F: Fn() -> bool,
+    {
+        let mut tick = tokio::time::interval(SINK_CHECK_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let now = available();
+            let mut cycles = self.cycles();
+            if cycles.sink_available != now {
+                cycles.sink_available = now;
+                let why = if now {
+                    "the stream can be written again"
+                } else {
+                    "the stream cannot be written"
+                };
+                self.set_ready(cycles.ready(), why);
+            }
+        }
     }
 
     /// Drives `poll_loop` until it returns or, outside once mode, SIGTERM
@@ -251,7 +353,7 @@ impl Lifecycle {
             () = signal => {}
         }
         self.inner.stopping.store(true, Ordering::Release);
-        if !self.inner.in_flight.load(Ordering::Acquire) {
+        if self.inner.in_flight.load(Ordering::Acquire) == 0 {
             tracing::info!("terminating between cycles");
             return Ok(());
         }
@@ -264,7 +366,7 @@ impl Lifecycle {
                 let ended = self.inner.cycle_ended.notified();
                 tokio::pin!(ended);
                 ended.as_mut().enable();
-                if !self.inner.in_flight.load(Ordering::Acquire) {
+                if self.inner.in_flight.load(Ordering::Acquire) == 0 {
                     return;
                 }
                 ended.await;
@@ -287,21 +389,106 @@ impl Lifecycle {
     }
 }
 
-/// Clears `in_flight` and wakes [`Lifecycle::run_until`] when a cycle ends,
-/// including one whose future is dropped half way.
+/// One loop's cycles of a [`Lifecycle`] that runs several loops: its own
+/// failure streak, the same readiness and drain. Cheap to clone.
+#[derive(Clone)]
+pub struct Tracker {
+    lifecycle: Lifecycle,
+    index: usize,
+}
+
+impl Tracker {
+    /// [`Lifecycle::track`] for this loop.
+    pub async fn track<C>(&self, cycle: C) -> anyhow::Result<()>
+    where
+        C: Future<Output = anyhow::Result<()>>,
+    {
+        self.lifecycle.track_as(self.index, cycle).await
+    }
+}
+
+/// Counts a cycle in `in_flight` and, when it ends (including one whose
+/// future is dropped half way), uncounts it and wakes
+/// [`Lifecycle::run_until`].
 struct InFlight<'a>(&'a Inner);
 
 impl<'a> InFlight<'a> {
     fn enter(inner: &'a Inner) -> Self {
-        inner.in_flight.store(true, Ordering::Release);
+        inner.in_flight.fetch_add(1, Ordering::AcqRel);
         Self(inner)
     }
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        self.0.in_flight.store(false, Ordering::Release);
+        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
         self.0.cycle_ended.notify_waiters();
+    }
+}
+
+/// Per-loop liveness for a process that runs several loops over one
+/// `/livez` [`Progress`]. Each loop beats its own [`LoopProgress::add`]ed
+/// `Progress`; `/livez`'s is beaten only once every loop has beaten since
+/// it last was, so it goes stalled when the slowest loop does (give or
+/// take one of the other loops' beats: [`Progress::idle`] beats every
+/// 10 s), and one loop's idle beats cannot hide another loop hanging. With
+/// no loop added it beats nothing (whatever beats `/livez`'s progress
+/// itself, such as a startup wait, still does).
+#[derive(Clone)]
+pub struct LoopProgress {
+    loops: Arc<Mutex<Vec<Progress>>>,
+    stall_after: Duration,
+}
+
+impl LoopProgress {
+    /// Starts folding the loops' progress into `livez`'s (a task, every
+    /// second). Needs a Tokio runtime.
+    pub fn spawn(livez: &Progress) -> Self {
+        let this = Self {
+            loops: Arc::new(Mutex::new(Vec::new())),
+            stall_after: livez.stall_after(),
+        };
+        let watcher = this.clone();
+        let livez = livez.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(LOOP_PROGRESS_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                watcher.fold_into(&livez);
+            }
+        });
+        this
+    }
+
+    /// A new loop's progress, "just beaten". Add one for each loop the
+    /// process actually runs (a loop that is off never beats, so it would
+    /// read as a stall), and beat it in place of `/livez`'s.
+    pub fn add(&self) -> Progress {
+        let progress = Progress::new(self.stall_after);
+        self.lock().push(progress.clone());
+        progress
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<Progress>> {
+        self.loops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Beats `livez` if every loop has beaten since `livez` last was.
+    fn fold_into(&self, livez: &Progress) {
+        let loops = self.lock();
+        if loops.is_empty() {
+            return;
+        }
+        let since = livez.since_last_beat();
+        if loops
+            .iter()
+            .all(|progress| progress.since_last_beat() < since)
+        {
+            livez.beat();
+        }
     }
 }
 
@@ -617,5 +804,152 @@ mod tests {
         assert_eq!(begun.elapsed(), Duration::from_secs(3) + DRAIN_GRACE);
         assert_eq!(finished.load(Ordering::SeqCst), 0);
         assert!(!lc.is_ready());
+    }
+
+    /// poller-tfl's shape: a short status cycle ending while a long daily
+    /// cycle runs must not read as "nothing in flight" at SIGTERM.
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_waits_for_every_loops_cycle_not_only_the_last_to_start() {
+        let lc = lifecycle();
+        let daily = lc.tracker();
+        let daily_done = AtomicBool::new(false);
+        let loops = async {
+            let status = async {
+                // Starts after the daily cycle, ends before the signal.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _ = lc
+                    .track(async {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        Ok(())
+                    })
+                    .await;
+                std::future::pending::<()>().await;
+            };
+            let routes = async {
+                let _ = daily
+                    .track(async {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        daily_done.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await;
+                std::future::pending::<()>().await;
+            };
+            tokio::join!(status, routes);
+            Ok(())
+        };
+        let begun = tokio::time::Instant::now();
+        let result = lc
+            .run_until(
+                loops,
+                tokio::time::sleep(Duration::from_secs(3)),
+                DRAIN_GRACE,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert!(daily_done.load(Ordering::SeqCst), "the daily cycle drained");
+        assert_eq!(begun.elapsed(), Duration::from_secs(10));
+    }
+
+    /// One loop's successes do not hide another loop's failure streak.
+    #[tokio::test]
+    async fn each_loop_has_its_own_failure_streak() {
+        let lc = lifecycle();
+        let daily = lc.tracker();
+        succeed(&lc).await;
+        for _ in 0..UNREADY_AFTER_FAILURES {
+            assert!(
+                daily
+                    .track(async { Err(anyhow::anyhow!("routes failed")) })
+                    .await
+                    .is_err()
+            );
+            succeed(&lc).await;
+        }
+        assert!(!lc.is_ready(), "the daily loop is on a streak");
+        succeed(&lc).await;
+        assert!(!lc.is_ready(), "status successes do not end it");
+        assert!(daily.track(async { Ok(()) }).await.is_ok());
+        assert!(lc.is_ready());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_fallback_ends_every_loops_streak() {
+        let lc = lifecycle_with_fallback(Duration::from_secs(60));
+        let daily = lc.tracker();
+        lc.sink_connected();
+        for _ in 0..UNREADY_AFTER_FAILURES {
+            fail(&lc).await;
+            let _ = daily.track(async { Err(anyhow::anyhow!("down")) }).await;
+        }
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert!(lc.is_ready());
+        let _ = daily.track(async { Err(anyhow::anyhow!("down")) }).await;
+        assert!(lc.is_ready(), "the streak started afresh");
+    }
+
+    /// A stream producer whose Redis is gone is unready (its cycles still
+    /// succeed: the snapshot is queued), and ready again once it writes.
+    #[tokio::test(start_paused = true)]
+    async fn an_unavailable_sink_makes_it_unready() {
+        let lc = lifecycle();
+        succeed(&lc).await;
+        let available = AtomicBool::new(true);
+        let watch = lc.watch_sink(|| available.load(Ordering::SeqCst));
+        tokio::pin!(watch);
+        let check = Duration::from_secs(SINK_CHECK_INTERVAL.as_secs() + 1);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut watch)
+                .await
+                .is_err()
+        );
+        assert!(lc.is_ready());
+        available.store(false, Ordering::SeqCst);
+        assert!(tokio::time::timeout(check, &mut watch).await.is_err());
+        assert!(!lc.is_ready());
+        succeed(&lc).await;
+        assert!(!lc.is_ready(), "a successful cycle does not override it");
+        available.store(true, Ordering::SeqCst);
+        assert!(tokio::time::timeout(check, &mut watch).await.is_err());
+        assert!(lc.is_ready());
+    }
+
+    /// `/livez` follows the slowest loop: one loop idling (beating every
+    /// 10 s) does not hide another wedged mid-cycle.
+    #[tokio::test(start_paused = true)]
+    async fn livez_stalls_when_any_loop_stalls() {
+        let stall = Duration::from_secs(120);
+        let livez = Progress::new(stall);
+        let loops = LoopProgress::spawn(&livez);
+        let idle = loops.add();
+        let wedged = loops.add();
+        let idle_loop = idle.idle(tokio::time::sleep(Duration::from_secs(3600)));
+        let check = async {
+            // Both beat for a while: never stalled.
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                wedged.beat();
+                assert!(!livez.is_stalled());
+            }
+            // Then one wedges: stalled within the window plus an idle beat.
+            tokio::time::sleep(stall + Duration::from_secs(12)).await;
+            assert!(livez.is_stalled());
+            // And recovers once it beats again.
+            wedged.beat();
+            tokio::time::sleep(Duration::from_secs(12)).await;
+            assert!(!livez.is_stalled());
+        };
+        tokio::select! {
+            () = idle_loop => panic!("the idle wait ended first"),
+            () = check => {}
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loop_progress_with_no_loops_leaves_livez_alone() {
+        let livez = Progress::new(Duration::from_secs(60));
+        let _loops = LoopProgress::spawn(&livez);
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert!(livez.is_stalled());
     }
 }
