@@ -10,11 +10,28 @@
 
 use anyhow::Result;
 use common::StationDeparture;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+/// Reads JSON `null` as the type's default, as a missing key already is
+/// with `#[serde(default)]`. LDBWS writes absent lists and flags as explicit
+/// `null`s (an empty overnight board's `"trainServices": null`, for one),
+/// and a plain `#[serde(default)] Vec` rejects `null`, failing the whole
+/// station's board.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 #[derive(Debug, Deserialize)]
 struct RdmStationBoard {
-    #[serde(default, rename = "trainServices")]
+    #[serde(
+        default,
+        rename = "trainServices",
+        deserialize_with = "null_as_default"
+    )]
     train_services: Vec<RdmServiceItem>,
 }
 
@@ -33,16 +50,24 @@ struct RdmServiceItem {
     service_id: String,
     #[serde(rename = "operatorCode")]
     operator_code: String,
+    /// Missing or `null`: no destination, so `parse_departures` skips the
+    /// service (logged) rather than failing the board.
+    #[serde(default, deserialize_with = "null_as_default")]
     destination: Vec<RdmServiceLocation>,
     std: String,
     etd: String,
-    #[serde(rename = "isCancelled")]
+    /// Missing or `null` reads as not cancelled.
+    #[serde(default, rename = "isCancelled", deserialize_with = "null_as_default")]
     is_cancelled: bool,
     #[serde(default, rename = "cancelReason")]
     cancel_reason: Option<String>,
     #[serde(default, rename = "delayReason")]
     delay_reason: Option<String>,
-    #[serde(default, rename = "subsequentCallingPoints")]
+    #[serde(
+        default,
+        rename = "subsequentCallingPoints",
+        deserialize_with = "null_as_default"
+    )]
     subsequent_calling_points: Vec<RdmCallingPointList>,
     /// The CURRENT (not "planned") platform this station's own departure
     /// board reports for this service -- Darwin/RDM merges any late
@@ -68,7 +93,7 @@ struct RdmServiceItem {
 
 #[derive(Debug, Deserialize)]
 struct RdmCallingPointList {
-    #[serde(default, rename = "callingPoint")]
+    #[serde(default, rename = "callingPoint", deserialize_with = "null_as_default")]
     calling_point: Vec<RdmCallingPoint>,
 }
 
@@ -83,7 +108,7 @@ struct RdmCallingPoint {
     et: Option<String>,
     #[serde(default)]
     at: Option<String>,
-    #[serde(default, rename = "isCancelled")]
+    #[serde(default, rename = "isCancelled", deserialize_with = "null_as_default")]
     is_cancelled: bool,
 }
 
@@ -257,13 +282,13 @@ struct RdmArrivalItem {
     service_id: String,
     #[serde(default, rename = "operatorCode")]
     operator_code: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     origin: Vec<RdmServiceLocation>,
     #[serde(default)]
     sta: Option<String>,
     #[serde(default)]
     eta: Option<String>,
-    #[serde(default, rename = "isCancelled")]
+    #[serde(default, rename = "isCancelled", deserialize_with = "null_as_default")]
     is_cancelled: bool,
     #[serde(default)]
     platform: Option<String>,
@@ -273,7 +298,11 @@ struct RdmArrivalItem {
 
 #[derive(Debug, Deserialize)]
 struct RdmArrivalBoard {
-    #[serde(default, rename = "trainServices")]
+    #[serde(
+        default,
+        rename = "trainServices",
+        deserialize_with = "null_as_default"
+    )]
     train_services: Vec<RdmArrivalItem>,
 }
 
@@ -752,5 +781,66 @@ mod tests {
     fn an_empty_arrival_board_parses_to_nothing() {
         assert_eq!(parse_arrivals(r#"{"crs": "LDS"}"#).expect("parse"), []);
         assert!(parse_arrivals("not json").is_err());
+    }
+
+    /// An overnight board with no trains: LDBWS sends the lists as
+    /// explicit `null`s, which must read as an empty board, not an error.
+    const EMPTY_OVERNIGHT_BOARD: &str = r#"
+        {
+            "generatedAt": "2026-07-06T02:30:00Z",
+            "locationName": "London Paddington",
+            "crs": "PAD",
+            "nrccMessages": null,
+            "trainServices": null,
+            "busServices": null,
+            "ferryServices": null
+        }
+    "#;
+
+    #[test]
+    fn a_null_train_services_list_is_an_empty_board() {
+        assert!(
+            parse_departures(EMPTY_OVERNIGHT_BOARD)
+                .expect("departures")
+                .is_empty()
+        );
+        assert_eq!(parse_arrivals(EMPTY_OVERNIGHT_BOARD).expect("arrivals"), []);
+    }
+
+    #[test]
+    fn null_lists_and_flags_inside_a_service_read_as_their_defaults() {
+        let json = r#"
+            {
+                "trainServices": [
+                    {"serviceID": "a", "operatorCode": "GW", "destination": [{"crs": "RDG"}],
+                     "std": "10:00", "etd": "On time", "isCancelled": null,
+                     "subsequentCallingPoints": null},
+                    {"serviceID": "b", "operatorCode": "GW", "destination": [{"crs": "OXF"}],
+                     "std": "10:05", "etd": "On time",
+                     "subsequentCallingPoints": [
+                        {"callingPoint": null},
+                        {"callingPoint": [{"crs": "DID", "st": "10:20", "isCancelled": null}]}
+                     ]},
+                    {"serviceID": "c", "operatorCode": "GW", "destination": null,
+                     "std": "10:10", "etd": "On time", "isCancelled": false}
+                ]
+            }
+        "#;
+        let departures = parse_departures(json).expect("should parse");
+        // `c` has no destination, so it is skipped, not fatal.
+        assert_eq!(departures.len(), 2);
+        assert!(!departures[0].is_cancelled);
+        assert_eq!(departures[0].calling_points, []);
+        assert_eq!(departures[1].calling_points.len(), 1);
+        assert!(!departures[1].calling_points[0].is_cancelled);
+        assert_eq!(departures[1].skipped_stations, Vec::<String>::new());
+
+        let arrivals = parse_arrivals(
+            r#"{"trainServices": [{"serviceID": "a", "sta": "10:30", "origin": null, "isCancelled": null}]}"#,
+        )
+        .expect("arrivals");
+        assert_eq!(arrivals.len(), 1);
+        assert_eq!(arrivals[0].origin_crs, None);
+        assert!(!arrivals[0].is_cancelled);
     }
 }
