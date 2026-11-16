@@ -179,8 +179,11 @@ async fn run() -> anyhow::Result<()> {
     // holds an undelivered snapshot.
     let sink = SampleSink::from_config(&config)?;
     tracing::info!("producing station samples to ds:ingest:station-samples");
-    // Postgres and the schema gate (the station list) passed above; the
-    // stream producer is lazy, so a Redis outage shows as failed cycles.
+    // Postgres and the schema gate (the station list) passed above. The
+    // stream producer connects lazily, but `SampleSink::deliver` waits for
+    // each snapshot's write receipt (up to `post_retry_budget`), so a Redis
+    // outage shows as failed cycles (`sink.rs`'s
+    // `redis_down_fails_the_cycle_transiently_and_holds_the_snapshot`).
     lifecycle.sink_connected();
 
     let policy = retry_policy(poll_interval);
