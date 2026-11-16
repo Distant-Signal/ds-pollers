@@ -1107,7 +1107,7 @@ async fn fetch_board_window(
     );
     let response = client
         .get(&url)
-        .header(RDM_AUTH_HEADER_NAME, &config.rdm_api_key)
+        .header(RDM_AUTH_HEADER_NAME, config.rdm_api_key.expose())
         .send()
         .await?;
     let status = response.status();
@@ -1257,7 +1257,7 @@ async fn fetch_departures_once(
 
     let response = client
         .get(&url)
-        .header(RDM_AUTH_HEADER_NAME, &config.rdm_api_key)
+        .header(RDM_AUTH_HEADER_NAME, config.rdm_api_key.expose())
         .send()
         .await?;
 
@@ -1434,7 +1434,7 @@ mod tests {
     fn test_config(base_url: String, num_rows: u32) -> Config {
         Config {
             ldbws_base_url: base_url,
-            rdm_api_key: "test-api-key".to_string(),
+            rdm_api_key: "test-api-key".into(),
             num_rows,
             ingest: config::IngestArgs {
                 redis_url: Some("redis://127.0.0.1:1".to_owned()),

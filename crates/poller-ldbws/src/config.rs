@@ -27,9 +27,10 @@ pub(crate) struct Config {
     /// `RDM_AUTH_HEADER_NAME` in `main.rs`). Community sources describe
     /// this as the "consumer key" specifically (as opposed to a paired
     /// "consumer secret") — unconfirmed against RDM's own docs, but
-    /// consistent with how the other three pollers authenticate.
-    #[arg(long, env)]
-    pub rdm_api_key: String,
+    /// consistent with how the other three pollers authenticate. Its
+    /// environment value is hidden from `--help`.
+    #[arg(long, env, hide_env_values = true)]
+    pub rdm_api_key: ds_runtime::secret::Secret,
 
     /// Number of services requested per station per cycle (LDBWS's own
     /// `numRows` query parameter), used as the *first* attempt each cycle.
@@ -296,6 +297,23 @@ mod config_debug_tests {
             !debug_output.contains("redis-password"),
             "the Redis password must never appear in Debug output: {debug_output}"
         );
+    }
+
+    /// `--help` names `RDM_API_KEY` but never prints its value.
+    #[test]
+    fn help_hides_the_rdm_api_keys_env_value() {
+        use clap::CommandFactory;
+
+        let command = Config::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "rdm_api_key")
+            .expect("the rdm_api_key argument");
+        assert_eq!(
+            arg.get_env().and_then(|env| env.to_str()),
+            Some("RDM_API_KEY")
+        );
+        assert!(arg.is_hide_env_values_set());
     }
 
     /// LEG-18: the three volume knobs are off unless set.
