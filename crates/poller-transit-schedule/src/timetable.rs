@@ -19,7 +19,7 @@ use ds_runtime::metrics::metric_name;
 use crate::Context;
 use crate::adapter::gtfs::{self, GtfsOptions};
 use crate::adapter::txc::{self, TxcOptions};
-use crate::adapter::{FeedError, download_to_file, ftp};
+use crate::adapter::{FeedError, download_to_file, finish_download, ftp, part_path};
 use crate::model::TransitModel;
 use crate::network::AdapterKind;
 use crate::{feed_guard, item, naptan, rail_links};
@@ -91,11 +91,14 @@ async fn download(ctx: &Context, path: &std::path::Path) -> Result<u64, FeedErro
     }
 }
 
-/// Downloads and parses the network's timetable with its adapter.
+/// Downloads and parses the network's timetable with its adapter. The
+/// download is written to `feed.zip.part` and renamed to `feed.zip` once
+/// complete, so a failed one never leaves a partial feed in the work dir.
 pub(crate) async fn fetch_model(ctx: &Context) -> Result<TransitModel, FeedError> {
     let path = ctx.config.work_dir.join("feed.zip");
+    let part = part_path(&path);
     let adapter = ctx.network.adapter;
-    let bytes = download(ctx, &path).await?;
+    let bytes = finish_download(download(ctx, &part).await, &part, &path).await?;
     #[expect(
         clippy::cast_precision_loss,
         reason = "a byte count far below 2^53"
