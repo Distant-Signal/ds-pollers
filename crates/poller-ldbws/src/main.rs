@@ -354,6 +354,7 @@ async fn poll_once(
     // Stations LDBWS rejected as invalid are left out until their hourly
     // re-probe is due -- see `rotation`'s module docs.
     let polled = rotation.pollable(&ordered, std::time::Instant::now());
+    state.platform_history.prune(std::time::Instant::now());
     state.request_budget.start_cycle();
     let CycleSampling {
         samples,
@@ -772,7 +773,7 @@ async fn sample_all_stations(
         }
         match fetch_departures(client, config, request_budget, crs).await {
             Ok(mut departures) => {
-                platform_history.apply(crs, &mut departures);
+                platform_history.apply(crs, &mut departures, std::time::Instant::now());
                 out.samples.push(StationSample {
                     crs: crs.clone(),
                     polled_at: Utc::now(),
@@ -884,7 +885,11 @@ async fn sample_tracked_stops(
                 let (offset, window) = tracked_stops::window(target.departs_at, Utc::now());
                 match fetch_board_window(client, config, &target.crs, offset, window).await {
                     Ok(mut departures) => {
-                        platform_history.apply(&target.crs, &mut departures);
+                        platform_history.apply(
+                            &target.crs,
+                            &mut departures,
+                            std::time::Instant::now(),
+                        );
                         let polled_at = Utc::now();
                         cadence.polled(target, polled_at);
                         boards.push(TrackedStopBoard {
