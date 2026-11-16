@@ -74,7 +74,10 @@ pub struct ObjStationData {
     pub exparrival: Option<String>,
     #[serde(default)]
     pub expdepart: Option<String>,
-    pub late: i32,
+    /// Text, read by [`late_minutes`]: a required `i32` here meant one
+    /// empty `<Late/>` failed the whole station's board.
+    #[serde(default)]
+    pub late: Option<String>,
     pub status: String,
     #[serde(default)]
     pub duein: Option<String>,
@@ -96,6 +99,26 @@ fn train_date(raw: Option<&str>) -> Option<chrono::NaiveDate> {
     chrono::NaiveDate::parse_from_str(raw?.trim(), "%d %b %Y").ok()
 }
 
+/// `Late` as minutes. A missing, empty (`<Late/>`) or non-numeric value is
+/// `0`, the feed's own value for a train with no lateness reported, so the
+/// rest of the row and the station's board survive. ds-core's
+/// `IslandOfIrelandDeparture::late_minutes` is a plain `i32`, so "unknown"
+/// cannot be told apart from `0` until that type changes; a non-blank value
+/// that does not parse is logged.
+fn late_minutes(raw: Option<&str>, train_code: &str) -> i32 {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return 0;
+    };
+    raw.parse().unwrap_or_else(|_| {
+        tracing::warn!(
+            train_code = train_code.trim(),
+            late = raw,
+            "unreadable Late value; using 0"
+        );
+        0
+    })
+}
+
 impl From<&ObjStationData> for IslandOfIrelandDeparture {
     fn from(d: &ObjStationData) -> Self {
         IslandOfIrelandDeparture {
@@ -109,7 +132,7 @@ impl From<&ObjStationData> for IslandOfIrelandDeparture {
             scheduled_departure: d.schdepart.clone(),
             expected_arrival: d.exparrival.clone(),
             expected_departure: d.expdepart.clone(),
-            late_minutes: d.late,
+            late_minutes: late_minutes(d.late.as_deref(), &d.traincode),
             status: d.status.clone(),
             due_in_minutes: d.duein.as_deref().and_then(|s| s.parse().ok()),
             train_date: train_date(d.traindate.as_deref()),
@@ -332,6 +355,45 @@ mod tests {
         assert_eq!(departures[0].late_minutes, 1);
         assert_eq!(departures[1].train_date, None);
         assert_eq!(departures[1].last_location, None);
+    }
+
+    /// An empty, missing or unreadable `Late` used to fail the whole
+    /// station's board; now it is `0` and every row survives.
+    #[test]
+    fn an_empty_missing_or_odd_late_keeps_the_board() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+            <ArrayOfObjStationData xmlns="http://api.irishrail.ie/realtime/">
+              <objStationData>
+                <Traincode>E101 </Traincode>
+                <Origin>Malahide</Origin>
+                <Destination>Bray</Destination>
+                <Status>En Route</Status>
+                <Late />
+              </objStationData>
+              <objStationData>
+                <Traincode>E102</Traincode>
+                <Origin>Bray</Origin>
+                <Destination>Howth</Destination>
+                <Status>No Information</Status>
+              </objStationData>
+              <objStationData>
+                <Traincode>E103</Traincode>
+                <Origin>Bray</Origin>
+                <Destination>Howth</Destination>
+                <Status>No Information</Status>
+                <Late>n/a</Late>
+              </objStationData>
+              <objStationData>
+                <Traincode>E104</Traincode>
+                <Origin>Bray</Origin>
+                <Destination>Howth</Destination>
+                <Status>En Route</Status>
+                <Late> 4 </Late>
+              </objStationData>
+            </ArrayOfObjStationData>"#;
+        let departures = parse_station_departures(xml).expect("must parse");
+        let late: Vec<i32> = departures.iter().map(|d| d.late_minutes).collect();
+        assert_eq!(late, [0, 0, 0, 4]);
     }
 
     /// Across midnight the date is the train's start day, as sent.
