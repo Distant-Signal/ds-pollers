@@ -503,14 +503,17 @@ next start (after the cause is fixed, restart the pod or set another
 token).
 
 **Leave the token set.** It is one-shot by design: the commit records
-which token it answered, so later restarts (a node drain, a rollout) with
+which token it answered, and every later commit carries the configured
+token too (the start-up check reads only the newest commit), so later restarts (a node drain, a rollout) with
 the same token change nothing. To refresh again, set a different token.
 Unsetting it (`""`) is harmless but restarts the pod for nothing. This was
 chosen over a plain on/off switch, which would refresh on every restart
 while on and so would have to be turned off again after each use (two
 changes, and a forgotten "on" means a full download on every restart).
 The token costs one optional field in the commit's `source`, which the
-writer stores with an activated version's source and otherwise ignores.
+writer stores with an activated version's source and otherwise ignores (so
+an activated version's source shows the configured token, not only on the
+forced commit).
 
 ## Adding a SIRI line alias
 

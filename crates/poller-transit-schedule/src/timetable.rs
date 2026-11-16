@@ -269,7 +269,8 @@ pub(crate) async fn poll_once(ctx: &Context) -> anyhow::Result<()> {
     }
 
     // An unanswered refresh request (crate::refresh): publish even an
-    // unchanged feed, and say which request this commit answers.
+    // unchanged feed. Every commit names the configured request, so the
+    // newest one shows it answered at the next start.
     let forced = ctx.refresh_pending.load(Ordering::Relaxed);
     let built = item::build(
         &ctx.network,
@@ -280,7 +281,7 @@ pub(crate) async fn poll_once(ctx: &Context) -> anyhow::Result<()> {
         produced_at,
         item::SourceTag {
             url_kind: ctx.network.adapter.as_str(),
-            refresh: forced.then_some(ctx.config.timetable_refresh.as_str()),
+            refresh: crate::refresh::commit_token(&ctx.config.timetable_refresh),
         },
     )?;
     if let Some(last) = last.as_ref().filter(|_| !forced) {
