@@ -118,7 +118,10 @@ async fn run() -> anyhow::Result<()> {
         "poller-irish-rail-live",
         500,
     ));
-    // The producers are lazy: a Redis outage shows as failed cycles.
+    // The producers are lazy and `publish` only queues a snapshot, never
+    // waiting for Redis: a Redis outage does not fail a cycle
+    // (`poller_cycle_total` stays `success`). The newest snapshot stays
+    // queued and is retried until Redis is back.
     lifecycle.sink_connected();
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
 
@@ -225,14 +228,26 @@ async fn poll_once(
     let samples =
         sample_stations_within_budget(client, config, &station_codes, CYCLE_TIME_BUDGET).await;
 
-    if samples.is_empty() {
-        tracing::warn!("no station samples collected this cycle; nothing to post");
-        return Ok(());
-    }
+    require_samples(station_codes.len(), samples.len())?;
 
     stream.publish(&samples, fetched_at).await?;
     station_list.offer(&live_stations, fetched_at).await;
     Ok(())
+}
+
+/// Fails a cycle that sampled no station: every board failed (an upstream
+/// 5xx outage, say), the budget ran out before the first one answered, or
+/// there was nothing to sample. Such a cycle used to report success with
+/// nothing sent, so `poller_cycle_total{result="failure"}` and readiness
+/// never showed the outage. A cycle with some boards is a success.
+fn require_samples(attempted: usize, sampled: usize) -> anyhow::Result<()> {
+    if sampled > 0 {
+        return Ok(());
+    }
+    if attempted == 0 {
+        anyhow::bail!("no station codes to sample this cycle");
+    }
+    anyhow::bail!("every one of {attempted} station boards failed this cycle; nothing to send")
 }
 
 /// Samples every code in `station_codes`, but never for longer than
@@ -523,6 +538,40 @@ mod tests {
         assert!(!should_send(Some(&sent), &list, soon));
         assert!(should_send(Some(&sent), &[live("AAA")], soon));
         assert!(should_send(Some(&sent), &list, t0 + STATION_LIST_RESEND));
+    }
+
+    #[test]
+    fn a_cycle_with_no_samples_fails() {
+        assert!(require_samples(3, 1).is_ok());
+        let err = require_samples(3, 0).unwrap_err().to_string();
+        assert!(err.contains("every one of 3"), "{err}");
+        assert!(require_samples(0, 0).is_err());
+    }
+
+    /// A 5xx outage: every board fails, so the cycle must too (it used to
+    /// report success with nothing sent).
+    #[tokio::test]
+    async fn every_board_failing_fails_the_cycle() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/getStationDataByCodeXML"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let config = test_config(server.uri());
+        let station_codes = vec!["AAA".to_string(), "BBB".to_string()];
+
+        let samples = sample_stations_within_budget(
+            &Client::new(),
+            &config,
+            &station_codes,
+            CYCLE_TIME_BUDGET,
+        )
+        .await;
+
+        assert_eq!(samples.len(), 0);
+        assert!(require_samples(station_codes.len(), samples.len()).is_err());
     }
 
     #[tokio::test]
