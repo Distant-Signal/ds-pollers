@@ -742,45 +742,129 @@ async fn fetch_json(
     config: &Config,
     what: &str,
 ) -> anyhow::Result<String> {
-    let mut attempt = 0;
-    // Tracks the status code of the most recent retryable failure, if any
-    // -- this is what distinguishes a same-cycle "succeeded on the first
-    // try" outcome from "succeeded after backing off from a 429/5xx",
-    // which the plain success/failure result of the call alone can't tell
-    // apart. See docs/superpowers/specs/2026-08-29-metrics-design.md's v1
-    // scope item 3.
-    let mut retried_status: Option<StatusCode> = None;
-    let policy = retry_policy(what);
-    loop {
-        let response = client
-            .get(url)
-            .header(TFL_AUTH_HEADER_NAME, &config.tfl_app_key)
-            .send()
-            .await?;
-        let status = response.status();
+    fetch_json_with(
+        client,
+        url,
+        config.tfl_app_key.expose(),
+        what,
+        retry_policy(what),
+    )
+    .await
+}
 
-        if status.is_success() {
-            let outcome = match retried_status {
-                None => "success",
-                Some(s) if s == StatusCode::TOO_MANY_REQUESTS => "retried_429",
-                Some(_) => "retried_5xx",
-            };
-            metrics::counter!(
-                ds_runtime::metrics::metric_name("tfl_fetch_total"),
-                "what" => what.to_string(),
-                "outcome" => outcome
-            )
-            .increment(1);
-            return Ok(response.text().await?);
+/// Worth retrying inside the cycle: a request that timed out or never
+/// connected (a blip, as a 5xx is), not one this poller built wrong.
+fn should_retry_transport(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect()
+}
+
+/// What a retryable failure was, for the metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retried {
+    TooManyRequests,
+    ServerError,
+    Transport,
+}
+
+impl Retried {
+    /// `tfl_fetch_total`'s `outcome` for a success after this.
+    fn outcome(self) -> &'static str {
+        match self {
+            Self::TooManyRequests => "retried_429",
+            Self::ServerError => "retried_5xx",
+            Self::Transport => "retried_transport",
         }
+    }
+
+    /// `tfl_fetch_retries_total`'s `status`.
+    fn label(self) -> &'static str {
+        match self {
+            Self::TooManyRequests => "429",
+            Self::ServerError => "5xx",
+            Self::Transport => "transport",
+        }
+    }
+}
+
+/// The body of a successful GET, or the transport error that ended it.
+async fn get_text(
+    client: &Client,
+    url: &str,
+    key: &str,
+) -> Result<Result<String, (StatusCode, Option<String>, String)>, reqwest::Error> {
+    let response = client
+        .get(url)
+        .header(TFL_AUTH_HEADER_NAME, key)
+        .send()
+        .await?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(Ok(response.text().await?));
+    }
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = response.text().await.unwrap_or_default();
+    Ok(Err((status, retry_after, body)))
+}
+
+async fn fetch_json_with(
+    client: &Client,
+    url: &str,
+    key: &str,
+    what: &str,
+    policy: RetryPolicy,
+) -> anyhow::Result<String> {
+    let mut attempt = 0;
+    // What the most recent retryable failure was, if any -- this is what
+    // distinguishes a same-cycle "succeeded on the first try" outcome from
+    // "succeeded after backing off from a 429/5xx/timeout", which the plain
+    // success/failure result of the call alone can't tell apart. See
+    // docs/superpowers/specs/2026-08-29-metrics-design.md's v1 scope item 3.
+    let mut retried: Option<Retried> = None;
+    loop {
+        let (status, retry_after, body) = match get_text(client, url, key).await {
+            Ok(Ok(text)) => {
+                metrics::counter!(
+                    ds_runtime::metrics::metric_name("tfl_fetch_total"),
+                    "what" => what.to_string(),
+                    "outcome" => retried.map_or("success", Retried::outcome)
+                )
+                .increment(1);
+                return Ok(text);
+            }
+            Ok(Err(failed)) => failed,
+            // A timeout or a refused connection: retried as a 5xx is (one
+            // blip among the routes job's hundreds of calls used to abort
+            // the whole daily run).
+            Err(err) => {
+                attempt += 1;
+                if attempt >= policy.max_attempts || !should_retry_transport(&err) {
+                    metrics::counter!(
+                        ds_runtime::metrics::metric_name("tfl_fetch_total"),
+                        "what" => what.to_string(),
+                        "outcome" => "exhausted"
+                    )
+                    .increment(1);
+                    return Err(err.into());
+                }
+                retried = Some(Retried::Transport);
+                count_retry(what, Retried::Transport);
+                let delay = policy.backoff.delay(attempt - 1);
+                tracing::warn!(
+                    error = %err,
+                    attempt,
+                    delay_secs = delay.as_secs(),
+                    "TfL {what} request failed; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        };
 
         attempt += 1;
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let body = response.text().await.unwrap_or_default();
         if attempt >= policy.max_attempts || !should_retry(status) {
             // A 404 is `TfL` not publishing the resource (a tram timetable
             // from anywhere but its timetabled origin), not a fault.
@@ -803,13 +887,13 @@ async fn fetch_json(
             .into());
         }
 
-        retried_status = Some(status);
-        metrics::counter!(
-            ds_runtime::metrics::metric_name("tfl_fetch_retries_total"),
-            "what" => what.to_string(),
-            "status" => if status == StatusCode::TOO_MANY_REQUESTS { "429" } else { "5xx" }
-        )
-        .increment(1);
+        let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+            Retried::TooManyRequests
+        } else {
+            Retried::ServerError
+        };
+        retried = Some(kind);
+        count_retry(what, kind);
         let asked = requested_wait(retry_after.as_deref(), &body);
         // At least what TfL asked for (jittered up by at most a quarter,
         // capped at 5 minutes), else the jittered exponential backoff.
@@ -825,8 +909,21 @@ async fn fetch_json(
     }
 }
 
+/// `distant_signal_tfl_fetch_retries_total{what, status}`.
+fn count_retry(what: &str, kind: Retried) {
+    metrics::counter!(
+        ds_runtime::metrics::metric_name("tfl_fetch_retries_total"),
+        "what" => what.to_string(),
+        "status" => kind.label()
+    )
+    .increment(1);
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[test]
@@ -834,6 +931,95 @@ mod tests {
         assert!(should_retry(StatusCode::TOO_MANY_REQUESTS));
         assert!(should_retry(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(should_retry(StatusCode::BAD_GATEWAY));
+    }
+
+    /// A policy that retries at once, for the transport tests.
+    const QUICK_RETRY: RetryPolicy = RetryPolicy {
+        max_attempts: 3,
+        backoff: ds_runtime::backoff::Backoff::new(
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        ),
+    };
+
+    /// A local server whose first `hangs` connections are accepted and
+    /// never answered; the rest get `200 ok`. Returns its URL and the
+    /// connections it has accepted.
+    async fn flaky_server(hangs: usize) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/Line", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                if counter.fetch_add(1, Ordering::SeqCst) < hangs {
+                    held.push(socket);
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 4096];
+                    let _ = socket.read(&mut request).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        (url, accepted)
+    }
+
+    fn quick_client() -> Client {
+        Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap()
+    }
+
+    /// One timeout among the routes job's hundreds of calls must not abort
+    /// the whole daily run: it is retried like a 5xx.
+    #[tokio::test]
+    async fn a_timeout_is_retried() {
+        let (url, accepted) = flaky_server(1).await;
+        let body = fetch_json_with(&quick_client(), &url, "k", "route-sequence", QUICK_RETRY)
+            .await
+            .unwrap();
+        assert_eq!(body, "ok");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn timeouts_give_up_after_the_policys_attempts() {
+        let (url, accepted) = flaky_server(usize::MAX).await;
+        let err = fetch_json_with(&quick_client(), &url, "k", "route-sequence", QUICK_RETRY)
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout),
+            "{err:#}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_retryable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        drop(listener);
+        let err = quick_client().get(&url).send().await.unwrap_err();
+        assert!(should_retry_transport(&err), "{err:?}");
+        assert!(
+            fetch_json_with(&quick_client(), &url, "k", "lines", QUICK_RETRY)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
