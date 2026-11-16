@@ -177,7 +177,7 @@ async fn fetch_incidents_xml(client: &Client, config: &Config) -> anyhow::Result
     // proven specifically for this product.
     let response = client
         .get(&config.rdm_incidents_base_url)
-        .header(RDM_AUTH_HEADER_NAME, &config.rdm_api_key)
+        .header(RDM_AUTH_HEADER_NAME, config.rdm_api_key.expose())
         .send()
         .await?
         .error_for_status()?;

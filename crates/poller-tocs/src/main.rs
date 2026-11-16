@@ -121,7 +121,7 @@ async fn fetch_tocs_xml(client: &Client, config: &Config) -> anyhow::Result<Stri
     // proven specifically for this product.
     let response = client
         .get(&config.rdm_tocs_base_url)
-        .header(RDM_AUTH_HEADER_NAME, &config.rdm_api_key)
+        .header(RDM_AUTH_HEADER_NAME, config.rdm_api_key.expose())
         .send()
         .await?
         .error_for_status()?;

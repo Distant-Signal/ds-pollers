@@ -26,8 +26,10 @@ pub(crate) struct Config {
 
     /// RDM API key, sent via the `x-apikey` header (see
     /// `RDM_AUTH_HEADER_NAME` in `main.rs`).
-    #[arg(long, env)]
-    pub rdm_api_key: String,
+    /// A [`Secret`] with its environment value
+    /// hidden, so `--help` never prints the live key.
+    #[arg(long, env, hide_env_values = true)]
+    pub rdm_api_key: Secret,
 
     /// RSPS5050 P-03-00 Rev A §10: "Recommend every 5 minutes."
     #[arg(long, env, default_value_t = 300)]
@@ -159,6 +161,18 @@ mod tests {
         ]);
         config.validate().expect("complete");
         assert!(!config.incidents_row_heartbeat);
+    }
+
+    /// `--help` printed `RDM_API_KEY`'s live value.
+    #[test]
+    fn help_hides_the_rdm_api_key() {
+        use clap::CommandFactory;
+        let command = Config::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "rdm_api_key")
+            .expect("rdm_api_key is an argument");
+        assert!(arg.is_hide_env_values_set());
     }
 
     #[test]
