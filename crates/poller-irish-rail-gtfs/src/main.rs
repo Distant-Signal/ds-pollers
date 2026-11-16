@@ -18,7 +18,6 @@ use std::time::Duration;
 use chrono::Utc;
 use clap::Parser;
 use config::Config;
-use gtfs_structures::Gtfs;
 use ingest_stream::SchemaId;
 use ingest_stream::snapshot::SnapshotStream;
 use reqwest::Client;
@@ -49,7 +48,7 @@ const MAX_GTFS_ZIP_BYTES: u64 = 200 * 1024 * 1024;
 /// **Sized against the pod, not just against the feed (L15 follow-up,
 /// 2026-09-27).** This was 2 GiB, which bounded nothing useful: the
 /// pre-scan itself streams (constant memory), but anything that PASSES it
-/// is then parsed wholesale into memory by `Gtfs::from_reader`, inside a
+/// is then parsed wholesale into memory by `mapping::parse_feed`, inside a
 /// container whose chart memory limit is 768Mi
 /// (`pollerIrishRailGtfs.resources.limits.memory`). A crafted zip inflating
 /// to ~1.5 GiB of CSV sailed through the old budget and `OOMKilled` the pod
@@ -58,10 +57,12 @@ const MAX_GTFS_ZIP_BYTES: u64 = 200 * 1024 * 1024;
 /// MiB is still ~9x headroom for feed growth while keeping inflated CSV
 /// plus its parsed form plus the (<= [`MAX_GTFS_ZIP_BYTES`]) zip bytes
 /// themselves inside that limit. Raise the pod limit first if this ever
-/// needs to grow.
+/// needs to grow. The budget counts every entry's inflated bytes, but
+/// `mapping::parse_feed` skips `shapes.txt`, so what is actually parsed
+/// into memory is far smaller than the budget on the real feed.
 const MAX_GTFS_INFLATED_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
-/// **L15 (2026-09-26 review): `Gtfs::from_reader` inflates every zip entry
+/// **L15 (2026-09-26 review): `mapping::parse_feed` inflates every zip entry
 /// with no bound of its own.** [`MAX_GTFS_ZIP_BYTES`]/[`download_capped`]
 /// above only bound the COMPRESSED download size, not what a hostile
 /// upstream's crafted zip could decompress to -- confirmed directly against
@@ -93,8 +94,8 @@ const MAX_GTFS_INFLATED_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 /// `MAX_GTFS_INFLATED_BYTES` -- without ever letting any entry fully
 /// materialize.
 ///
-/// This duplicates the decompression work `Gtfs::from_reader` goes on to do
-/// if this check passes: `Gtfs::from_reader` offers no injectable read
+/// This duplicates the decompression work `mapping::parse_feed` goes on to do
+/// if this check passes: `mapping::parse_feed` offers no injectable read
 /// wrapper or size-bound option of its own to avoid that (its `ZipArchive`
 /// is entirely internal to `read_from_reader`, never exposed to the
 /// caller), so there is no way to check as-you-go during the real parse
@@ -311,7 +312,7 @@ async fn poll_once(client: &Client, config: &Config, sinks: &Sinks) -> anyhow::R
 
     // Both steps are synchronous, CPU-bound work over a potentially large
     // amount of decompressed data -- `reject_gtfs_zip_bomb` by design (see
-    // its own doc comment), and `Gtfs::from_reader` in the ordinary case --
+    // its own doc comment), and `mapping::parse_feed` in the ordinary case --
     // so both are moved onto the blocking pool together. Without this, a
     // pathological feed would stall this whole process's tokio runtime for
     // however long the (bounded, but still real) decompression work takes,
@@ -320,7 +321,7 @@ async fn poll_once(client: &Client, config: &Config, sinks: &Sinks) -> anyhow::R
     // runtime).
     let gtfs = tokio::task::spawn_blocking(move || {
         reject_gtfs_zip_bomb(&bytes)?;
-        Gtfs::from_reader(std::io::Cursor::new(bytes))
+        mapping::parse_feed(std::io::Cursor::new(bytes))
             .map_err(|err| anyhow::anyhow!("failed to parse GTFS feed: {err}"))
     })
     .await
@@ -454,7 +455,7 @@ mod reject_gtfs_zip_bomb_tests {
 
     /// Builds a single-entry zip, `name` -> `contents`, via a real
     /// `zip::ZipWriter` -- the exact code path `reject_gtfs_zip_bomb` (and
-    /// `Gtfs::from_reader`) reads back, not a hand-rolled byte layout.
+    /// `mapping::parse_feed`) reads back, not a hand-rolled byte layout.
     fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut buf = Vec::new();
         {
