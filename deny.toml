@@ -46,15 +46,14 @@ ignore = [
     { id = "RUSTSEC-2026-0546", reason = "zip 8 extract()/extract_unwrapped_root_dir only; never called, entries are read in memory" }, # expires 2026-12-18
     { id = "RUSTSEC-2026-0547", reason = "zip 8 legacy-zip feature (Shrink/Reduce/Implode decoders) not compiled; unsupported methods return CompressionMethodNotSupported" }, # expires 2026-12-18
     { id = "RUSTSEC-2026-0548", reason = "zip 8 ZipStreamReader/read_zipfile_from_stream only; never used, gtfs-structures reads via the seekable ZipArchive" }, # expires 2026-12-18
-    # chrono and chrono-tz: informational "unmaintained" advisories
-    # (RUSTSEC-2026-0543, RUSTSEC-2026-0555), not vulnerabilities. All
+    # chrono: informational "unmaintained" advisory
+    # (RUSTSEC-2026-0543), not a vulnerability. All
     # versions are affected and no patched release exists. chrono is a
     # direct dependency across the Distant-Signal Rust repositories, plus
     # the sqlx, schemars and ts-rs integrations; the advisory suggests
     # jiff or time, but a move is a cross-repo effort. Revisit before the
     # expiry: migrate if a plan exists, else re-read the advisory and renew.
     { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (informational, no patched version); a move to jiff or time is a cross-repo effort" }, # expires 2027-02-17
-    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained (informational, no patched version); a move to jiff or time is a cross-repo effort" }, # expires 2027-02-17
 ]
 
 [licenses]
