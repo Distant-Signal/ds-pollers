@@ -74,7 +74,10 @@ async fn run() -> anyhow::Result<()> {
         ),
     };
 
-    // The producers are lazy: a Redis outage shows as failed cycles.
+    // The producers are lazy and `publish` only queues a snapshot, never
+    // waiting for Redis: a Redis outage does not fail a cycle
+    // (`poller_cycle_total` stays `success`). The newest snapshot stays
+    // queued and is retried until Redis is back.
     lifecycle.sink_connected();
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     // The startup cursor is the older of the newest `ioi-stations/1` and

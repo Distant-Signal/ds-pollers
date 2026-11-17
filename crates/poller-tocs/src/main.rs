@@ -57,7 +57,10 @@ async fn run() -> anyhow::Result<()> {
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let stream = stream_sink(&config)?;
-    // The producer is lazy: a Redis outage shows as failed cycles.
+    // The producer is lazy and `publish` only queues a snapshot, never
+    // waiting for Redis: a Redis outage does not fail a cycle
+    // (`poller_cycle_total` stays `success`). The newest snapshot stays
+    // queued and is retried until Redis is back.
     lifecycle.sink_connected();
     let cycle = || lifecycle.track(poll_once(&client, &config, &stream));
 
