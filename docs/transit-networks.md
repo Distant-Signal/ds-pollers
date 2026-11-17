@@ -283,12 +283,37 @@ login Traveline issues on request:
 3. **Ranma adds `poller-transit-net-password`** (letters and digits) to the
    Redis users SealedSecret.
 
-The login crosses the network in clear (TNDS offers plain FTP), and so does
-the file; the producer logs a warning at its first download to say so. FTPS
-is not supported. The login is a free registration that guards nothing else;
-do not reuse a password.
+**FTP security.** `TRANSIT_TXC_FTP_SECURITY` sets how the producer talks to
+an `ftp://` `txcUrl` (a chart value for it is ds-deploy's; until it exists,
+the pod's `env` does it):
 
-**NetworkPolicy.** Passive FTP opens its data connection to a port the
+| Value | What it does |
+|---|---|
+| `plain` (the default) | No TLS. The login and the file cross the network in clear; the producer logs a warning at its first download to say so. Nothing changes for an existing deployment. |
+| `explicit` | Explicit FTPS (RFC 4217): `AUTH TLS` is sent first, and `USER`/`PASS` only once the control connection is TLS. A server that answers `AUTH` with a 5xx (no FTPS) gets plain FTP instead, with a warning on every download. |
+| `required` | As `explicit`, but a server that does not complete the TLS upgrade is an error, before the login is sent. |
+
+With TLS on, `PBSZ 0` and `PROT P` follow the login, so the data connection
+is TLS too, and it resumes the control connection's TLS session (servers
+that demand session reuse accept it). The certificate is checked against
+the system's roots for the URL's host name; verification cannot be switched
+off. `TRANSIT_TXC_FTP_CA_FILE` (the path of a PEM file, empty by default)
+adds CA certificates to trust, for a provider whose certificate is from a
+private or unlisted CA. `explicit` only guards against a passive listener,
+because a network attacker can forge the 5xx that triggers its fallback: use
+`required` once the provider is known to offer FTPS. Plain FTP's login is a
+free registration that guards nothing else; do not reuse a password with
+any mode.
+
+Before changing the mode, check the provider (no login needed): connect to
+the control port, read the greeting, send `FEAT` and `AUTH TLS`, then `QUIT`.
+A server that offers FTPS lists `AUTH TLS` in `FEAT` and answers `AUTH TLS`
+with `234`. Then set `explicit`, watch one download (a `does not offer AUTH
+TLS` warning means it fell back), and move to `required`.
+
+**NetworkPolicy.** FTPS uses the same ports as plain FTP (control port 21 and
+the server's passive data ports), so nothing about egress changes. Passive
+FTP opens its data connection to a port the
 server picks. With the chart's default (no `networkPolicy.egress.internetPorts`)
 nothing is needed. If production limits `internetPorts`, also set
 `networkPolicy.components.poller-transit-schedule.internetPorts: []` (every

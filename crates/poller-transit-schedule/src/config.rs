@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use clap::Parser;
 
+use crate::adapter::ftp::FtpSecurity;
+
 /// CLI/env configuration for `poller-transit-schedule` (transit spec §6,
 /// §13.1): one process per network. Every URL but TNDS's is a public,
 /// key-free BODS or `NaPTAN` download (spec §3), so each has a working
@@ -65,6 +67,26 @@ pub(crate) struct Config {
         hide_env_values = true
     )]
     pub txc_password: String,
+
+    /// How an `ftp://` TXC URL is protected: `plain` (no TLS: the login
+    /// and the file cross the network in clear, as TNDS offered it),
+    /// `explicit` (FTPS via `AUTH TLS`, falling back to plain FTP only if
+    /// the server answers 5xx) or `required` (FTPS or an error, before the
+    /// login is sent). Both connections are TLS, and the certificate is
+    /// verified. `plain` until the provider is confirmed to offer FTPS.
+    #[arg(
+        long,
+        env = "TRANSIT_TXC_FTP_SECURITY",
+        value_enum,
+        default_value_t = FtpSecurity::Plain
+    )]
+    pub txc_ftp_security: FtpSecurity,
+
+    /// A PEM file of extra CA certificates to trust for the FTPS server
+    /// (added to the system's roots; verification is never skipped). Empty
+    /// for none.
+    #[arg(long, env = "TRANSIT_TXC_FTP_CA_FILE", default_value = "")]
+    pub txc_ftp_ca_file_path: String,
 
     /// The BODS SIRI-SX bulk archive (a 302 to a signed URL).
     #[arg(
@@ -169,6 +191,13 @@ impl Config {
     /// Whether the TXC source is TNDS-style FTP (and so needs the login).
     pub(crate) fn txc_over_ftp(&self) -> bool {
         self.txc_url.starts_with("ftp://")
+    }
+
+    /// The extra FTPS CA bundle, if one is set.
+    pub(crate) fn txc_ftp_ca_file(&self) -> Option<PathBuf> {
+        Some(&self.txc_ftp_ca_file_path)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
     }
 
     /// The checks that need the network file (NET design §5, §6): the
@@ -287,6 +316,8 @@ impl std::fmt::Debug for Config {
                     "<redacted>"
                 },
             )
+            .field("txc_ftp_security", &self.txc_ftp_security)
+            .field("txc_ftp_ca_file_path", &self.txc_ftp_ca_file_path)
             .field("situations_url", &self.situations_url)
             .field("naptan_url", &self.naptan_url)
             .field("timetable_interval_secs", &self.timetable_interval_secs)
@@ -344,6 +375,32 @@ mod tests {
         let txc = Config::try_parse_from(["p", "--network", "net", "--adapter", "txc"]).unwrap();
         assert_eq!(txc.txc_url, "ftp://ftp.tnds.co.uk/EM.zip");
         assert_eq!(txc.txc_max_bytes, 419_430_400);
+        assert_eq!(
+            txc.txc_ftp_security,
+            FtpSecurity::Plain,
+            "plain FTP until the provider is confirmed to offer FTPS"
+        );
+        assert_eq!(txc.txc_ftp_ca_file(), None);
+        let required = Config::try_parse_from([
+            "p",
+            "--network",
+            "net",
+            "--adapter",
+            "txc",
+            "--txc-ftp-security",
+            "required",
+            "--txc-ftp-ca-file-path",
+            "/ca/tnds.pem",
+        ])
+        .unwrap();
+        assert_eq!(required.txc_ftp_security, FtpSecurity::Required);
+        assert_eq!(
+            required.txc_ftp_ca_file(),
+            Some(PathBuf::from("/ca/tnds.pem"))
+        );
+        assert!(
+            Config::try_parse_from(["p", "--network", "net", "--txc-ftp-security", "tls"]).is_err()
+        );
         assert!(
             Config::try_parse_from(["p", "--network", "metrolink", "--horizon-days", "0"]).is_err()
         );
