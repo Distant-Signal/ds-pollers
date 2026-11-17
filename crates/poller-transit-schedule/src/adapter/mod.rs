@@ -13,7 +13,7 @@ pub(crate) mod sirisx;
 pub(crate) mod txc;
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio::io::AsyncWriteExt;
 
@@ -101,10 +101,59 @@ impl<R: Read> Read for CappedReader<R> {
     }
 }
 
+/// Where a download to `path` is written until it is complete
+/// (`feed.zip.part`).
+pub(crate) fn part_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".part");
+    PathBuf::from(name)
+}
+
+/// Finishes a download written to `part` ([`part_path`]): a complete one is
+/// renamed to `path`; after a failed one neither file is left behind (a
+/// partial feed can be most of 159 MB).
+pub(crate) async fn finish_download(
+    result: Result<u64, FeedError>,
+    part: &Path,
+    path: &Path,
+) -> Result<u64, FeedError> {
+    match result {
+        Ok(bytes) => match tokio::fs::rename(part, path).await {
+            Ok(()) => Ok(bytes),
+            Err(err) => {
+                let _ = tokio::fs::remove_file(part).await;
+                Err(FeedError::Io(format!(
+                    "moving {} into place: {err}",
+                    part.display()
+                )))
+            }
+        },
+        Err(err) => {
+            let _ = tokio::fs::remove_file(part).await;
+            let _ = tokio::fs::remove_file(path).await;
+            Err(err)
+        }
+    }
+}
+
 /// Downloads `url` to `path` (a zip needs a seekable file), refusing a
 /// declared `Content-Length` over `max_bytes` before reading and aborting
-/// once the streamed body passes it. The bytes written.
+/// once the streamed body passes it. The bytes written; after a failure
+/// the partial file is deleted.
 pub(crate) async fn download_to_file(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<u64, FeedError> {
+    let result = fetch_to_file(client, url, path, max_bytes).await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    result
+}
+
+async fn fetch_to_file(
     client: &reqwest::Client,
     url: &str,
     path: &Path,
@@ -131,8 +180,6 @@ pub(crate) async fn download_to_file(
     while let Some(chunk) = response.chunk().await.map_err(|err| io(&err))? {
         written += chunk.len() as u64;
         if written > max_bytes {
-            drop(file);
-            let _ = tokio::fs::remove_file(path).await;
             return Err(FeedError::Oversize(format!(
                 "{url} (over {max_bytes} bytes while streaming)"
             )));
@@ -204,5 +251,56 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.reason(), "oversize", "{err}");
         assert!(!path.exists(), "a partial download is deleted");
+    }
+
+    #[tokio::test]
+    async fn a_body_cut_short_leaves_no_partial_file() {
+        // A Content-Length longer than the body: the stream fails part way.
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nPK partial")
+                .unwrap();
+            socket.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("feed.zip");
+        let err = download_to_file(
+            &reqwest::Client::new(),
+            &format!("http://{addr}/"),
+            &path,
+            1024,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.reason(), "fetch", "{err}");
+        assert!(!path.exists(), "a partial download is deleted");
+    }
+
+    #[tokio::test]
+    async fn a_download_lands_under_its_name_only_when_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("feed.zip");
+        let part = part_path(&path);
+        assert_eq!(part, dir.path().join("feed.zip.part"));
+
+        std::fs::write(&part, b"whole").unwrap();
+        assert_eq!(finish_download(Ok(5), &part, &path).await.unwrap(), 5);
+        assert_eq!(std::fs::read(&path).unwrap(), b"whole");
+        assert!(!part.exists());
+
+        // A failure leaves neither the part nor an older feed behind.
+        std::fs::write(&part, b"wh").unwrap();
+        let err = finish_download(Err(FeedError::Io("cut".to_owned())), &part, &path)
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason(), "fetch");
+        assert!(!part.exists());
+        assert!(!path.exists());
     }
 }

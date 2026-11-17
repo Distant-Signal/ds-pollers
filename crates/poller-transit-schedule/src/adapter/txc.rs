@@ -19,10 +19,11 @@
 //! 4. **Dates.** The journey's operating profile (else its pattern's, else
 //!    its service's), expanded from yesterday to today plus the horizon,
 //!    inside the service's `OperatingPeriod`; a later document of the same
-//!    `ServiceCode` takes over from its start date. With the network's
-//!    `override_rule = "narrowest-period"` (`TfL`), a line runs on each date
-//!    only the journeys of its active document with the shortest
-//!    `OperatingPeriod` ([`override_winners`]). A journey's
+//!    `ServiceCode` takes over for its own period (to its end date, so a
+//!    bounded one only carves out its dates; [`service_periods`]). With
+//!    the network's `override_rule = "narrowest-period"` (`TfL`), a line
+//!    runs on each date only the journeys of its active document with the
+//!    shortest `OperatingPeriod` ([`override_winners`]). A journey's
 //!    `DepartureDayShift` adds whole days to its times, not its dates.
 //! 5. **Folding**, as GTFS: patterns by (line, direction, calls), service
 //!    ids by date set, each line's station order.
@@ -937,9 +938,13 @@ fn doc_head(
     })
 }
 
-/// The days each document serves each of its services on: from its
-/// `OperatingPeriod` start, to its end or the day before a later
-/// document of the same `ServiceCode` starts (a new timetable takes over).
+/// The days each document serves each of its services on: its
+/// `OperatingPeriod`, less the periods of every later document of the same
+/// `ServiceCode` with a later start: a new timetable takes over for its own
+/// period. An open-ended new timetable ends the older one for good; a
+/// bounded one (a Christmas timetable) only carves out its dates, and the
+/// older one resumes after. A later revision with the same start replaces
+/// the older one outright, whatever its end.
 /// Keyed by (document index, service code).
 fn service_periods(docs: &[DocHead]) -> ServicePeriods {
     let mut by_code: BTreeMap<String, Vec<(NaiveDate, String, usize, NaiveDate)>> = BTreeMap::new();
@@ -957,14 +962,60 @@ fn service_periods(docs: &[DocHead]) -> ServicePeriods {
     for (code, mut versions) in by_code {
         versions.sort();
         for (n, (start, _, doc, end)) in versions.iter().enumerate() {
-            let end = match versions.get(n + 1) {
-                Some((next, ..)) => (*end).min(next.pred_opt().unwrap_or(NaiveDate::MIN)),
-                None => *end,
-            };
-            out.insert((*doc, code.clone()), (*start, end));
+            // A later revision with the same start replaces this one
+            // outright (a re-registration that ends sooner must not
+            // bring the old one back after its end).
+            let later: Vec<(NaiveDate, NaiveDate)> = versions[n + 1..]
+                .iter()
+                .map(|(from, _, _, to)| {
+                    if from == start {
+                        (*from, NaiveDate::MAX)
+                    } else {
+                        (*from, *to)
+                    }
+                })
+                .collect();
+            out.insert((*doc, code.clone()), subtract((*start, *end), &later));
         }
     }
     out
+}
+
+/// `range` (both ends inclusive) less every range in `cut`, as the
+/// disjoint ranges left, in order.
+fn subtract(
+    range: (NaiveDate, NaiveDate),
+    cut: &[(NaiveDate, NaiveDate)],
+) -> Vec<(NaiveDate, NaiveDate)> {
+    let mut left = if range.0 <= range.1 {
+        vec![range]
+    } else {
+        Vec::new()
+    };
+    for &(from, to) in cut {
+        if from > to {
+            continue;
+        }
+        let mut next = Vec::with_capacity(left.len() + 1);
+        for (a, b) in left {
+            if to < a || b < from {
+                next.push((a, b));
+                continue;
+            }
+            if a < from
+                && let Some(before) = from.pred_opt()
+            {
+                next.push((a, before));
+            }
+            if to < b
+                && let Some(after) = to.succ_opt()
+            {
+                next.push((after, b));
+            }
+        }
+        left = next;
+    }
+    left
 }
 
 /// Which (document, service code) runs each line on each date under the
@@ -986,7 +1037,7 @@ fn override_winners(
     let mut best: HashMap<(usize, NaiveDate), (Rank<'_>, usize, &str)> = HashMap::new();
     for (i, doc) in docs.iter().enumerate() {
         for service in &doc.services {
-            let Some(&(from, to)) = periods.get(&(i, service.code.clone())) else {
+            let Some(ranges) = periods.get(&(i, service.code.clone())) else {
                 continue;
             };
             let width = (service.period.1 - service.period.0).num_days();
@@ -996,22 +1047,24 @@ fn override_winners(
                 std::cmp::Reverse(doc.revision.as_str()),
                 std::cmp::Reverse(doc.entry.as_str()),
             );
-            let mut day = from.max(window.0);
-            let last = to.min(window.1);
-            while day <= last {
-                if service.days[day.weekday().num_days_from_monday() as usize] {
-                    for kind in &service.lines {
-                        let RouteKind::Line(line) = *kind else {
-                            continue;
-                        };
-                        let slot = best.entry((line, day)).or_insert((rank, i, &service.code));
-                        if rank < slot.0 {
-                            *slot = (rank, i, &service.code);
+            for &(from, to) in ranges {
+                let mut day = from.max(window.0);
+                let last = to.min(window.1);
+                while day <= last {
+                    if service.days[day.weekday().num_days_from_monday() as usize] {
+                        for kind in &service.lines {
+                            let RouteKind::Line(line) = *kind else {
+                                continue;
+                            };
+                            let slot = best.entry((line, day)).or_insert((rank, i, &service.code));
+                            if rank < slot.0 {
+                                *slot = (rank, i, &service.code);
+                            }
                         }
                     }
+                    let Some(next) = day.succ_opt() else { break };
+                    day = next;
                 }
-                let Some(next) = day.succ_opt() else { break };
-                day = next;
             }
         }
     }
@@ -1049,8 +1102,9 @@ fn route_kind(network: &NetworkConfig, name: &str) -> Result<RouteKind, FeedErro
     }
 }
 
-/// The first and last day each (document, service code) serves.
-type ServicePeriods = HashMap<(usize, String), (NaiveDate, NaiveDate)>;
+/// The ranges of days (first and last, in order) each (document, service
+/// code) serves.
+type ServicePeriods = HashMap<(usize, String), Vec<(NaiveDate, NaiveDate)>>;
 
 /// A journey pattern of a document, read.
 struct Pattern<'a> {
@@ -1066,7 +1120,7 @@ struct Service<'a> {
     only_line: Option<RouteKind>,
     patterns: HashMap<&'a str, Pattern<'a>>,
     profile: Option<&'a Node>,
-    period: (NaiveDate, NaiveDate),
+    periods: &'a [(NaiveDate, NaiveDate)],
 }
 
 /// A pattern's identity: line, direction and calls (platform, arrival
@@ -1198,7 +1252,7 @@ fn journeys(
                 },
             );
         }
-        let Some(period) = periods.get(&(doc_index, code.to_owned())).copied() else {
+        let Some(service_periods) = periods.get(&(doc_index, code.to_owned())) else {
             continue;
         };
         services.insert(
@@ -1208,7 +1262,7 @@ fn journeys(
                 only_line,
                 patterns,
                 profile: service.child("OperatingProfile"),
-                period,
+                periods: service_periods,
             },
         );
     }
@@ -1374,13 +1428,14 @@ fn journeys(
             .map(read_profile)
             .transpose()?
             .unwrap_or_default();
-        let from = window.0.max(service.period.0);
-        let to = window.1.min(service.period.1);
-        let mut dates = if from <= to {
-            expand(&profile, from, to, calendar)
-        } else {
-            BTreeSet::new()
-        };
+        let mut dates = BTreeSet::new();
+        for &(start, end) in service.periods {
+            let from = window.0.max(start);
+            let to = window.1.min(end);
+            if from <= to {
+                dates.extend(expand(&profile, from, to, calendar));
+            }
+        }
         if let (Some(winners), RouteKind::Line(line)) = (winners, route) {
             dates.retain(|day| {
                 winners
@@ -1967,6 +2022,156 @@ mod tests {
             model.source_feed_version.as_deref(),
             Some("20270201_000000")
         );
+    }
+
+    #[test]
+    fn a_bounded_later_version_carves_out_its_dates_and_the_base_resumes() {
+        // A Christmas-style version of service 1, 2027-03-10 to 2027-03-15:
+        // the base runs before and after it, the version only within it.
+        let christmas = FIXTURE
+            .replace(
+                "ModificationDateTime=\"2026-10-20T10:15:00\"",
+                "ModificationDateTime=\"2027-02-01T00:00:00\"",
+            )
+            .replace(
+                "<StartDate>2026-10-01</StartDate><EndDate>2027-03-31</EndDate>",
+                "<StartDate>2027-03-10</StartDate><EndDate>2027-03-15</EndDate>",
+            );
+        let bytes = zip(&[("a.xml", FIXTURE), ("b.xml", &christmas)]);
+        let model = parse(Cursor::new(bytes), &net(), &options("2027-03-01")).unwrap();
+        let base = dates(&model, "EM_NE_NET1:VJ2");
+        let (from, to) = (date("2027-03-10"), date("2027-03-15"));
+        assert!(base.iter().all(|d| *d < from || to < *d), "{base:?}");
+        assert!(base.iter().any(|d| *d < from), "{base:?}");
+        assert!(base.iter().any(|d| *d > to), "the base resumes: {base:?}");
+        assert_eq!(base.last(), Some(&date("2027-03-31")));
+        let special = dates(&model, "EM_NE_NET1:VJ2:2");
+        assert!(!special.is_empty());
+        assert!(
+            special.iter().all(|d| from <= *d && *d <= to),
+            "{special:?}"
+        );
+    }
+
+    #[test]
+    fn later_versions_subtract_from_a_period() {
+        let r = |a: &str, b: &str| (date(a), date(b));
+        let base = r("2026-12-01", "2027-01-31");
+        // A bounded cut in the middle leaves both sides.
+        assert_eq!(
+            subtract(base, &[r("2026-12-20", "2027-01-03")]),
+            [r("2026-12-01", "2026-12-19"), r("2027-01-04", "2027-01-31")]
+        );
+        // An open-ended later version ends it for good.
+        assert_eq!(
+            subtract(base, &[(date("2027-01-10"), NaiveDate::MAX)]),
+            [r("2026-12-01", "2027-01-09")]
+        );
+        // A cut over the whole range, or one outside it.
+        let none: [(NaiveDate, NaiveDate); 0] = [];
+        assert_eq!(subtract(base, &[r("2026-11-01", "2027-02-01")]), none);
+        assert_eq!(subtract(base, &[r("2027-03-01", "2027-03-02")]), [base]);
+        // Two cuts, and an empty base.
+        assert_eq!(
+            subtract(
+                base,
+                &[r("2026-12-01", "2026-12-05"), r("2027-01-31", "2027-01-31")]
+            ),
+            [r("2026-12-06", "2027-01-30")]
+        );
+        assert_eq!(subtract(r("2027-01-02", "2027-01-01"), &[]), none);
+        // Open ends stay open.
+        assert_eq!(
+            subtract(
+                (NaiveDate::MIN, NaiveDate::MAX),
+                &[r("2027-01-01", "2027-01-02")]
+            ),
+            [
+                (NaiveDate::MIN, date("2026-12-31")),
+                (date("2027-01-03"), NaiveDate::MAX)
+            ]
+        );
+    }
+
+    #[test]
+    fn service_periods_of_overlapping_same_day_and_open_versions() {
+        let r = |a: &str, b: &str| (date(a), date(b));
+        let head = |revision: &str, period: (NaiveDate, NaiveDate)| DocHead {
+            entry: format!("{revision}.xml"),
+            revision: revision.to_owned(),
+            services: vec![ServiceHead {
+                code: "S".to_owned(),
+                lines: Vec::new(),
+                period,
+                days: [true; 7],
+            }],
+        };
+        let of = |docs: &[DocHead], doc: usize| {
+            service_periods(docs)
+                .remove(&(doc, "S".to_owned()))
+                .unwrap()
+        };
+        let none: [(NaiveDate, NaiveDate); 0] = [];
+
+        // An open base, then two overlapping bounded versions: each serves
+        // its own dates less the later one's, and the base resumes after.
+        let docs = [
+            head("1", (date("2026-12-01"), NaiveDate::MAX)),
+            head("2", r("2026-12-20", "2027-01-03")),
+            head("3", r("2026-12-28", "2027-01-10")),
+        ];
+        assert_eq!(
+            of(&docs, 0),
+            [
+                r("2026-12-01", "2026-12-19"),
+                (date("2027-01-11"), NaiveDate::MAX)
+            ]
+        );
+        assert_eq!(of(&docs, 1), [r("2026-12-20", "2026-12-27")]);
+        assert_eq!(of(&docs, 2), [r("2026-12-28", "2027-01-10")]);
+
+        // Document order does not matter: the start date decides.
+        let shuffled = [
+            head("3", r("2026-12-28", "2027-01-10")),
+            head("1", (date("2026-12-01"), NaiveDate::MAX)),
+            head("2", r("2026-12-20", "2027-01-03")),
+        ];
+        assert_eq!(of(&shuffled, 1), of(&docs, 0));
+
+        // An open-ended later version ends the base for good, even under a
+        // bounded one in between.
+        let docs = [
+            head("1", (date("2026-12-01"), NaiveDate::MAX)),
+            head("2", r("2026-12-20", "2027-01-03")),
+            head("3", (date("2027-01-01"), NaiveDate::MAX)),
+        ];
+        assert_eq!(of(&docs, 0), [r("2026-12-01", "2026-12-19")]);
+        assert_eq!(of(&docs, 1), [r("2026-12-20", "2026-12-31")]);
+
+        // A later revision with the same start replaces the older one
+        // outright, even when it ends sooner: no older days come back.
+        let docs = [
+            head("2026-10-01T00:00:00", r("2026-12-01", "2027-03-31")),
+            head("2026-11-01T00:00:00", r("2026-12-01", "2027-01-31")),
+        ];
+        assert_eq!(of(&docs, 0), none);
+        assert_eq!(of(&docs, 1), [r("2026-12-01", "2027-01-31")]);
+
+        // Later versions covering the rest leave only the days before the
+        // first of them.
+        let docs = [
+            head("1", r("2026-12-10", "2026-12-20")),
+            head("2", r("2026-12-11", "2026-12-15")),
+            head("3", r("2026-12-16", "2026-12-20")),
+        ];
+        assert_eq!(of(&docs, 0), [r("2026-12-10", "2026-12-10")]);
+        // An inverted period serves nothing and cuts nothing.
+        let docs = [
+            head("1", r("2026-12-01", "2026-12-31")),
+            head("2", r("2026-12-20", "2026-12-10")),
+        ];
+        assert_eq!(of(&docs, 0), [r("2026-12-01", "2026-12-31")]);
+        assert_eq!(of(&docs, 1), none);
     }
 
     #[test]

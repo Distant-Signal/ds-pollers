@@ -15,7 +15,11 @@
 //!   daily schedule resumes from that commit.
 //!
 //! So a token is answered once, by its own commit, and later restarts with
-//! the same token change nothing: it never needs unsetting. The feed guard
+//! the same token change nothing: it never needs unsetting. Every commit
+//! sent while a token is configured carries it ([`commit_token`]), not
+//! just the forced one: the check reads only the newest commit, so a daily
+//! commit without the token would make the next restart see it as
+//! unanswered and download and republish the whole feed again. The feed guard
 //! still applies to a forced fetch: a refused feed publishes nothing, and
 //! the request stays unanswered until the next start.
 
@@ -43,6 +47,14 @@ pub(crate) async fn check_at_start(ctx: &Context) {
         .store(pending, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The `source.refresh` of a commit sent while `configured` is the
+/// configured token (empty for none). A commit only goes out once the
+/// token is answered or as its answer (a pending token forces the cycle),
+/// so every commit can carry it.
+pub(crate) fn commit_token(configured: &str) -> Option<&str> {
+    (!configured.is_empty()).then_some(configured)
+}
+
 /// Whether `requested` (the configured token, empty for none) still needs
 /// answering, given the token the newest commit on the stream answered.
 pub(crate) fn pending(requested: &str, answered: Option<&str>) -> bool {
@@ -63,5 +75,18 @@ mod tests {
         assert!(pending("2026-10-15", Some("2026-10-01")));
         // Already answered by the newest commit: not again.
         assert!(!pending("2026-10-15", Some("2026-10-15")));
+    }
+
+    #[test]
+    fn later_commits_keep_the_token_so_a_restart_does_not_refetch() {
+        assert_eq!(commit_token(""), None);
+        // The forced commit answers the token, and the next daily commit
+        // (not forced) carries it too: a restart after it is not pending.
+        let forced = commit_token("2026-10-15");
+        assert_eq!(forced, Some("2026-10-15"));
+        let daily = commit_token("2026-10-15");
+        assert!(!pending("2026-10-15", daily));
+        // A new token is still unanswered by those commits.
+        assert!(pending("2026-10-16", daily));
     }
 }

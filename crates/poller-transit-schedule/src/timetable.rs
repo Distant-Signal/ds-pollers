@@ -3,7 +3,8 @@
 //! 1. download the network's GTFS or `TransXChange` zip to the work dir
 //!    and parse it on the blocking pool ([`fetch_model`]);
 //! 2. apply the `NaPTAN` names (a failure is counted, never fatal);
-//! 3. the feed guard against the last commit on the stream;
+//! 3. the feed guard against the last commit on the stream (a feed with no
+//!    service today but some soon, as on Christmas Day, waits a day);
 //! 4. build the item (parts, then the commit) with the rail links;
 //! 5. skip it if the last commit has the same content and is under
 //!    [`SKIP_UNCHANGED_FOR`] old (a restart) and no refresh request is
@@ -19,7 +20,7 @@ use ds_runtime::metrics::metric_name;
 use crate::Context;
 use crate::adapter::gtfs::{self, GtfsOptions};
 use crate::adapter::txc::{self, TxcOptions};
-use crate::adapter::{FeedError, download_to_file, ftp};
+use crate::adapter::{FeedError, download_to_file, finish_download, ftp, part_path};
 use crate::model::TransitModel;
 use crate::network::AdapterKind;
 use crate::{feed_guard, item, naptan, rail_links};
@@ -91,11 +92,14 @@ async fn download(ctx: &Context, path: &std::path::Path) -> Result<u64, FeedErro
     }
 }
 
-/// Downloads and parses the network's timetable with its adapter.
+/// Downloads and parses the network's timetable with its adapter. The
+/// download is written to `feed.zip.part` and renamed to `feed.zip` once
+/// complete, so a failed one never leaves a partial feed in the work dir.
 pub(crate) async fn fetch_model(ctx: &Context) -> Result<TransitModel, FeedError> {
     let path = ctx.config.work_dir.join("feed.zip");
+    let part = part_path(&path);
     let adapter = ctx.network.adapter;
-    let bytes = download(ctx, &path).await?;
+    let bytes = finish_download(download(ctx, &part).await, &part, &path).await?;
     #[expect(
         clippy::cast_precision_loss,
         reason = "a byte count far below 2^53"
@@ -221,6 +225,49 @@ pub(crate) async fn cursor(ctx: &Context) -> anyhow::Result<Option<DateTime<Utc>
     )
 }
 
+/// The feed guard: whether to send the timetable now (`false`: hold it
+/// back for a day), or the refusal.
+fn guard(
+    ctx: &Context,
+    model: &TransitModel,
+    counts: common::transit::TimetableCounts,
+    last: Option<&Baseline>,
+    today: chrono::NaiveDate,
+) -> anyhow::Result<bool> {
+    match feed_guard::check(
+        model,
+        counts,
+        last.map(|b| b.commit.counts),
+        today,
+        ctx.config.feed_max_drop_fraction,
+    ) {
+        Ok(feed_guard::Verdict::Publish) => Ok(true),
+        Ok(feed_guard::Verdict::NoServiceUntil(day)) => {
+            // A day without service (Christmas Day): the writer refuses a
+            // commit with no service on its day, so hold the feed back
+            // until the next daily cycle, without a refusal or an alert.
+            tracing::info!(
+                network = %ctx.network.id,
+                %today,
+                next_service = %day,
+                "no service today in the timetable; not sending it until a day with service"
+            );
+            Ok(false)
+        }
+        Err(refusal) => {
+            count(ctx, FEED_REFUSED, [("reason", refusal.reason())]);
+            // A refusal of the data itself: the same feed is refused again,
+            // so the loop waits a whole interval instead of re-downloading it
+            // on the failed-cycle backoff, and a once-mode run exits 3 (its
+            // Job fails without retrying; common::poller_loop).
+            Err(anyhow::Error::new(common::ingest::DataRejected(format!(
+                "network {}: the timetable was refused ({refusal}); the previous version stays active",
+                ctx.network.id
+            ))))
+        }
+    }
+}
+
 /// One timetable cycle.
 pub(crate) async fn poll_once(ctx: &Context) -> anyhow::Result<()> {
     let produced_at = Utc::now();
@@ -240,22 +287,8 @@ pub(crate) async fn poll_once(ctx: &Context) -> anyhow::Result<()> {
     let counts = feed_guard::counts(&model);
     let last = baseline(ctx).await;
     let today = common::transit::service_date(produced_at);
-    if let Err(refusal) = feed_guard::check(
-        &model,
-        counts,
-        last.as_ref().map(|b| b.commit.counts),
-        today,
-        ctx.config.feed_max_drop_fraction,
-    ) {
-        count(ctx, FEED_REFUSED, [("reason", refusal.reason())]);
-        // A refusal of the data itself: the same feed is refused again, so
-        // the loop waits a whole interval instead of re-downloading it on the
-        // failed-cycle backoff, and a once-mode run exits 3 (its Job fails
-        // without retrying; common::poller_loop).
-        return Err(anyhow::Error::new(common::ingest::DataRejected(format!(
-            "network {}: the timetable was refused ({refusal}); the previous version stays active",
-            ctx.network.id
-        ))));
+    if !guard(ctx, &model, counts, last.as_ref(), today)? {
+        return Ok(());
     }
     for (kind, rows) in [
         ("lines", counts.lines),
@@ -269,7 +302,8 @@ pub(crate) async fn poll_once(ctx: &Context) -> anyhow::Result<()> {
     }
 
     // An unanswered refresh request (crate::refresh): publish even an
-    // unchanged feed, and say which request this commit answers.
+    // unchanged feed. Every commit names the configured request, so the
+    // newest one shows it answered at the next start.
     let forced = ctx.refresh_pending.load(Ordering::Relaxed);
     let built = item::build(
         &ctx.network,
@@ -280,7 +314,7 @@ pub(crate) async fn poll_once(ctx: &Context) -> anyhow::Result<()> {
         produced_at,
         item::SourceTag {
             url_kind: ctx.network.adapter.as_str(),
-            refresh: forced.then_some(ctx.config.timetable_refresh.as_str()),
+            refresh: crate::refresh::commit_token(&ctx.config.timetable_refresh),
         },
     )?;
     if let Some(last) = last.as_ref().filter(|_| !forced) {

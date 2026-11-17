@@ -314,11 +314,7 @@ pub(crate) fn parse<R: Read + Seek>(
         Ok(())
     })?;
 
-    // 4. Stops.
-    let used: BTreeSet<&str> = stop_names.iter().map(String::as_str).collect();
-    let stops = read_stops(&mut archive, cap, &used, network)?;
-
-    // 5. Service dates.
+    // 5. Service dates (before the stops, which only live trips need).
     let from = options
         .today
         .checked_sub_days(Days::new(1))
@@ -339,6 +335,15 @@ pub(crate) fn parse<R: Read + Seek>(
             trip_calls.clear();
         }
     }
+
+    // 4. Stops: those the live trips call at. A stop only expired trips use
+    // is neither published nor required in stops.txt.
+    let used: BTreeSet<&str> = calls
+        .iter()
+        .flatten()
+        .map(|call| stop_names[call.stop as usize].as_str())
+        .collect();
+    let stops = read_stops(&mut archive, cap, &used, network)?;
 
     let mut source_feed_version = None;
     each_row(&mut archive, "feed_info.txt", cap, |cols, rec| {
@@ -1018,6 +1023,59 @@ mod tests {
             .map(|s| s.service_id.as_str())
             .collect();
         assert_eq!(services, ["S"]);
+    }
+
+    #[test]
+    fn stops_only_expired_trips_call_at_are_neither_published_nor_required() {
+        // OLD's trip calls at Ddd (in stops.txt) and at a platform stops.txt
+        // no longer has: neither is published, and the feed still parses.
+        let calendar = format!("{CALENDAR}OLD,1,1,1,1,1,1,1,20260901,20261010\n");
+        let stops = format!(
+            "{STOPS}9400ZZMADDD1,Ddd (Manchester Metrolink),53.3,-2.3,0,940GZZMADDD\n\
+             940GZZMADDD,Ddd (Manchester Metrolink),53.3,-2.3,1,\n"
+        );
+        let stop_times = format!(
+            "{STOP_TIMES}\
+             T3,09:00:00,09:00:00,9400ZZMADDD1,1,0,1\n\
+             T3,09:20:00,09:20:00,9400ZZMAGONE1,2,1,0\n"
+        );
+        let bytes = zip(&[
+            ("agency.txt", AGENCY),
+            ("routes.txt", ROUTES),
+            (
+                "trips.txt",
+                "route_id,service_id,trip_id,trip_headsign,direction_id\n\
+                 R1,S,T1,,0\nR1,S,T2,,0\nR1,OLD,T3,,0\n",
+            ),
+            ("stop_times.txt", &stop_times),
+            ("stops.txt", &stops),
+            ("calendar.txt", &calendar),
+        ]);
+        let model = parse(Cursor::new(bytes), &metrolink(), &options("2026-10-15")).unwrap();
+        let ids: Vec<&str> = model.stops.iter().map(|s| s.stop_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["9400ZZMAAAA", "9400ZZMABBB", "9400ZZMAAAA1", "9400ZZMABBB1"]
+        );
+        // A live trip's stop missing from stops.txt is still malformed.
+        let live = stop_times.replace("T3,09:20", "T2,10:30").replace(
+            "T2,10:30:00,09:20:00,9400ZZMAGONE1,2",
+            "T2,10:30:00,10:30:00,9400ZZMAGONE1,3",
+        );
+        let bytes = zip(&[
+            ("agency.txt", AGENCY),
+            ("routes.txt", ROUTES),
+            (
+                "trips.txt",
+                "route_id,service_id,trip_id,trip_headsign,direction_id\n\
+                 R1,S,T1,,0\nR1,S,T2,,0\nR1,OLD,T3,,0\n",
+            ),
+            ("stop_times.txt", &live),
+            ("stops.txt", &stops),
+            ("calendar.txt", &calendar),
+        ]);
+        let err = parse(Cursor::new(bytes), &metrolink(), &options("2026-10-15")).unwrap_err();
+        assert!(err.to_string().contains("9400ZZMAGONE1"), "{err}");
     }
 
     #[test]

@@ -154,7 +154,8 @@ fn feed_version(source: Option<&str>, sha: &str) -> String {
 pub(crate) struct SourceTag<'a> {
     /// `bods-gtfs` (or the fallback's kind).
     pub url_kind: &'a str,
-    /// The refresh request this item answers, when forced.
+    /// The configured refresh request, answered by this item or an earlier
+    /// one ([`crate::refresh::commit_token`]).
     pub refresh: Option<&'a str>,
 }
 
