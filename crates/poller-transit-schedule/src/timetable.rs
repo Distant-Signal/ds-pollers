@@ -77,9 +77,14 @@ async fn download(ctx: &Context, path: &std::path::Path) -> Result<u64, FeedErro
                 user: config.txc_username.clone(),
                 password: config.txc_password.clone(),
             };
+            let security = ftp::Security {
+                mode: config.txc_ftp_security,
+                ca_file: config.txc_ftp_ca_file(),
+            };
             ftp::download_to_file(
                 &config.txc_url,
                 &login,
+                &security,
                 path,
                 config.txc_max_bytes,
                 crate::REQUEST_TIMEOUT,

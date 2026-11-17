@@ -1,0 +1,5 @@
+TEST FIXTURES ONLY. A throwaway CA and a server certificate for
+`localhost`, with its private key, used by the in-process fake FTPS server
+in ../ftp.rs's tests. The key guards nothing and is only ever loaded under
+cfg(test). Generated with openssl (EC P-256, valid 100 years): ca.pem is
+CA:TRUE pathlen 0; server.pem is CA:FALSE, serverAuth, SAN DNS:localhost only.
