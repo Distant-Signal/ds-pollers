@@ -295,10 +295,12 @@ the pod's `env` does it):
 
 With TLS on, `PBSZ 0` and `PROT P` follow the login, so the data connection
 is TLS too, and it resumes the control connection's TLS session (servers
-that demand session reuse accept it). The certificate is checked against
+that demand session reuse accept it). A data connection that ends without a
+TLS `close_notify` is accepted only if the `226` follows and the bytes equal
+the `SIZE` the server gave; with no `SIZE` the download fails. The certificate is checked against
 the system's roots for the URL's host name; verification cannot be switched
 off. `TRANSIT_TXC_FTP_CA_FILE` (the path of a PEM file, empty by default)
-adds CA certificates to trust, for a provider whose certificate is from a
+adds CA certificates to trust (on top of the system's roots, not instead of them), for a provider whose certificate is from a
 private or unlisted CA. `explicit` only guards against a passive listener,
 because a network attacker can forge the 5xx that triggers its fallback: use
 `required` once the provider is known to offer FTPS. Plain FTP's login is a

@@ -26,9 +26,10 @@
 //! TLS session: both connections share one rustls `ClientConfig`, whose
 //! session store resumes by server name (a TLS 1.3 ticket, or a TLS 1.2
 //! session id or ticket). A server that ends the data connection without a
-//! TLS `close_notify` (common) is accepted when the transfer reply says it
-//! completed, unless the `SIZE` the server gave disagrees with the bytes
-//! received.
+//! TLS `close_notify` (common) is accepted only when the transfer reply
+//! says it completed and the bytes received equal the `SIZE` the server
+//! gave; with no `SIZE` it is an error (a forged close could truncate the
+//! file undetected).
 //!
 //! The server certificate is verified against the system's roots, plus the
 //! PEM bundle at `TRANSIT_TXC_FTP_CA_FILE` when set (for a provider whose
@@ -592,19 +593,27 @@ async fn fetch(
     loop {
         let n = match data.read(&mut buf).await {
             Ok(n) => n,
-            // A TLS peer closing without `close_notify` is common; the
-            // `226` below and the size check stand in for it.
-            Err(err) if tls_data && err.kind() == ErrorKind::UnexpectedEof => {
-                if let Some(size) = expected
-                    && written != size
-                {
+            // A TLS peer closing without `close_notify` is common, and an
+            // attacker can also forge it to truncate the file: the `226`
+            // (on the authenticated control connection) and the byte count
+            // against `SIZE` stand in for it. Without a `SIZE` there is
+            // nothing to check the count against, so it fails closed.
+            Err(err) if tls_data && err.kind() == ErrorKind::UnexpectedEof => match expected {
+                Some(size) if written == size => 0,
+                Some(size) => {
                     return Err(io(
                         &target.host,
                         format!("the data connection ended at {written} of {size} bytes"),
                     ));
                 }
-                0
-            }
+                None => {
+                    return Err(io(
+                        &target.host,
+                        "the data connection ended without a TLS close_notify and the server \
+                         gave no SIZE to check the file against",
+                    ));
+                }
+            },
             Err(err) => return Err(io(&target.host, format!("reading the file: {err}"))),
         };
         if n == 0 {
@@ -1107,6 +1116,27 @@ mod tests {
         .await;
         assert_eq!(run.result.unwrap(), 12);
         assert_eq!(run.bytes, b"PK zip bytes");
+    }
+
+    #[tokio::test]
+    async fn an_unclean_tls_close_without_a_size_fails_closed() {
+        let fake = Fake {
+            tls: Some(Versions::Tls13),
+            unclean_close: true,
+            size: false,
+            ..Fake::default()
+        };
+        let run = run(
+            fake,
+            "localhost",
+            &security(FtpSecurity::Required, true),
+            "secret",
+            1024,
+        )
+        .await;
+        let err = run.result.unwrap_err().to_string();
+        assert!(err.contains("close_notify"), "{err}");
+        assert_eq!(run.bytes, [] as [u8; 0]);
     }
 
     #[tokio::test]
