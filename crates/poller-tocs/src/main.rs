@@ -57,7 +57,10 @@ async fn run() -> anyhow::Result<()> {
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let stream = stream_sink(&config)?;
-    // The producer is lazy: a Redis outage shows as failed cycles.
+    // The producer is lazy and `publish` only queues a snapshot, never
+    // waiting for Redis: a Redis outage does not fail a cycle
+    // (`poller_cycle_total` stays `success`). The newest snapshot stays
+    // queued and is retried until Redis is back.
     lifecycle.sink_connected();
     let cycle = || lifecycle.track(poll_once(&client, &config, &stream));
 
@@ -121,7 +124,7 @@ async fn fetch_tocs_xml(client: &Client, config: &Config) -> anyhow::Result<Stri
     // proven specifically for this product.
     let response = client
         .get(&config.rdm_tocs_base_url)
-        .header(RDM_AUTH_HEADER_NAME, &config.rdm_api_key)
+        .header(RDM_AUTH_HEADER_NAME, config.rdm_api_key.expose())
         .send()
         .await?
         .error_for_status()?;

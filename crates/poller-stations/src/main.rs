@@ -149,7 +149,7 @@ async fn fetch_stations_json(
     // working assumption used for `poller-incidents` (Task 3).
     let response = client
         .get(format!("{}/stations", config.rdm_stations_base_url))
-        .header(RDM_AUTH_HEADER_NAME, &config.rdm_api_key)
+        .header(RDM_AUTH_HEADER_NAME, config.rdm_api_key.expose())
         .send()
         .await?
         .error_for_status()?;

@@ -24,8 +24,10 @@ pub(crate) struct Config {
 
     /// RDM API key, sent via the `x-apikey` header (see
     /// `RDM_AUTH_HEADER_NAME` in `main.rs`).
-    #[arg(long, env)]
-    pub rdm_api_key: String,
+    /// A [`Secret`](ds_runtime::secret::Secret) with its environment value
+    /// hidden, so `--help` never prints the live key.
+    #[arg(long, env, hide_env_values = true)]
+    pub rdm_api_key: ds_runtime::secret::Secret,
 
     /// Postgres, as the `stations` role (required). Pool size and timeouts
     /// come from the shared `DATABASE_*` variables (`ds_runtime::pg`); the
@@ -139,6 +141,18 @@ mod tests {
                 .all(|arg| arg.get_env().is_none_or(|env| env != "INGEST_SINK")),
             "INGEST_SINK was removed in release D"
         );
+    }
+
+    /// `--help` printed `RDM_API_KEY`'s live value.
+    #[test]
+    fn help_hides_the_rdm_api_key() {
+        use clap::CommandFactory;
+        let command = Config::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "rdm_api_key")
+            .expect("rdm_api_key is an argument");
+        assert!(arg.is_hide_env_values_set());
     }
 
     #[test]

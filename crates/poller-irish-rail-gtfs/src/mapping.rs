@@ -35,7 +35,29 @@ use std::ops::RangeInclusive;
 use common::island_of_ireland::{
     IslandOfIrelandLineDefinition, IslandOfIrelandNetwork, IslandOfIrelandStation,
 };
-use gtfs_structures::{Gtfs, Stop};
+use gtfs_structures::{Gtfs, GtfsReader, Stop};
+
+/// Parses a downloaded GTFS zip the way this poller needs it.
+///
+/// - `read_shapes(false)`: [`map_feed`] never reads `shapes.txt`, which is
+///   most of the real feed (24.8 of 27.2 MB inflated, 2026-09-27), so
+///   parsing it only costs memory in a 768Mi pod.
+/// - `unkown_enum_as_default(true)` (the crate's spelling): a code the
+///   crate does not know (a new `location_type` or `wheelchair_boarding`,
+///   say) already parses as an `Unknown` variant, and this maps it to the
+///   spec's default afterwards, so nothing downstream ever sees one.
+///   [`map_feed`] reads none of these enums today; this keeps a future
+///   reader from tripping over one.
+pub(crate) fn parse_feed<R: std::io::Read + std::io::Seek>(
+    reader: R,
+) -> Result<Gtfs, gtfs_structures::Error> {
+    GtfsReader::default()
+        .read_shapes(false)
+        .unkown_enum_as_default(true)
+        .raw()
+        .read_from_reader(reader)
+        .and_then(Gtfs::try_from)
+}
 
 /// A data-quality problem found while mapping one feed. Each is counted in
 /// `distant_signal_gtfs_feed_issues_total{kind}` and summarised in one log
@@ -393,7 +415,7 @@ mod tests {
 
     /// Builds a GTFS feed in-memory from the given CSV rows (headers above)
     /// and round-trips it through a real zip, so these tests exercise the
-    /// same `Gtfs::from_reader` code path `main.rs` uses, not a hand-built
+    /// same [`parse_feed`] code path `main.rs` uses, not a hand-built
     /// `Gtfs` struct literal (whose exact field set could drift from what
     /// the crate actually requires).
     fn feed(stops: &str, routes: &str, trips: &str, stop_times: &str) -> Gtfs {
@@ -409,8 +431,6 @@ mod tests {
     /// [`feed`] with the caller's `agency.txt` and whole `routes.txt`
     /// (header included), for the colour and agency columns.
     fn feed_with(agency: &str, routes: &str, stops: &str, trips: &str, stop_times: &str) -> Gtfs {
-        use std::io::Write;
-
         let files: [(&str, String); 6] = [
             ("agency.txt", agency.to_owned()),
             ("stops.txt", format!("{STOPS_HEADER}{stops}")),
@@ -420,17 +440,64 @@ mod tests {
             ("calendar.txt", CALENDAR.to_owned()),
         ];
 
+        parse_feed(std::io::Cursor::new(zip_bytes(&files))).expect("parse test feed")
+    }
+
+    /// Zips the given `(name, contents)` files in memory.
+    fn zip_bytes(files: &[(&str, String)]) -> Vec<u8> {
+        use std::io::Write;
+
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
             let options = zip::write::SimpleFileOptions::default();
-            for (name, contents) in &files {
+            for (name, contents) in files {
                 zip.start_file(*name, options).unwrap();
                 zip.write_all(contents.as_bytes()).unwrap();
             }
             zip.finish().unwrap();
         }
-        Gtfs::from_reader(std::io::Cursor::new(buf)).expect("parse test feed")
+        buf
+    }
+
+    /// Codes the crate does not know (a new `location_type`,
+    /// `wheelchair_boarding` and `route_type`) still parse and map, and a
+    /// `shapes.txt` is not parsed at all: this one is malformed, so reading
+    /// it would fail the whole feed.
+    #[test]
+    fn parse_feed_tolerates_unknown_enums_and_skips_shapes() {
+        let files: [(&str, String); 7] = [
+            ("agency.txt", AGENCY.to_owned()),
+            (
+                "stops.txt",
+                "stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station,wheelchair_boarding\n\
+                 STOP_A,Zesttown,53.0,-6.0,9,,7\nSTOP_B,Zorough,53.1,-6.1,,,\n"
+                    .to_owned(),
+            ),
+            (
+                "routes.txt",
+                format!("{ROUTES_HEADER}ROUTE_1,IR,,Zesttown - Zorough,1999\n"),
+            ),
+            ("trips.txt", format!("{TRIPS_HEADER}ROUTE_1,WEEKDAY,TRIP_1\n")),
+            (
+                "stop_times.txt",
+                format!(
+                    "{STOP_TIMES_HEADER}TRIP_1,08:00:00,08:00:00,STOP_A,1\nTRIP_1,08:10:00,08:10:00,STOP_B,2\n"
+                ),
+            ),
+            ("calendar.txt", CALENDAR.to_owned()),
+            (
+                "shapes.txt",
+                "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\nS1,not-a-number,x,y\n"
+                    .to_owned(),
+            ),
+        ];
+        let gtfs = parse_feed(std::io::Cursor::new(zip_bytes(&files))).expect("parse feed");
+        assert!(gtfs.shapes.is_empty());
+        let mapped = map_feed(&gtfs);
+        assert_eq!(mapped.stations.len(), 2);
+        assert_eq!(mapped.lines.len(), 1);
+        assert_eq!(mapped.lines[0].stations, ["STOP_A", "STOP_B"]);
     }
 
     /// Two good stops on one route with one trip.
