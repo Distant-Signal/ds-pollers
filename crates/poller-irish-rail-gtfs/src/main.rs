@@ -36,10 +36,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// response (compromised upstream, DNS hijack, a misconfigured mirror)
 /// could OOM-kill this poller. The real feed is ~9 MB as of this writing
 /// (confirmed live: `curl -I` against `Config::gtfs_url`'s default reports
-/// `content-length: 9145817`). 200 MiB is roughly 20x that -- generous
+/// `content-length: 9145817`). the original 200 MiB was roughly 20x that -- generous
 /// enough to absorb years of feed growth, but bounded enough that an
 /// unbounded/hostile response can't exhaust this process's memory.
-const MAX_GTFS_ZIP_BYTES: u64 = 200 * 1024 * 1024;
+///
+/// **Lowered to 64 MiB (DS-534)**: still about 7x the real 9 MB feed, and
+/// the zip bytes sit in memory beside the parse in a 768Mi pod, so 200 MiB
+/// left too little room for the rest.
+const MAX_GTFS_ZIP_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Cumulative decompressed-bytes budget for [`reject_gtfs_zip_bomb`]'s
 /// bounded pre-scan of the downloaded GTFS zip -- see that function's own
@@ -60,7 +64,12 @@ const MAX_GTFS_ZIP_BYTES: u64 = 200 * 1024 * 1024;
 /// needs to grow. The budget counts every entry's inflated bytes, but
 /// `mapping::parse_feed` skips `shapes.txt`, so what is actually parsed
 /// into memory is far smaller than the budget on the real feed.
-const MAX_GTFS_INFLATED_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+///
+/// **Lowered to 128 MiB (DS-534)**: `shapes.txt` is no longer parsed, and
+/// 128 MiB is still about 5x the real 27.2 MB inflated feed (the pin test
+/// below requires at least 4x) while halving the worst case a passing zip
+/// can cost in the 768Mi pod.
+const MAX_GTFS_INFLATED_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
 
 /// **L15 (2026-09-26 review): `mapping::parse_feed` inflates every zip entry
 /// with no bound of its own.** [`MAX_GTFS_ZIP_BYTES`]/[`download_capped`]
@@ -106,7 +115,7 @@ const MAX_GTFS_INFLATED_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 /// Thin wrapper around [`reject_gtfs_zip_bomb_with_budget`], mirroring
 /// [`download_gtfs_zip`]/[`download_capped`]'s own split just below: real
 /// callers always use [`MAX_GTFS_INFLATED_BYTES`], while tests exercise the
-/// identical logic against a tiny budget (actually decompressing 256 MiB just
+/// identical logic against a tiny budget (actually decompressing 128 MiB just
 /// to prove the cap trips would make the test suite slow and memory-hungry
 /// for no extra coverage).
 fn reject_gtfs_zip_bomb(bytes: &[u8]) -> anyhow::Result<()> {
@@ -149,7 +158,7 @@ fn reject_gtfs_zip_bomb_with_budget(bytes: &[u8], max_inflated_bytes: u64) -> an
 /// Downloads `url`'s body with `MAX_GTFS_ZIP_BYTES` enforced. Thin wrapper
 /// around `download_capped` so production code always uses the real cap
 /// while tests can exercise the same logic against a small one (streaming
-/// 200 MiB just to prove the cap trips would make the test suite slow and
+/// 64 MiB just to prove the cap trips would make the test suite slow and
 /// memory-hungry for no extra coverage).
 async fn download_gtfs_zip(client: &Client, url: &str) -> anyhow::Result<Vec<u8>> {
     download_capped(client, url, MAX_GTFS_ZIP_BYTES).await
@@ -501,7 +510,7 @@ mod reject_gtfs_zip_bomb_tests {
     /// deliberately tiny test budget -- proving the pre-check catches an
     /// entry whose declared/actual decompressed size exceeds what's
     /// plausible, without this test needing to build anything close to the
-    /// real (256 MiB) production budget.
+    /// real (128 MiB) production budget.
     #[test]
     fn a_highly_compressed_bomb_entry_is_rejected() {
         let bomb_plaintext = vec![0u8; 64 * 1024];
