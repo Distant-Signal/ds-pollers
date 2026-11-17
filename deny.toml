@@ -25,15 +25,27 @@ ignore = [
     # sqlx-macros-core; we run Postgres and no RSA operation is reachable).
     # Re-read at the date: bump rsa when its dependents allow, else renew.
     { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 only via sqlx-mysql, which this repo never uses; patched only in rsa 0.10" }, # expires 2027-05-17
-    # zip 8.6.0, only via gtfs-structures (poller-irish-rail-gtfs), which
-    # still requires zip ^8.6 and only reads entries in memory: all four
-    # are in ZipArchive::extract(), which nothing calls. Fixed in zip 9,
-    # which our own crates use. The reasoning and the 2026-12-18 review
-    # date are in osv-scanner.toml (DS-58, DS-350).
+    # zip 8.6.0, only via gtfs-structures 0.50.1 (poller-irish-rail-gtfs,
+    # disabled in the chart by default), which still requires zip ^8.6.
+    # It compiles zip with `deflate` only and calls only ZipArchive::new,
+    # by_index and name. The advisories below are in APIs or features that
+    # are not compiled or never called by gtfs-structures 0.50.1 (zip 8,
+    # deflate only) or by our code; each reason says which. Fixed in zip 9,
+    # which our own crates use. Residual risk: the Irish Rail archive's
+    # size pre-check parses with zip 9 while the real parse uses zip 8, so
+    # a zip 8/9 parsing differential is theoretically possible. Mitigated
+    # by the 64 MiB compressed cap, the https-only fetch from a single
+    # transport-authority URL and the pod memory limit (768Mi). The
+    # reasoning and the 2026-12-18 review date are in osv-scanner.toml
+    # (DS-58, DS-350).
     { id = "RUSTSEC-2026-0367", reason = "zip 8 extract() only, never called; see osv-scanner.toml" }, # expires 2026-12-18
     { id = "RUSTSEC-2026-0368", reason = "zip 8 extract() only, never called; see osv-scanner.toml" }, # expires 2026-12-18
     { id = "RUSTSEC-2026-0369", reason = "zip 8 extract() only, never called; see osv-scanner.toml" }, # expires 2026-12-18
     { id = "RUSTSEC-2026-0429", reason = "zip 8 extract() only, never called; see osv-scanner.toml" }, # expires 2026-12-18
+    { id = "RUSTSEC-2026-0545", reason = "zip 8 aes-crypto feature not compiled (gtfs-structures enables deflate only); no decrypt API called; the feed is not encrypted" }, # expires 2026-12-18
+    { id = "RUSTSEC-2026-0546", reason = "zip 8 extract()/extract_unwrapped_root_dir only; never called, entries are read in memory" }, # expires 2026-12-18
+    { id = "RUSTSEC-2026-0547", reason = "zip 8 legacy-zip feature (Shrink/Reduce/Implode decoders) not compiled; unsupported methods return CompressionMethodNotSupported" }, # expires 2026-12-18
+    { id = "RUSTSEC-2026-0548", reason = "zip 8 ZipStreamReader/read_zipfile_from_stream only; never used, gtfs-structures reads via the seekable ZipArchive" }, # expires 2026-12-18
     # chrono and chrono-tz: informational "unmaintained" advisories
     # (RUSTSEC-2026-0543, RUSTSEC-2026-0555), not vulnerabilities. All
     # versions are affected and no patched release exists. chrono is a
