@@ -73,6 +73,7 @@ async fn run() -> anyhow::Result<()> {
     if config.metrics.metrics_enabled {
         ds_runtime::metrics::install(config.metrics_port)?;
     }
+    poller_http::register_metrics(&["incidents"], &["incidents"]);
     let sink = db_sink(&config, &progress, budget).await?;
     lifecycle.sink_connected();
     tracing::info!(

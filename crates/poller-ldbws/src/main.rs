@@ -147,6 +147,7 @@ async fn run() -> anyhow::Result<()> {
     // the first cycle.
     config.reads.connect(&progress).await?;
     let client = build_client()?;
+    poller_http::register_metrics(&["ldbws"], &["ldbws"]);
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     // `Rc<RefCell<_>>`, mirroring `poller-tfl`'s own `dlr_state` exactly
     // (see that crate's `main.rs` for the full reasoning) -- `run_poll_loop`'s

@@ -134,6 +134,7 @@ async fn run() -> anyhow::Result<()> {
         // few https-only redirects are allowed.
         .redirect(poller_http::https_redirects())
         .build()?;
+    poller_http::register_metrics(&["transit-schedule", "naptan", "transit-situations"], &[]);
     let ctx = Context {
         config,
         network,

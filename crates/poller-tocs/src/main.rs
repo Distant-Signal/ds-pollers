@@ -70,6 +70,7 @@ async fn run() -> anyhow::Result<()> {
     let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
     let once = common::poller_loop::RunOnce::from_env()?.is_some();
     let client = build_client()?;
+    poller_http::register_metrics(&["tocs"], &["tocs"]);
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let stream = stream_sink(&config)?;
     // The producer is lazy and `publish` only queues a snapshot, never

@@ -57,6 +57,7 @@ async fn run() -> anyhow::Result<()> {
         .user_agent(config::USER_AGENT)
         .redirect(poller_http::https_redirects())
         .build()?;
+    poller_http::register_metrics(&["nir-stations"], &["nir-stations"]);
     let redis = config
         .redis
         .client("the ingest stream")

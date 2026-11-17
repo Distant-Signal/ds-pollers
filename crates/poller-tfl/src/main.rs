@@ -217,6 +217,7 @@ async fn run() -> anyhow::Result<()> {
     if config.metrics.metrics_enabled {
         ds_runtime::metrics::install(config.metrics_port)?;
     }
+    poller_http::register_metrics(&["tfl"], &["tfl"]);
     // Each loop beats its own progress, so `/livez` sees one that hangs.
     // The daily jobs beat theirs before each TfL call too: their runs can
     // outlast the stall window (TfL's 429 waits), which the status loop's

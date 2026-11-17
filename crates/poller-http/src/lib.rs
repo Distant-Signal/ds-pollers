@@ -118,6 +118,28 @@ pub fn redirect_target_allowed(url: &Url) -> bool {
         .any(|suffix| host.ends_with(suffix))
 }
 
+/// Registers `upstream_redirect_refused_total` for each of `status_feeds`
+/// (the feeds that go through [`check_status`]) and
+/// `upstream_body_cap_exceeded_total` for each of `capped_feeds` (the feeds
+/// that go through [`read_capped`]) at 0, so `rate()` works before the
+/// first refusal. Call it once at startup.
+pub fn register_metrics(status_feeds: &[&'static str], capped_feeds: &[&'static str]) {
+    for feed in status_feeds {
+        metrics::counter!(
+            ds_runtime::metrics::metric_name("upstream_redirect_refused_total"),
+            "feed" => *feed
+        )
+        .increment(0);
+    }
+    for feed in capped_feeds {
+        metrics::counter!(
+            ds_runtime::metrics::metric_name("upstream_body_cap_exceeded_total"),
+            "feed" => *feed
+        )
+        .increment(0);
+    }
+}
+
 /// Fails on a non-success status, and says so plainly for a redirect that
 /// was not followed (never naming its `Location`). `feed` labels the log
 /// line and the `upstream_redirect_refused_total` metric.

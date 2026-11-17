@@ -118,6 +118,7 @@ async fn run() -> anyhow::Result<()> {
     let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
     let once = common::poller_loop::RunOnce::from_env()?.is_some();
     let client = build_client()?;
+    poller_http::register_metrics(&["irish-rail-live"], &["irish-rail-live"]);
     let redis = config
         .redis
         .client("the ingest stream")

@@ -36,7 +36,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// response (compromised upstream, DNS hijack, a misconfigured mirror)
 /// could OOM-kill this poller. The real feed is ~9 MB as of this writing
 /// (confirmed live: `curl -I` against `Config::gtfs_url`'s default reports
-/// `content-length: 9145817`). the original 200 MiB was roughly 20x that -- generous
+/// `content-length: 9145817`). The original 200 MiB was roughly 20x that -- generous
 /// enough to absorb years of feed growth, but bounded enough that an
 /// unbounded/hostile response can't exhaust this process's memory.
 ///
@@ -238,6 +238,7 @@ async fn run() -> anyhow::Result<()> {
     let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
     let once = common::poller_loop::RunOnce::from_env()?.is_some();
     let client = build_client()?;
+    poller_http::register_metrics(&["irish-rail-gtfs"], &[]);
     let redis = config
         .redis
         .client("the ingest stream")

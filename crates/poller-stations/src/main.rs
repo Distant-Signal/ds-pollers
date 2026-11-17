@@ -72,6 +72,7 @@ async fn run() -> anyhow::Result<()> {
     if config.metrics.metrics_enabled {
         ds_runtime::metrics::install(config.metrics_port)?;
     }
+    poller_http::register_metrics(&["stations"], &["stations"]);
     let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
     let client = build_client()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
