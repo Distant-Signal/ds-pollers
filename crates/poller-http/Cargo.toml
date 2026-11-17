@@ -1,0 +1,21 @@
+[package]
+name = "poller-http"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.102"
+ds-runtime = { workspace = true, features = ["default"] }
+metrics = "0.24"
+reqwest = { version = "0.13.4", default-features = false, features = ["native-tls", "gzip"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
+
+[lints]
+workspace = true

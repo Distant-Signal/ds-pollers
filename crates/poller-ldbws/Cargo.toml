@@ -10,6 +10,7 @@ license.workspace = true
 # Readiness after the first successful cycle, and the SIGTERM drain
 # (docs/redeploy-safety.md).
 poller-lifecycle = { path = "../poller-lifecycle" }
+poller-http = { path = "../poller-http" }
 health-http = { workspace = true }
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }

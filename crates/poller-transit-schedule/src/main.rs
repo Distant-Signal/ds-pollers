@@ -129,7 +129,12 @@ async fn run() -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(USER_AGENT)
+        // No credential is sent over HTTP (the TNDS login is FTP), and the
+        // SIRI-SX archive answers 302 to a signed object-store URL, so a
+        // few https-only redirects are allowed.
+        .redirect(poller_http::https_redirects())
         .build()?;
+    poller_http::register_metrics(&["transit-schedule", "naptan", "transit-situations"], &[]);
     let ctx = Context {
         config,
         network,

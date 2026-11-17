@@ -48,6 +48,22 @@ const TFL_AUTH_HEADER_NAME: &str = "Ocp-Apim-Subscription-Key";
 /// connection and never answers would otherwise hang the poll loop forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The client for the credentialed upstream calls. It never follows a
+/// redirect: it sends the `TfL` key in a custom header, which reqwest would carry
+/// to another host (poller-http's module docs).
+fn build_client() -> reqwest::Result<Client> {
+    Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(poller_http::no_redirects())
+        .build()
+}
+
+/// The most of one response body read (decoded). The largest answers are
+/// the daily jobs' stop lists and route sequences, a few MB to about 20 MB
+/// of JSON; 64 MiB is several times that. The status poll's answer is
+/// about 100 KB.
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 /// Once mode: how long a daily job waits for its snapshot to reach the
 /// stream before failing (exit 1, so the Job retries).
 const ONCE_FLUSH_GRACE: Duration = Duration::from_secs(120);
@@ -184,7 +200,7 @@ async fn run() -> anyhow::Result<()> {
     // every request unauthenticated instead of refusing to start. Catch that
     // here, before the client is built.
     require_non_empty_key(config.tfl_app_key.expose())?;
-    let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
+    let client = build_client()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let stream = stream_sink(&config)?;
     let (stops, routes) = daily_sinks(&config)?;
@@ -201,6 +217,7 @@ async fn run() -> anyhow::Result<()> {
     if config.metrics.metrics_enabled {
         ds_runtime::metrics::install(config.metrics_port)?;
     }
+    poller_http::register_metrics(&["tfl"], &["tfl"]);
     // Each loop beats its own progress, so `/livez` sees one that hangs.
     // The daily jobs beat theirs before each TfL call too: their runs can
     // outlast the stall window (TfL's 429 waits), which the status loop's
@@ -885,22 +902,34 @@ async fn get_text(
     client: &Client,
     url: &str,
     key: &str,
-) -> Result<Result<String, (StatusCode, Option<String>, String)>, reqwest::Error> {
+) -> Result<Result<String, (StatusCode, Option<String>, String)>, poller_http::ReadError> {
+    get_text_capped(client, url, key, MAX_BODY_BYTES).await
+}
+
+async fn get_text_capped(
+    client: &Client,
+    url: &str,
+    key: &str,
+    cap: usize,
+) -> Result<Result<String, (StatusCode, Option<String>, String)>, poller_http::ReadError> {
     let response = client
         .get(url)
         .header(TFL_AUTH_HEADER_NAME, key)
         .send()
-        .await?;
+        .await
+        .map_err(poller_http::ReadError::Transport)?;
     let status = response.status();
     if status.is_success() {
-        return Ok(Ok(response.text().await?));
+        return Ok(Ok(
+            poller_http::read_capped_text(response, cap, "tfl").await?
+        ));
     }
     let retry_after = response
         .headers()
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let body = response.text().await.unwrap_or_default();
+    let body = poller_http::error_body(response).await;
     Ok(Err((status, retry_after, body)))
 }
 
@@ -933,7 +962,18 @@ async fn fetch_json_with(
             // A timeout or a refused connection: retried as a 5xx is (one
             // blip among the routes job's hundreds of calls used to abort
             // the whole daily run).
-            Err(err) => {
+            // A body past the cap is not retried: it would only be asked
+            // for again.
+            Err(poller_http::ReadError::TooLarge(err)) => {
+                metrics::counter!(
+                    ds_runtime::metrics::metric_name("tfl_fetch_total"),
+                    "what" => what.to_string(),
+                    "outcome" => "exhausted"
+                )
+                .increment(1);
+                return Err(err.into());
+            }
+            Err(poller_http::ReadError::Transport(err)) => {
                 attempt += 1;
                 if attempt >= policy.max_attempts || !should_retry_transport(&err) {
                     metrics::counter!(
@@ -1114,6 +1154,52 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// A redirect is not followed (it is a failed status, not retried
+    /// into another host), and the host it names gets nothing.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_the_target_gets_nothing() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let target = MockServer::start().await;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/stolen", target.uri())),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let err = get_text_capped(&build_client().unwrap(), &origin.uri(), "k", 4096)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::TEMPORARY_REDIRECT);
+        assert!(target.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A body past the cap fails at once, without a retry.
+    #[tokio::test]
+    async fn an_oversized_body_fails_without_retrying() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 4096]))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let ok = get_text_capped(&client, &server.uri(), "k", 4096).await;
+        assert_eq!(ok.unwrap().unwrap().len(), 4096);
+        let err = get_text_capped(&client, &server.uri(), "k", 4095)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, poller_http::ReadError::TooLarge(_)), "{err}");
     }
 
     #[test]

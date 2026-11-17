@@ -67,13 +67,26 @@ const CYCLE_TIME_BUDGET: Duration = Duration::from_secs(240);
 /// default of sending none at all. See `ds_runtime::user_agent`.
 const USER_AGENT: &str = ds_runtime::user_agent!();
 
+/// The most of an upstream body a debug log line carries.
+const LOG_BODY_LIMIT: usize = 4 * 1024;
+
+/// The most of the all-stations body read (decoded): about 170 stations,
+/// some 30 KB of XML, so 2 MiB is a wide margin.
+const MAX_STATIONS_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// The most of one station's departures body read (decoded): a few KB of
+/// XML at most, so 1 MiB is a wide margin.
+const MAX_BOARD_BODY_BYTES: usize = 1024 * 1024;
+
 /// Builds the HTTP client used for every upstream fetch and ingest POST.
 /// Split out of `main` so the test below can assert, over real HTTP, that
 /// the client actually sends [`USER_AGENT`].
 fn build_client() -> reqwest::Result<Client> {
+    // No credential is sent, so a few https-only redirects are allowed.
     Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(USER_AGENT)
+        .redirect(poller_http::https_redirects())
         .build()
 }
 
@@ -96,9 +109,16 @@ async fn run() -> anyhow::Result<()> {
     ds_runtime::logging::init("poller-irish-rail-live");
 
     let config = Config::parse();
+    if config::is_plaintext(&config.irish_rail_base_url) {
+        tracing::warn!(
+            "IRISH_RAIL_BASE_URL is plain http://: the departures can be read or altered in \
+             transit; use https://"
+        );
+    }
     let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
     let once = common::poller_loop::RunOnce::from_env()?.is_some();
     let client = build_client()?;
+    poller_http::register_metrics(&["irish-rail-live"], &["irish-rail-live"]);
     let redis = config
         .redis
         .client("the ingest stream")
@@ -310,14 +330,15 @@ async fn fetch_all_stations(
     config: &Config,
 ) -> anyhow::Result<Vec<IslandOfIrelandLiveStation>> {
     let url = format!("{}/getAllStationsXML", config.irish_rail_base_url);
-    let body = client
-        .get(&url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    tracing::debug!(body = %body, "raw getAllStationsXML response body");
+    let response = client.get(&url).send().await?;
+    let response = poller_http::ensure_success(response, "irish-rail-live")?;
+    let body =
+        poller_http::read_capped_text(response, MAX_STATIONS_BODY_BYTES, "irish-rail-live").await?;
+    tracing::debug!(
+        body = %poller_http::truncate_for_log(&body, LOG_BODY_LIMIT),
+        len = body.len(),
+        "raw getAllStationsXML response body (start)"
+    );
     schema::parse_all_stations(&body)
 }
 
@@ -343,14 +364,16 @@ async fn fetch_station_departures(
     ))?;
     url.query_pairs_mut()
         .append_pair("StationCode", station_code.trim());
-    let body = client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    tracing::debug!(station_code = %station_code, body = %body, "raw getStationDataByCodeXML response body");
+    let response = client.get(url).send().await?;
+    let response = poller_http::ensure_success(response, "irish-rail-live")?;
+    let body =
+        poller_http::read_capped_text(response, MAX_BOARD_BODY_BYTES, "irish-rail-live").await?;
+    tracing::debug!(
+        station_code = %station_code,
+        body = %poller_http::truncate_for_log(&body, LOG_BODY_LIMIT),
+        len = body.len(),
+        "raw getStationDataByCodeXML response body (start)"
+    );
     schema::parse_station_departures(&body)
 }
 
@@ -410,6 +433,26 @@ mod tests {
 
     const EMPTY_STATION_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
         <ArrayOfObjStationData xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns="http://api.irishrail.ie/realtime/" />"#;
+
+    #[tokio::test]
+    async fn an_oversized_departures_body_fails_the_station() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/getStationDataByCodeXML"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_BOARD_BODY_BYTES + 1]),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = test_config(server.uri());
+
+        let err = fetch_station_departures(&Client::new(), &config, "BFSTC")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("exceeded"), "{err}");
+    }
 
     #[tokio::test]
     async fn station_code_is_trimmed_and_url_encoded_not_spliced_raw() {

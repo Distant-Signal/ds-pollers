@@ -10,6 +10,7 @@ license.workspace = true
 # Readiness after the first successful cycle, and the SIGTERM drain
 # (docs/redeploy-safety.md).
 poller-lifecycle = { path = "../poller-lifecycle" }
+poller-http = { path = "../poller-http" }
 anyhow = "1.0.102"
 # The startup cursor (`ingest_freshness.fetched_at`).
 chrono = "0.4.44"
@@ -31,6 +32,9 @@ serde_json = { version = "1.0.149", features = ["raw_value"] }
 sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "tls-native-tls"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1.44"
+
+[dev-dependencies]
+wiremock = "0.6"
 
 [lints]
 workspace = true

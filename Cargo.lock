@@ -2223,6 +2223,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "poller-http"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ds-runtime",
+ "metrics",
+ "reqwest",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "poller-incidents"
 version = "0.1.0"
 dependencies = [
@@ -2235,6 +2248,7 @@ dependencies = [
  "ds-runtime",
  "ds-store",
  "metrics",
+ "poller-http",
  "poller-lifecycle",
  "quick-xml",
  "redis",
@@ -2244,6 +2258,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -2259,6 +2274,7 @@ dependencies = [
  "gtfs-structures",
  "ingest-stream",
  "metrics",
+ "poller-http",
  "poller-lifecycle",
  "reqwest",
  "serde",
@@ -2280,6 +2296,7 @@ dependencies = [
  "ds-runtime",
  "ingest-stream",
  "metrics",
+ "poller-http",
  "poller-lifecycle",
  "quick-xml",
  "reqwest",
@@ -2305,6 +2322,7 @@ dependencies = [
  "ingest-stream",
  "metrics",
  "metrics-exporter-prometheus",
+ "poller-http",
  "poller-lifecycle",
  "redis",
  "reqwest",
@@ -2340,6 +2358,7 @@ dependencies = [
  "ds-runtime",
  "ingest-stream",
  "metrics",
+ "poller-http",
  "poller-lifecycle",
  "reqwest",
  "serde",
@@ -2360,6 +2379,7 @@ dependencies = [
  "ds-runtime",
  "ds-store",
  "metrics",
+ "poller-http",
  "poller-lifecycle",
  "reqwest",
  "serde",
@@ -2367,6 +2387,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -2381,6 +2402,7 @@ dependencies = [
  "ds-runtime",
  "ingest-stream",
  "metrics",
+ "poller-http",
  "poller-lifecycle",
  "redis",
  "reqwest",
@@ -2388,6 +2410,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -2402,12 +2425,14 @@ dependencies = [
  "ds-runtime",
  "ingest-stream",
  "metrics",
+ "poller-http",
  "poller-lifecycle",
  "quick-xml",
  "reqwest",
  "serde",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -2425,6 +2450,7 @@ dependencies = [
  "health-http",
  "ingest-stream",
  "metrics",
+ "poller-http",
  "poller-lifecycle",
  "quick-xml",
  "redis",

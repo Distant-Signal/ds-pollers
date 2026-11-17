@@ -60,6 +60,21 @@ use tracked_stops::Cadence;
 /// 30s is comfortably short relative to the 60s default poll interval.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The client for the credentialed upstream calls. It never follows a
+/// redirect: it sends the RDM key in a custom header, which reqwest would carry
+/// to another host (poller-http's module docs).
+fn build_client() -> reqwest::Result<Client> {
+    Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(poller_http::no_redirects())
+        .build()
+}
+
+/// The most of one board's body read (decoded). A board with details is
+/// tens of KB to about 1 MB of JSON at the largest `numRows`; 8 MiB is a
+/// wide margin, and a larger answer fails that station's request.
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 /// Number of `numRows` values `fetch_departures` will try for a single
 /// station before giving up on it for the cycle: the operator-configured
 /// value plus up to three halved fallbacks (10 -> 5 -> 2 -> 1 for the
@@ -131,7 +146,8 @@ async fn run() -> anyhow::Result<()> {
     // Ingest plan 4.5: the catalogue, Postgres and the schema gate before
     // the first cycle.
     config.reads.connect(&progress).await?;
-    let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
+    let client = build_client()?;
+    poller_http::register_metrics(&["ldbws"], &["ldbws"]);
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     // `Rc<RefCell<_>>`, mirroring `poller-tfl`'s own `dlr_state` exactly
     // (see that crate's `main.rs` for the full reasoning) -- `run_poll_loop`'s
@@ -1180,10 +1196,10 @@ async fn fetch_arrivals_window(
         .await?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = poller_http::error_body(response).await;
         anyhow::bail!("LDBWS arrival board for {crs} failed: {status} {body}");
     }
-    schema::parse_arrivals(&response.text().await?)
+    schema::parse_arrivals(&poller_http::read_capped_text(response, MAX_BODY_BYTES, "ldbws").await?)
 }
 
 /// One `GetDepBoardWithDetails` call for a window of `crs`'s board:
@@ -1208,10 +1224,12 @@ async fn fetch_board_window(
         .await?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = poller_http::error_body(response).await;
         anyhow::bail!("LDBWS window board for {crs} failed: {status} {body}");
     }
-    schema::parse_departures(&response.text().await?)
+    schema::parse_departures(
+        &poller_http::read_capped_text(response, MAX_BODY_BYTES, "ldbws").await?,
+    )
 }
 
 /// The deduplicated CRS list to sample, computed from the line catalogue
@@ -1267,6 +1285,12 @@ enum FetchError {
 
 impl From<reqwest::Error> for FetchError {
     fn from(err: reqwest::Error) -> Self {
+        FetchError::Other(err.into())
+    }
+}
+
+impl From<poller_http::ReadError> for FetchError {
+    fn from(err: poller_http::ReadError) -> Self {
         FetchError::Other(err.into())
     }
 }
@@ -1359,11 +1383,11 @@ async fn fetch_departures_once(
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = poller_http::error_body(response).await;
         return Err(FetchError::Status(status, body));
     }
 
-    Ok(response.text().await?)
+    Ok(poller_http::read_capped_text(response, MAX_BODY_BYTES, "ldbws").await?)
 }
 
 /// Samples a single station, retrying a 500 with progressively smaller
@@ -1557,6 +1581,48 @@ mod tests {
             },
             reads: sample_source::SampleStationsArgs::default(),
         }
+    }
+
+    /// A redirect is not followed, so the host it names gets nothing, and
+    /// the key header goes nowhere but the configured host.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_the_target_gets_nothing() {
+        let target = MockServer::start().await;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/stolen", target.uri())),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let config = test_config(origin.uri(), 10);
+        let err = fetch_departures_once(&build_client().unwrap(), &config, "PAD", 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::Status(status, _) if status == 307));
+        assert!(target.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A body past the cap fails the request instead of being buffered.
+    #[tokio::test]
+    async fn an_oversized_board_body_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/GetDepBoardWithDetails/PAD"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_BODY_BYTES + 1]))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = test_config(server.uri(), 10);
+        let err = fetch_departures_once(&Client::new(), &config, "PAD", 10)
+            .await
+            .unwrap_err();
+        let FetchError::Other(err) = err else {
+            panic!("expected a non-status error");
+        };
+        assert!(err.to_string().contains("exceeded"), "{err}");
     }
 
     const ONE_SERVICE_BODY: &str = r#"{"trainServices":[{"serviceID":"svc-1","operatorCode":"GW","destination":[{"crs":"RDG"}],"std":"10:00","etd":"10:05","isCancelled":false}]}"#;

@@ -35,6 +35,16 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 1;
 /// relative to the 24-hour recommended poll interval for this feed.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The client for the credentialed upstream calls. It never follows a
+/// redirect: it sends the RDM key in a custom header, which reqwest would carry
+/// to another host (poller-http's module docs).
+fn build_client() -> reqwest::Result<Client> {
+    Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(poller_http::no_redirects())
+        .build()
+}
+
 /// What `--print-config-defaults` prints (`ds_runtime::service_args`).
 fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
     poller_lifecycle::config_defaults(
@@ -62,8 +72,9 @@ async fn run() -> anyhow::Result<()> {
     if config.metrics.metrics_enabled {
         ds_runtime::metrics::install(config.metrics_port)?;
     }
+    poller_http::register_metrics(&["stations"], &["stations"]);
     let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
-    let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
+    let client = build_client()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let retry_budget = common::poller_loop::post_retry_budget(poll_interval);
 
@@ -143,18 +154,41 @@ async fn fetch_stations_json(
     client: &Client,
     config: &Config,
 ) -> anyhow::Result<impl std::ops::Deref<Target = [u8]>> {
+    fetch_capped(
+        client,
+        &format!("{}/stations", config.rdm_stations_base_url),
+        config.rdm_api_key.expose(),
+        MAX_BODY_BYTES,
+    )
+    .await
+}
+
+/// The most of the body a debug log line carries.
+const LOG_BODY_LIMIT: usize = 4 * 1024;
+
+/// The most of the stations body read (decoded). The real feed is about
+/// 37 MB of JSON; 96 MiB is about 2.5 times that, and the largest cap here
+/// because the pod holds the body and its parse together.
+const MAX_BODY_BYTES: usize = 96 * 1024 * 1024;
+
+async fn fetch_capped(
+    client: &Client,
+    url: &str,
+    api_key: &str,
+    cap: usize,
+) -> anyhow::Result<Vec<u8>> {
     // Header not stated specifically for the Stations product in
     // RSPS5050 P-03-00 Rev A §6 ("An API Key will be required to access
     // the JSON feed via RDM" — no header name given); this is the same
     // working assumption used for `poller-incidents` (Task 3).
     let response = client
-        .get(format!("{}/stations", config.rdm_stations_base_url))
-        .header(RDM_AUTH_HEADER_NAME, config.rdm_api_key.expose())
+        .get(url)
+        .header(RDM_AUTH_HEADER_NAME, api_key)
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let response = poller_http::ensure_success(response, "stations")?;
 
-    let body = response.bytes().await?;
+    let body = poller_http::read_capped(response, cap, "stations").await?;
 
     // GAP: the JSON field casing for this feed is unconfirmed (see
     // `schema.rs` module docs). Logging the raw body here, before parsing,
@@ -162,7 +196,58 @@ async fn fetch_stations_json(
     // `RUST_LOG=poller_stations=debug`, inspect the logged body against a
     // known station (e.g. `EUS`), and adjust `schema::RdmStation`'s
     // `rename_all`/per-field `rename` attributes if reality differs.
-    tracing::debug!(body = %String::from_utf8_lossy(&body), "raw stations response body");
+    // Only the start: the whole body is about 37 MB.
+    tracing::debug!(
+        body = %String::from_utf8_lossy(&body[..body.len().min(LOG_BODY_LIMIT)]),
+        len = body.len(),
+        "raw stations response body (start)"
+    );
 
     Ok(body)
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn an_oversized_body_fails_the_cycle() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 4096]))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let ok = fetch_capped(&client, &server.uri(), "k", 4096).await;
+        assert_eq!(ok.unwrap().len(), 4096);
+        let err = fetch_capped(&client, &server.uri(), "k", 4095)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeded"), "{err}");
+    }
+
+    /// A redirect is not followed, so the host it names gets nothing, and
+    /// the key header goes nowhere but the configured host.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_the_target_gets_nothing() {
+        let target = MockServer::start().await;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/stolen", target.uri())),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let client = build_client().unwrap();
+        let err = fetch_capped(&client, &origin.uri(), "k", 4096)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("redirect"), "{err}");
+        assert!(target.received_requests().await.unwrap().is_empty());
+    }
 }

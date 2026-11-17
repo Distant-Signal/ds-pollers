@@ -28,6 +28,21 @@ use reqwest::Client;
 /// comfortably short relative to the 86400s recommended poll interval.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The client for the credentialed upstream calls. It never follows a
+/// redirect: it sends the RDM key in a custom header, which reqwest would carry
+/// to another host (poller-http's module docs).
+fn build_client() -> reqwest::Result<Client> {
+    Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(poller_http::no_redirects())
+        .build()
+}
+
+/// The most of the TOC list body read (decoded). The real feed is about 40
+/// rows of XML (a few KB); 8 MiB is orders of magnitude above that and
+/// still harmless to hold.
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 /// Once mode (`RUN_ONCE`, a scheduled Job; `common::poller_loop`): how long
 /// the run waits for its snapshot to reach the stream before failing (exit
 /// 1, so the Job retries). Inside the chart's `activeDeadlineSeconds`.
@@ -54,7 +69,8 @@ async fn run() -> anyhow::Result<()> {
     let config = Config::parse();
     let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
     let once = common::poller_loop::RunOnce::from_env()?.is_some();
-    let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
+    let client = build_client()?;
+    poller_http::register_metrics(&["tocs"], &["tocs"]);
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let stream = stream_sink(&config)?;
     // The producer is lazy and `publish` only queues a snapshot, never
@@ -119,15 +135,76 @@ async fn poll_once(
 }
 
 async fn fetch_tocs_xml(client: &Client, config: &Config) -> anyhow::Result<String> {
+    fetch_capped(
+        client,
+        &config.rdm_tocs_base_url,
+        config.rdm_api_key.expose(),
+        MAX_BODY_BYTES,
+    )
+    .await
+}
+
+async fn fetch_capped(
+    client: &Client,
+    url: &str,
+    api_key: &str,
+    cap: usize,
+) -> anyhow::Result<String> {
     // Header per RSPS5050 P-03-00 Rev A §3 — corroborated for the RDM
     // platform generally via a different product's confirmed example, not
     // proven specifically for this product.
     let response = client
-        .get(&config.rdm_tocs_base_url)
-        .header(RDM_AUTH_HEADER_NAME, config.rdm_api_key.expose())
+        .get(url)
+        .header(RDM_AUTH_HEADER_NAME, api_key)
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let response = poller_http::ensure_success(response, "tocs")?;
 
-    Ok(response.text().await?)
+    Ok(poller_http::read_capped_text(response, cap, "tocs").await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn an_oversized_body_fails_the_cycle() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 4096]))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let ok = fetch_capped(&client, &server.uri(), "k", 4096).await;
+        assert_eq!(ok.unwrap().len(), 4096);
+        let err = fetch_capped(&client, &server.uri(), "k", 4095)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeded"), "{err}");
+    }
+
+    /// A redirect is not followed, so the host it names gets nothing, and
+    /// the key header goes nowhere but the configured host.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_the_target_gets_nothing() {
+        let target = MockServer::start().await;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/stolen", target.uri())),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let client = build_client().unwrap();
+        let err = fetch_capped(&client, &origin.uri(), "k", 4096)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("redirect"), "{err}");
+        assert!(target.received_requests().await.unwrap().is_empty());
+    }
 }
