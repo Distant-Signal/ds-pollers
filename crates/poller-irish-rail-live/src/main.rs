@@ -106,6 +106,12 @@ async fn run() -> anyhow::Result<()> {
     ds_runtime::logging::init("poller-irish-rail-live");
 
     let config = Config::parse();
+    if config::is_plaintext(&config.irish_rail_base_url) {
+        tracing::warn!(
+            "IRISH_RAIL_BASE_URL is plain http://: the departures can be read or altered in \
+             transit; use https://"
+        );
+    }
     let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
     let once = common::poller_loop::RunOnce::from_env()?.is_some();
     let client = build_client()?;

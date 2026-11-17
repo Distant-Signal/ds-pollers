@@ -4,9 +4,13 @@
 //! to `PASV`), under the same byte cap as an HTTPS download. Small enough
 //! to need no new dependency.
 //!
-//! Plain FTP: the login crosses the network in clear, as TNDS offers it.
-//! It is a free registration guarding nothing else (the runbook says so).
-//! The password never appears in an error or a log line.
+//! Plain FTP: the login crosses the network in clear, as TNDS offers it,
+//! and the file arrives unprotected (the zip is checked only by its size
+//! cap and its parse). It is a free registration guarding nothing else
+//! (the runbook says so). FTPS (explicit TLS) is not supported: this client is hand-written
+//! and would need a TLS upgrade of both the control and the data
+//! connection (with session reuse), which is not simple here, so the first
+//! download of a process logs a warning instead. The password never appears in an error or a log line.
 //!
 //! The data connection goes to the control connection's peer address,
 //! whatever address a `PASV` reply names (the usual guard against a server
@@ -281,6 +285,13 @@ async fn fetch(
     path: &Path,
     max_bytes: u64,
 ) -> Result<u64, FeedError> {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            host = %target.host,
+            "downloading over plain FTP: the login and the file cross the network unprotected"
+        );
+    });
     let mut control = Control::connect(&target.host, target.port).await?;
     control.login(login).await?;
     control

@@ -283,8 +283,10 @@ login Traveline issues on request:
 3. **Ranma adds `poller-transit-net-password`** (letters and digits) to the
    Redis users SealedSecret.
 
-The login crosses the network in clear (TNDS offers plain FTP). It is a
-free registration that guards nothing else; do not reuse a password.
+The login crosses the network in clear (TNDS offers plain FTP), and so does
+the file; the producer logs a warning at its first download to say so. FTPS
+is not supported. The login is a free registration that guards nothing else;
+do not reuse a password.
 
 **NetworkPolicy.** Passive FTP opens its data connection to a port the
 server picks. With the chart's default (no `networkPolicy.egress.internetPorts`)

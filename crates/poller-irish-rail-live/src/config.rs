@@ -28,10 +28,16 @@ pub(crate) struct Config {
     /// re-confirmed live during this crate's own implementation:
     /// `getAllStationsXML` returned 171 stations, `getStationDataByCodeXML`
     /// returned real live departure data for both `BFSTC` and `CNLLY`).
+    ///
+    /// `https://` by default: the service answers over TLS with a valid
+    /// certificate and the same bodies as plain `http://` (checked
+    /// 2026-11-17), and a plain-HTTP answer could be altered in transit.
+    /// A configured `http://` URL still works, with a startup warning
+    /// ([`is_plaintext`]).
     #[arg(
         long,
         env,
-        default_value = "http://api.irishrail.ie/realtime/realtime.asmx"
+        default_value = "https://api.irishrail.ie/realtime/realtime.asmx"
     )]
     pub irish_rail_base_url: String,
 
@@ -95,11 +101,35 @@ pub(crate) struct Config {
     pub health: ds_runtime::service_args::HealthArgs,
 }
 
+/// Whether `base_url` is plain HTTP (the poller warns at startup).
+pub(crate) fn is_plaintext(base_url: &str) -> bool {
+    base_url
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
-    use super::Config;
+    use super::{Config, is_plaintext};
+
+    #[test]
+    fn the_default_base_url_is_https() {
+        let config = Config::try_parse_from(["poller-irish-rail-live"]).unwrap();
+        assert!(config.irish_rail_base_url.starts_with("https://"));
+        assert!(!is_plaintext(&config.irish_rail_base_url));
+    }
+
+    #[test]
+    fn a_plain_http_base_url_is_flagged() {
+        assert!(is_plaintext(
+            "http://api.irishrail.ie/realtime/realtime.asmx"
+        ));
+        assert!(is_plaintext("HTTP://example.org"));
+        assert!(!is_plaintext("https://example.org"));
+        assert!(!is_plaintext(""));
+    }
 
     /// No required args at all (since ingest plan 3c.2 dropped the OAuth
     /// ones). Everything, including `station_codes_override`, is left unset
