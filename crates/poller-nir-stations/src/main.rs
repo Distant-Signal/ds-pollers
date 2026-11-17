@@ -49,9 +49,13 @@ async fn run() -> anyhow::Result<()> {
     // `.user_agent(...)` is NOT optional -- see config::USER_AGENT's own
     // doc comment and this plan's Global Constraints. Every request this
     // client makes to admin.opendatani.gov.uk 403s without it.
+    // The open-data CSV links answer 302 to a signed object-store URL on
+    // another host, so redirects are followed, https-only and few; no
+    // credential is sent.
     let client = Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(config::USER_AGENT)
+        .redirect(poller_http::https_redirects())
         .build()?;
     let redis = config
         .redis
@@ -142,7 +146,8 @@ fn older_cursor(
 const MAX_CSV_BYTES: usize = 8 * 1024 * 1024;
 
 async fn fetch_csv(client: &Client, url: &str, cap: usize) -> anyhow::Result<Vec<u8>> {
-    let response = client.get(url).send().await?.error_for_status()?;
+    let response = client.get(url).send().await?;
+    let response = poller_http::ensure_success(response, "nir-stations")?;
     Ok(poller_http::read_capped(response, cap, "nir-stations").await?)
 }
 

@@ -48,6 +48,16 @@ const TFL_AUTH_HEADER_NAME: &str = "Ocp-Apim-Subscription-Key";
 /// connection and never answers would otherwise hang the poll loop forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The client for the credentialed upstream calls. It never follows a
+/// redirect: it sends the `TfL` key in a custom header, which reqwest would carry
+/// to another host (poller-http's module docs).
+fn build_client() -> reqwest::Result<Client> {
+    Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(poller_http::no_redirects())
+        .build()
+}
+
 /// The most of one response body read (decoded). The largest answers are
 /// the daily jobs' stop lists and route sequences, a few MB to about 20 MB
 /// of JSON; 64 MiB is several times that. The status poll's answer is
@@ -190,7 +200,7 @@ async fn run() -> anyhow::Result<()> {
     // every request unauthenticated instead of refusing to start. Catch that
     // here, before the client is built.
     require_non_empty_key(config.tfl_app_key.expose())?;
-    let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
+    let client = build_client()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let stream = stream_sink(&config)?;
     let (stops, routes) = daily_sinks(&config)?;
@@ -1143,6 +1153,31 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// A redirect is not followed (it is a failed status, not retried
+    /// into another host), and the host it names gets nothing.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_the_target_gets_nothing() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let target = MockServer::start().await;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/stolen", target.uri())),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let err = get_text_capped(&build_client().unwrap(), &origin.uri(), "k", 4096)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::TEMPORARY_REDIRECT);
+        assert!(target.received_requests().await.unwrap().is_empty());
     }
 
     /// A body past the cap fails at once, without a retry.

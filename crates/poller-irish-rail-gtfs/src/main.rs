@@ -164,7 +164,8 @@ async fn download_gtfs_zip(client: &Client, url: &str) -> anyhow::Result<Vec<u8>
 /// otherwise enable) rather than `Response::bytes`, which buffers the
 /// entire body internally before this code ever gets to check its size.
 async fn download_capped(client: &Client, url: &str, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
-    let mut response = client.get(url).send().await?.error_for_status()?;
+    let mut response =
+        poller_http::ensure_success(client.get(url).send().await?, "irish-rail-gtfs")?;
 
     if let Some(declared_len) = response.content_length()
         && declared_len > max_bytes
@@ -197,9 +198,12 @@ const USER_AGENT: &str = ds_runtime::user_agent!();
 /// Split out of `main` so the test below can assert, over real HTTP, that
 /// the client actually sends [`USER_AGENT`].
 fn build_client() -> reqwest::Result<Client> {
+    // The download sends no credential, so a few https-only redirects are
+    // allowed (poller-http).
     Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(USER_AGENT)
+        .redirect(poller_http::https_redirects())
         .build()
 }
 

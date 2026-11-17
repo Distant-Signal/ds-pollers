@@ -160,12 +160,8 @@ async fn fetch_to_file(
     max_bytes: u64,
 ) -> Result<u64, FeedError> {
     let io = |err: &dyn std::fmt::Display| FeedError::Io(format!("downloading {url}: {err}"));
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|err| io(&err))?;
+    let mut response = client.get(url).send().await.map_err(|err| io(&err))?;
+    poller_http::check_status(&response, "transit-schedule").map_err(|err| io(&err))?;
     if let Some(declared) = response.content_length()
         && declared > max_bytes
     {

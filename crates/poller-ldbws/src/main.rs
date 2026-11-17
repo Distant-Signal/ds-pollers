@@ -60,6 +60,16 @@ use tracked_stops::Cadence;
 /// 30s is comfortably short relative to the 60s default poll interval.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The client for the credentialed upstream calls. It never follows a
+/// redirect: it sends the RDM key in a custom header, which reqwest would carry
+/// to another host (poller-http's module docs).
+fn build_client() -> reqwest::Result<Client> {
+    Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(poller_http::no_redirects())
+        .build()
+}
+
 /// The most of one board's body read (decoded). A board with details is
 /// tens of KB to about 1 MB of JSON at the largest `numRows`; 8 MiB is a
 /// wide margin, and a larger answer fails that station's request.
@@ -136,7 +146,7 @@ async fn run() -> anyhow::Result<()> {
     // Ingest plan 4.5: the catalogue, Postgres and the schema gate before
     // the first cycle.
     config.reads.connect(&progress).await?;
-    let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
+    let client = build_client()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     // `Rc<RefCell<_>>`, mirroring `poller-tfl`'s own `dlr_state` exactly
     // (see that crate's `main.rs` for the full reasoning) -- `run_poll_loop`'s
@@ -1570,6 +1580,28 @@ mod tests {
             },
             reads: sample_source::SampleStationsArgs::default(),
         }
+    }
+
+    /// A redirect is not followed, so the host it names gets nothing, and
+    /// the key header goes nowhere but the configured host.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_the_target_gets_nothing() {
+        let target = MockServer::start().await;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/stolen", target.uri())),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let config = test_config(origin.uri(), 10);
+        let err = fetch_departures_once(&build_client().unwrap(), &config, "PAD", 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::Status(status, _) if status == 307));
+        assert!(target.received_requests().await.unwrap().is_empty());
     }
 
     /// A body past the cap fails the request instead of being buffered.

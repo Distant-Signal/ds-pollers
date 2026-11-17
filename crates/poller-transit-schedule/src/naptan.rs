@@ -139,7 +139,7 @@ pub(crate) fn apply(model: &mut TransitModel, nodes: &Nodes, network: &NetworkCo
 
 /// Downloads the area's CSV.
 pub(crate) async fn fetch(client: &reqwest::Client, url: &str) -> Result<String> {
-    let mut response = client.get(url).send().await?.error_for_status()?;
+    let mut response = poller_http::ensure_success(client.get(url).send().await?, "naptan")?;
     if response.content_length().is_some_and(|len| len > MAX_BYTES) {
         bail!("NaPTAN response over {MAX_BYTES} bytes");
     }

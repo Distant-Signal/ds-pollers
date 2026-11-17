@@ -28,6 +28,16 @@ use reqwest::Client;
 /// comfortably short relative to the 86400s recommended poll interval.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The client for the credentialed upstream calls. It never follows a
+/// redirect: it sends the RDM key in a custom header, which reqwest would carry
+/// to another host (poller-http's module docs).
+fn build_client() -> reqwest::Result<Client> {
+    Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(poller_http::no_redirects())
+        .build()
+}
+
 /// The most of the TOC list body read (decoded). The real feed is about 40
 /// rows of XML (a few KB); 8 MiB is orders of magnitude above that and
 /// still harmless to hold.
@@ -59,7 +69,7 @@ async fn run() -> anyhow::Result<()> {
     let config = Config::parse();
     let (lifecycle, progress) = poller_lifecycle::Lifecycle::spawn(&config.health)?;
     let once = common::poller_loop::RunOnce::from_env()?.is_some();
-    let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
+    let client = build_client()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let stream = stream_sink(&config)?;
     // The producer is lazy and `publish` only queues a snapshot, never
@@ -146,8 +156,8 @@ async fn fetch_capped(
         .get(url)
         .header(RDM_AUTH_HEADER_NAME, api_key)
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let response = poller_http::ensure_success(response, "tocs")?;
 
     Ok(poller_http::read_capped_text(response, cap, "tocs").await?)
 }
@@ -173,5 +183,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exceeded"), "{err}");
+    }
+
+    /// A redirect is not followed, so the host it names gets nothing, and
+    /// the key header goes nowhere but the configured host.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_the_target_gets_nothing() {
+        let target = MockServer::start().await;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/stolen", target.uri())),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let client = build_client().unwrap();
+        let err = fetch_capped(&client, &origin.uri(), "k", 4096)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("redirect"), "{err}");
+        assert!(target.received_requests().await.unwrap().is_empty());
     }
 }

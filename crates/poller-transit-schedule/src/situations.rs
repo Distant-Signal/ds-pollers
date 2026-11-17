@@ -45,7 +45,7 @@ async fn download(ctx: &Context) -> Result<Option<Vec<u8>>, FeedError> {
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         return Ok(None);
     }
-    if let Err(err) = response.error_for_status_ref() {
+    if let Err(err) = poller_http::check_status(&response, "transit-situations") {
         return Err(io(&err));
     }
     if response

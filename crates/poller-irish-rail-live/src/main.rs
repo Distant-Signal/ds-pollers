@@ -79,9 +79,11 @@ const MAX_BOARD_BODY_BYTES: usize = 1024 * 1024;
 /// Split out of `main` so the test below can assert, over real HTTP, that
 /// the client actually sends [`USER_AGENT`].
 fn build_client() -> reqwest::Result<Client> {
+    // No credential is sent, so a few https-only redirects are allowed.
     Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(USER_AGENT)
+        .redirect(poller_http::https_redirects())
         .build()
 }
 
@@ -318,7 +320,8 @@ async fn fetch_all_stations(
     config: &Config,
 ) -> anyhow::Result<Vec<IslandOfIrelandLiveStation>> {
     let url = format!("{}/getAllStationsXML", config.irish_rail_base_url);
-    let response = client.get(&url).send().await?.error_for_status()?;
+    let response = client.get(&url).send().await?;
+    let response = poller_http::ensure_success(response, "irish-rail-live")?;
     let body =
         poller_http::read_capped_text(response, MAX_STATIONS_BODY_BYTES, "irish-rail-live").await?;
     tracing::debug!(body = %body, "raw getAllStationsXML response body");
@@ -347,7 +350,8 @@ async fn fetch_station_departures(
     ))?;
     url.query_pairs_mut()
         .append_pair("StationCode", station_code.trim());
-    let response = client.get(url).send().await?.error_for_status()?;
+    let response = client.get(url).send().await?;
+    let response = poller_http::ensure_success(response, "irish-rail-live")?;
     let body =
         poller_http::read_capped_text(response, MAX_BOARD_BODY_BYTES, "irish-rail-live").await?;
     tracing::debug!(station_code = %station_code, body = %body, "raw getStationDataByCodeXML response body");
