@@ -145,6 +145,9 @@ async fn run() -> anyhow::Result<()> {
     refresh::check_at_start(&ctx).await;
     let readiness = report_readiness(&ctx, &ready);
 
+    // Each loop beats its own progress, so one loop's idle beats cannot
+    // hide the other hanging from `/livez` (poller_lifecycle::LoopProgress).
+    let loop_progress = poller_lifecycle::LoopProgress::spawn(&progress);
     let timetable_loop = async {
         if !ctx.config.loops.timetable() {
             tracing::info!("the timetable loop is off (TRANSIT_LOOPS)");
@@ -156,7 +159,7 @@ async fn run() -> anyhow::Result<()> {
             ctx.config.timetable_interval(),
             false,
             ctx.config.metrics_port,
-            &progress,
+            &loop_progress.add(),
             || timetable_cycle(&ctx),
         )
         .await
@@ -177,7 +180,7 @@ async fn run() -> anyhow::Result<()> {
             ctx.config.situations_interval(),
             false,
             ctx.config.metrics_port,
-            &progress,
+            &loop_progress.add(),
             || situations::poll_once(&ctx),
         )
         .await

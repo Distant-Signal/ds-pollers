@@ -12,7 +12,9 @@
 //! - `LineStatus.created` is serialised as `"0001-01-01T00:00:00"` — no
 //!   timezone — which `chrono`'s serde impl will not parse into a
 //!   `DateTime<Utc>`. It is deliberately not modelled. The line-level
-//!   `created`/`modified` are proper RFC 3339 with a `Z`.
+//!   `created`/`modified` and the validity periods are proper RFC 3339
+//!   with a `Z`, but are read leniently all the same (no offset is read
+//!   as UTC): one entry that fails to parse no longer updates its line.
 //! - `TfL`'s `statusSeverity` is its own 0–20 scale, which diverges from this
 //!   app's `Severity` above 14 (`TfL` 20 is "Service Closed"; ours is the NR
 //!   extension "Recovering"). Every code goes through
@@ -40,8 +42,10 @@ pub(crate) struct TflLine {
     /// When `TfL` last touched this line's record. Used as the `from_date`
     /// for a status that carries no validity period of its own — a stable
     /// timestamp, unlike `Utc::now()`, so an unchanged line does not
-    /// produce a fresh `line_status_history` row every 300s.
-    #[serde(default)]
+    /// produce a fresh `line_status_history` row every 300s. Lenient: an
+    /// unreadable one is `None` (the fallback is then `now`), not a reason
+    /// to drop the line.
+    #[serde(default, deserialize_with = "lenient_time")]
     pub modified: Option<DateTime<Utc>>,
     #[serde(default)]
     pub line_statuses: Vec<TflLineStatus>,
@@ -65,8 +69,9 @@ pub(crate) struct TflLineStatus {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TflValidityPeriod {
+    #[serde(deserialize_with = "tfl_time")]
     pub from_date: DateTime<Utc>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_tfl_time")]
     pub to_date: Option<DateTime<Utc>>,
     #[serde(default)]
     pub is_now: bool,
@@ -81,6 +86,118 @@ pub(crate) struct TflDisruption {
     pub category: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+}
+
+/// A `TfL` timestamp: RFC 3339, or (as `TfL` already sends
+/// `LineStatus.created`) a date and time with no offset, read as UTC (the
+/// .NET `DateTime` `TfL` serialises without its kind is UTC everywhere it
+/// does carry a `Z`).
+fn parse_tfl_time(text: &str) -> Option<DateTime<Utc>> {
+    if let Ok(time) = DateTime::parse_from_rfc3339(text) {
+        return Some(time.with_timezone(&Utc));
+    }
+    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f")
+        .ok()
+        .map(|naive| naive.and_utc())
+}
+
+fn tfl_time<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let text = String::deserialize(deserializer)?;
+    parse_tfl_time(&text)
+        .ok_or_else(|| serde::de::Error::custom(format!("not a TfL timestamp: {text:?}")))
+}
+
+fn optional_tfl_time<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|text| {
+            parse_tfl_time(&text)
+                .ok_or_else(|| serde::de::Error::custom(format!("not a TfL timestamp: {text:?}")))
+        })
+        .transpose()
+}
+
+/// [`optional_tfl_time`], with anything unreadable as `None`.
+fn lenient_time<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_tfl_time))
+}
+
+/// A parsed `/Line/Mode/{modes}/Status` response: the lines that parsed,
+/// and the entries that did not.
+#[derive(Debug)]
+pub(crate) struct ParsedStatus {
+    pub reports: Vec<LineStatusReport>,
+    /// Each malformed entry's line id (prefixed, as a report's), `None`
+    /// when even that could not be read.
+    pub skipped: Vec<Option<String>>,
+}
+
+/// What [`complete_snapshot`] did with the malformed entries.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Completed {
+    /// Lines whose last good report stood in for a malformed entry.
+    pub carried_forward: Vec<String>,
+}
+
+/// The whole snapshot to publish from `parsed`, with `last` (each line's
+/// last good report) updated from it.
+///
+/// The writer prunes every `TfL` line missing from the snapshot it applies,
+/// so a malformed entry simply left out would delete that line's live
+/// status every cycle. Instead its line's last good report stands in for it
+/// (the line keeps the status it last had, and every other line still
+/// updates). When there is none (a fresh pod, or an entry with no readable
+/// id) the snapshot is refused: `Err` names the entries, and nothing is
+/// published, so nothing is pruned.
+pub(crate) fn complete_snapshot(
+    parsed: ParsedStatus,
+    last: &mut std::collections::HashMap<String, LineStatusReport>,
+) -> Result<(Vec<LineStatusReport>, Completed)> {
+    let ParsedStatus {
+        mut reports,
+        skipped,
+    } = parsed;
+    let mut carried_forward = Vec::new();
+    let mut missing = Vec::new();
+    for id in skipped {
+        // A malformed repeat of a line that did parse leaves nothing out.
+        if id
+            .as_ref()
+            .is_some_and(|id| reports.iter().any(|r| &r.id == id))
+        {
+            continue;
+        }
+        match id.as_ref().and_then(|id| last.get(id)) {
+            Some(report) => {
+                carried_forward.push(report.id.clone());
+                reports.push(report.clone());
+            }
+            None => missing.push(id.unwrap_or_else(|| "(no id)".to_owned())),
+        }
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "malformed TfL line status entries with no earlier report to stand in for them: {}; \
+             refusing a snapshot that would delete their lines' status",
+            missing.join(", ")
+        );
+    }
+    for report in &reports {
+        last.insert(report.id.clone(), report.clone());
+    }
+    Ok((reports, Completed { carried_forward }))
 }
 
 /// Parses a whole `/Line/Mode/{modes}/Status` response body.
@@ -102,25 +219,32 @@ pub(crate) struct TflDisruption {
 /// genuinely invalid JSON document (not just one bad element) still fails
 /// outright at the outer `Vec<serde_json::Value>` parse -- that failure is
 /// not recoverable per-element.
-pub(crate) fn parse_line_status(json: &str, now: DateTime<Utc>) -> Result<Vec<LineStatusReport>> {
+///
+/// The skipped entries are returned too: the snapshot is whole (the writer
+/// prunes lines missing from it), so [`complete_snapshot`] must account for
+/// them before anything is published.
+pub(crate) fn parse_line_status(json: &str, now: DateTime<Utc>) -> Result<ParsedStatus> {
     let raw_lines: Vec<serde_json::Value> = serde_json::from_str(json)?;
-    let lines: Vec<TflLine> = raw_lines
-        .into_iter()
-        .filter_map(
-            |value| match serde_json::from_value::<TflLine>(value.clone()) {
-                Ok(line) => Some(line),
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        line = ?value,
-                        "skipping malformed TfL line status entry rather than failing the whole batch"
-                    );
-                    None
-                }
-            },
-        )
-        .collect();
-    Ok(lines.iter().map(|line| to_report(line, now)).collect())
+    let mut reports = Vec::with_capacity(raw_lines.len());
+    let mut skipped = Vec::new();
+    for value in raw_lines {
+        match TflLine::deserialize(&value) {
+            Ok(line) => reports.push(to_report(&line, now)),
+            Err(err) => {
+                let id = value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|id| format!("{TFL_LINE_ID_PREFIX}{id}"));
+                tracing::warn!(
+                    error = %err,
+                    line = ?value,
+                    "malformed TfL line status entry; the other lines still update"
+                );
+                skipped.push(id);
+            }
+        }
+    }
+    Ok(ParsedStatus { reports, skipped })
 }
 
 fn to_report(line: &TflLine, now: DateTime<Utc>) -> LineStatusReport {
@@ -294,8 +418,9 @@ mod tests {
 
     #[test]
     fn parses_a_real_response_and_maps_every_field() {
-        let reports =
-            parse_line_status(TRAM_STATUS_JSON, now()).expect("live capture should parse");
+        let reports = parse_line_status(TRAM_STATUS_JSON, now())
+            .expect("live capture should parse")
+            .reports;
         assert_eq!(reports.len(), 1);
         let report = &reports[0];
 
@@ -384,7 +509,9 @@ mod tests {
           }
         ]"#;
 
-        let reports = parse_line_status(json, now()).expect("should parse");
+        let reports = parse_line_status(json, now())
+            .expect("should parse")
+            .reports;
         assert_eq!(reports[0].id, "tfl-victoria");
         assert_eq!(reports[0].statuses.len(), 2);
         assert_eq!(reports[0].statuses[0].severity, Severity::PlannedClosure);
@@ -409,7 +536,9 @@ mod tests {
           }
         ]"#;
 
-        let reports = parse_line_status(json, now()).expect("should parse");
+        let reports = parse_line_status(json, now())
+            .expect("should parse")
+            .reports;
         let status = &reports[0].statuses[0];
         assert_eq!(status.severity, Severity::Information);
         assert_eq!(status.reason, "Partly Marvellous");
@@ -433,7 +562,9 @@ mod tests {
           }
         ]"#;
 
-        let reports = parse_line_status(json, now()).expect("should parse");
+        let reports = parse_line_status(json, now())
+            .expect("should parse")
+            .reports;
         let validity = &reports[0].statuses[0].validity;
         assert_eq!(
             validity.from_date,
@@ -505,15 +636,142 @@ mod tests {
           }
         ]"#;
 
-        let reports = parse_line_status(json, now())
+        let parsed = parse_line_status(json, now())
             .expect("one malformed line entry must not fail the whole batch parse");
         assert_eq!(
-            reports.len(),
+            parsed.reports.len(),
             2,
             "both well-formed lines must survive; only the malformed one is skipped"
         );
-        let ids: Vec<&str> = reports.iter().map(|r| r.id.as_str()).collect();
+        let ids: Vec<&str> = parsed.reports.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["tfl-victoria", "tfl-circle"]);
+        assert_eq!(parsed.skipped, vec![Some("tfl-central".to_owned())]);
+
+        // The snapshot is whole (the writer prunes what it lacks): with no
+        // earlier Central report it is refused rather than published
+        // without Central, which would delete Central's live status.
+        let mut last = std::collections::HashMap::new();
+        let refused = complete_snapshot(parse_line_status(json, now()).unwrap(), &mut last);
+        assert!(refused.unwrap_err().to_string().contains("tfl-central"));
+        assert!(
+            last.is_empty(),
+            "nothing remembered from a refused snapshot"
+        );
+
+        // With one, Central keeps its last status and the others update.
+        let good = json.replace(r#""not-a-number""#, "6");
+        let (first, _) =
+            complete_snapshot(parse_line_status(&good, now()).unwrap(), &mut last).unwrap();
+        assert_eq!(first.len(), 3);
+        let (snapshot, completed) =
+            complete_snapshot(parse_line_status(json, now()).unwrap(), &mut last).unwrap();
+        assert_eq!(completed.carried_forward, vec!["tfl-central".to_owned()]);
+        let mut ids: Vec<&str> = snapshot.iter().map(|r| r.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["tfl-central", "tfl-circle", "tfl-victoria"]);
+        let central = snapshot.iter().find(|r| r.id == "tfl-central").unwrap();
+        assert_eq!(central.statuses[0].severity, Severity::SevereDelays);
+    }
+
+    #[test]
+    fn an_entry_with_no_readable_id_refuses_the_snapshot() {
+        let json = r#"[
+          { "id": "victoria", "name": "Victoria", "modeName": "tube", "lineStatuses": [] },
+          { "name": "Mystery", "modeName": "tube", "lineStatuses": [] }
+        ]"#;
+        let parsed = parse_line_status(json, now()).unwrap();
+        assert_eq!(parsed.skipped, vec![None]);
+        let mut last = std::collections::HashMap::new();
+        assert!(complete_snapshot(parsed, &mut last).is_err());
+    }
+
+    #[test]
+    fn a_malformed_repeat_of_a_parsed_line_leaves_nothing_out() {
+        let json = r#"[
+          { "id": "victoria", "name": "Victoria", "modeName": "tube", "lineStatuses": [] },
+          { "id": "victoria", "name": "Victoria", "lineStatuses": [] }
+        ]"#;
+        let mut last = std::collections::HashMap::new();
+        let (snapshot, completed) =
+            complete_snapshot(parse_line_status(json, now()).unwrap(), &mut last).unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(completed.carried_forward, Vec::<String>::new());
+    }
+
+    /// `TfL` already sends `LineStatus.created` without an offset; a
+    /// validity period or `modified` sent the same way must not lose the
+    /// line (which the writer's prune would turn into deleting it).
+    #[test]
+    fn timestamps_without_an_offset_are_read_as_utc() {
+        let json = r#"[
+          {
+            "id": "jubilee",
+            "name": "Jubilee",
+            "modeName": "tube",
+            "modified": "2026-08-22T02:00:00.123",
+            "lineStatuses": [
+              {
+                "statusSeverity": 9,
+                "statusSeverityDescription": "Minor Delays",
+                "validityPeriods": [
+                  { "fromDate": "2026-08-22T01:00:00", "toDate": "2026-08-22T09:00:00.5", "isNow": true }
+                ]
+              },
+              { "statusSeverity": 10, "statusSeverityDescription": "Good Service", "validityPeriods": [] }
+            ]
+          }
+        ]"#;
+        let parsed = parse_line_status(json, now()).unwrap();
+        assert_eq!(parsed.skipped, Vec::<Option<String>>::new());
+        let report = &parsed.reports[0];
+        let validity = &report.statuses[0].validity;
+        assert_eq!(
+            validity.from_date,
+            "2026-08-22T01:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(
+            validity.to_date,
+            Some("2026-08-22T09:00:00.5Z".parse::<DateTime<Utc>>().unwrap())
+        );
+        assert_eq!(
+            report.statuses[1].validity.from_date,
+            "2026-08-22T02:00:00.123Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_modified_time_falls_back_to_now_not_a_skip() {
+        let json = r#"[
+          {
+            "id": "central",
+            "name": "Central",
+            "modeName": "tube",
+            "modified": "yesterday-ish",
+            "lineStatuses": [
+              { "statusSeverity": 10, "statusSeverityDescription": "Good Service", "validityPeriods": [] }
+            ]
+          }
+        ]"#;
+        let parsed = parse_line_status(json, now()).unwrap();
+        assert_eq!(parsed.skipped, Vec::<Option<String>>::new());
+        assert_eq!(parsed.reports[0].statuses[0].validity.from_date, now());
+    }
+
+    #[test]
+    fn an_unreadable_validity_date_is_still_malformed() {
+        assert_eq!(parse_tfl_time("not a date"), None);
+        let json = r#"[
+          {
+            "id": "central",
+            "name": "Central",
+            "modeName": "tube",
+            "lineStatuses": [
+              { "statusSeverity": 6, "validityPeriods": [ { "fromDate": "soon" } ] }
+            ]
+          }
+        ]"#;
+        let parsed = parse_line_status(json, now()).unwrap();
+        assert_eq!(parsed.skipped, vec![Some("tfl-central".to_owned())]);
     }
 
     #[test]

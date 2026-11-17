@@ -183,39 +183,32 @@ async fn run() -> anyhow::Result<()> {
     // succeed with `tfl_app_key = ""` rather than failing — silently sending
     // every request unauthenticated instead of refusing to start. Catch that
     // here, before the client is built.
-    require_non_empty_key(&config.tfl_app_key)?;
+    require_non_empty_key(config.tfl_app_key.expose())?;
     let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let stream = stream_sink(&config)?;
-
-    let stops = if config.tfl_stops_enabled && config.jobs.daily() {
-        Some(daily_sink(
-            &config,
-            common::tfl_stops::SCHEMA,
-            "TFL_STOPS_ENABLED",
-        )?)
-    } else {
-        tracing::info!("the stops job is off (TFL_STOPS_ENABLED)");
-        None
-    };
-    let routes = if config.tfl_routes_enabled && config.jobs.daily() {
-        Some(daily_sink(
-            &config,
-            common::tfl_routes::SCHEMA,
-            "TFL_ROUTES_ENABLED",
-        )?)
-    } else {
-        tracing::info!("the route-sequences job is off (TFL_ROUTES_ENABLED)");
-        None
-    };
+    let (stops, routes) = daily_sinks(&config)?;
 
     if once {
         return daily_once(&client, &config, &progress, stops, routes).await;
     }
-    // The producers are lazy: a Redis outage shows as failed cycles.
+    // The producers are lazy and `publish` never waits for Redis, so a
+    // Redis outage does not fail a cycle (`poller_cycle_total` stays
+    // `success`): `watch_sink` below makes the pod unready instead, while a
+    // producer's last XADD failed.
     lifecycle.sink_connected();
+    // Once, for every loop: with `TFL_JOBS=daily` there is no status loop.
+    if config.metrics.metrics_enabled {
+        ds_runtime::metrics::install(config.metrics_port)?;
+    }
+    // Each loop beats its own progress, so `/livez` sees one that hangs.
+    // The daily jobs beat theirs before each TfL call too: their runs can
+    // outlast the stall window (TfL's 429 waits), which the status loop's
+    // idle beats used to cover.
+    let loop_progress = poller_lifecycle::LoopProgress::spawn(&progress);
 
-    let cycle = || lifecycle.track(poll_once(&client, &config, &stream));
+    let last_reports = LastReports::default();
+    let cycle = || lifecycle.track(poll_once(&client, &config, &stream, &last_reports));
 
     // The startup cursor is the stream's newest entry (spec §11.3).
     let status_loop = async {
@@ -227,26 +220,30 @@ async fn run() -> anyhow::Result<()> {
             "tfl",
             || async { Ok(stream.last_produced_at().await?) },
             poll_interval,
-            config.metrics.metrics_enabled,
+            // Installed above.
+            false,
             config.metrics_port,
-            &progress,
+            &loop_progress.add(),
             cycle,
         )
         .await
     };
+    // Each daily job has its own failure streak, so the status poll's
+    // successes do not hide a failing job.
     let stops_loop = async {
         let Some(stops) = &stops else {
             return std::future::pending().await;
         };
+        let tracker = lifecycle.tracker();
+        let beats = loop_progress.add();
         common::poller_loop::run_poll_loop_with_cursor(
             "tfl-stops",
             || async { Ok(stops.stream.last_produced_at().await?) },
             Duration::from_secs(config.tfl_stops_interval_secs),
-            // The status loop installs the exporter.
             false,
             config.metrics_port,
-            &progress,
-            || lifecycle.track(release_after(stops_once(&client, &config, stops))),
+            &beats,
+            || tracker.track(release_after(stops_once(&client, &config, stops, &beats))),
         )
         .await
     };
@@ -254,22 +251,31 @@ async fn run() -> anyhow::Result<()> {
         let Some(routes) = &routes else {
             return std::future::pending().await;
         };
+        let tracker = lifecycle.tracker();
+        let beats = loop_progress.add();
         common::poller_loop::run_poll_loop_with_cursor(
             "tfl-routes",
             || async { Ok(routes.stream.last_produced_at().await?) },
             Duration::from_secs(config.tfl_stops_interval_secs),
             false,
             config.metrics_port,
-            &progress,
-            || lifecycle.track(release_after(routes_once(&client, &config, routes))),
+            &beats,
+            || tracker.track(release_after(routes_once(&client, &config, routes, &beats))),
         )
         .await
     };
+    let status_on = config.jobs.status();
+    let sink = lifecycle.watch_sink(|| {
+        (!status_on || stream.is_available())
+            && stops.as_ref().is_none_or(|s| s.stream.is_available())
+            && routes.as_ref().is_none_or(|s| s.stream.is_available())
+    });
     let loops = async {
         tokio::select! {
             result = status_loop => result,
             result = stops_loop => result,
             result = routes_loop => result,
+            never = sink => match never {},
         }
     };
     // Not once mode (that returned above). At SIGTERM a cycle in flight
@@ -286,6 +292,31 @@ async fn run() -> anyhow::Result<()> {
         flush(routes.stream, "tfl-routes").await;
     }
     result
+}
+
+/// The stops and routes jobs' producers, each `None` while its job is off.
+fn daily_sinks(config: &Config) -> anyhow::Result<(Option<DailySink>, Option<DailySink>)> {
+    let stops = if config.tfl_stops_enabled && config.jobs.daily() {
+        Some(daily_sink(
+            config,
+            common::tfl_stops::SCHEMA,
+            "TFL_STOPS_ENABLED",
+        )?)
+    } else {
+        tracing::info!("the stops job is off (TFL_STOPS_ENABLED)");
+        None
+    };
+    let routes = if config.tfl_routes_enabled && config.jobs.daily() {
+        Some(daily_sink(
+            config,
+            common::tfl_routes::SCHEMA,
+            "TFL_ROUTES_ENABLED",
+        )?)
+    } else {
+        tracing::info!("the route-sequences job is off (TFL_ROUTES_ENABLED)");
+        None
+    };
+    Ok((stops, routes))
 }
 
 /// Flushes a long-running producer at exit, warning about what is left.
@@ -321,7 +352,7 @@ async fn daily_once(
             false,
             config.metrics_port,
             progress,
-            || release_after(stops_once(client, config, &stops)),
+            || release_after(stops_once(client, config, &stops, progress)),
         )
         .await;
         results.push(
@@ -336,7 +367,7 @@ async fn daily_once(
             false,
             config.metrics_port,
             progress,
-            || release_after(routes_once(client, config, &routes)),
+            || release_after(routes_once(client, config, &routes, progress)),
         )
         .await;
         results.push(
@@ -414,7 +445,15 @@ async fn release_after(job: impl Future<Output = anyhow::Result<()>>) -> anyhow:
     result
 }
 
-async fn stops_once(client: &Client, config: &Config, sink: &DailySink) -> anyhow::Result<()> {
+/// `progress` is beaten before each `TfL` call (each bounded by its retry
+/// policy): a run is one loop iteration of `/livez`'s stall window, and a
+/// slow but moving run (`TfL` asking for waits) must not read as a hang.
+async fn stops_once(
+    client: &Client,
+    config: &Config,
+    sink: &DailySink,
+    progress: &ds_runtime::progress::Progress,
+) -> anyhow::Result<()> {
     let fetched_at = Utc::now();
     let base = config.tfl_base_url.trim_end_matches('/');
     let modes = common::tfl_stops::MODES.join(",");
@@ -423,6 +462,7 @@ async fn stops_once(client: &Client, config: &Config, sink: &DailySink) -> anyho
         if page > 1 {
             tokio::time::sleep(STOPS_CALL_GAP).await;
         }
+        progress.beat();
         let url = format!("{base}/StopPoint/Mode/{modes}?page={page}");
         let body = fetch_json(client, &url, config, "stops").await?;
         let parsed = stops::parse_page(&body)?;
@@ -443,6 +483,7 @@ async fn stops_once(client: &Client, config: &Config, sink: &DailySink) -> anyho
     let mut hubs = std::collections::BTreeMap::new();
     for chunk in stops::hub_codes(&found).chunks(stops::HUB_BATCH) {
         tokio::time::sleep(STOPS_CALL_GAP).await;
+        progress.beat();
         let url = format!("{base}/StopPoint/{}", chunk.join(","));
         let body = fetch_json(client, &url, config, "stop-hubs").await?;
         hubs.extend(stops::hub_rail(stops::parse_page(&body)?.stop_points));
@@ -488,7 +529,13 @@ async fn stops_once(client: &Client, config: &Config, sink: &DailySink) -> anyho
 /// each line's routes in both directions, through the feed guard (on the
 /// route count), published as one snapshot. A line with no route at all
 /// fails the run: the snapshot replaces every line's routes.
-async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyhow::Result<()> {
+/// `progress` as [`stops_once`]'s.
+async fn routes_once(
+    client: &Client,
+    config: &Config,
+    sink: &DailySink,
+    progress: &ds_runtime::progress::Progress,
+) -> anyhow::Result<()> {
     let fetched_at = Utc::now();
     let base = config.tfl_base_url.trim_end_matches('/');
     let modes = common::tfl_stops::MODES.join(",");
@@ -507,6 +554,7 @@ async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyh
         for direction in common::tfl_routes::DIRECTIONS {
             tokio::time::sleep(STOPS_CALL_GAP).await;
             // `parse_lines` kept only lower-case slugs: safe in a path.
+            progress.beat();
             let url = format!("{base}/Line/{line}/Route/Sequence/{direction}");
             let body = fetch_json(client, &url, config, "route-sequence").await?;
             let parsed = routes::parse_sequence(line, direction, &body)?;
@@ -534,7 +582,7 @@ async fn routes_once(client: &Client, config: &Config, sink: &DailySink) -> anyh
             "refusing the TfL route sequences: {refusal}"
         ))));
     }
-    let rows = with_running_times(client, config, rows).await;
+    let rows = with_running_times(client, config, rows, progress).await;
     let timed = rows.iter().filter(|r| r.step_seconds.is_some()).count();
     tracing::info!(
         lines = lines.len(),
@@ -576,6 +624,7 @@ async fn with_running_times(
     client: &Client,
     config: &Config,
     mut rows: Vec<common::tfl_routes::TflLineRoute>,
+    progress: &ds_runtime::progress::Progress,
 ) -> Vec<common::tfl_routes::TflLineRoute> {
     let base = config.tfl_base_url.trim_end_matches('/');
     let mut samples = routes::StepSamples::default();
@@ -591,6 +640,7 @@ async fn with_running_times(
             continue;
         }
         tokio::time::sleep(STOPS_CALL_GAP).await;
+        progress.beat();
         // Line ids are slugs and stop ids `NaPTAN` ids (both checked by
         // `routes::parse_sequence`): safe in a path.
         let url = format!("{base}/Line/{}/Timetable/{first}/to/{last}", route.line_id);
@@ -692,16 +742,49 @@ fn stream_sink(config: &Config) -> anyhow::Result<SnapshotStream> {
     ))
 }
 
+/// Each `TfL` line's last published report, by id: what stands in for a
+/// malformed entry ([`schema::complete_snapshot`]).
+type LastReports = std::sync::Mutex<std::collections::HashMap<String, common::LineStatusReport>>;
+
 async fn poll_once(
     client: &Client,
     config: &Config,
     stream: &SnapshotStream,
+    last: &LastReports,
 ) -> anyhow::Result<()> {
     // The snapshot's `produced_at` on the stream (decision D13): when it
     // was fetched, not when it is sent.
     let fetched_at = Utc::now();
     let body = fetch_status_json(client, config).await?;
-    let reports = schema::parse_line_status(&body, fetched_at)?;
+    let parsed = schema::parse_line_status(&body, fetched_at)?;
+    let skipped = parsed.skipped.len();
+    let completed = {
+        let mut last = last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        schema::complete_snapshot(parsed, &mut last)
+    };
+    let reports = match completed {
+        Ok((reports, completed)) => {
+            // A malformed repeat of a line that parsed left nothing out.
+            if !completed.carried_forward.is_empty() {
+                count_skipped(completed.carried_forward.len(), "carried_forward");
+                tracing::warn!(
+                    lines = ?completed.carried_forward,
+                    "malformed TfL line status entries; their lines keep their last status"
+                );
+            }
+            reports
+        }
+        Err(err) => {
+            count_skipped(skipped, "refused");
+            // TfL's data, not a fault here: the next interval (no
+            // in-cycle retry), and nothing is published, so nothing pruned.
+            return Err(anyhow::Error::new(common::ingest::DataRejected(format!(
+                "{err:#}"
+            ))));
+        }
+    };
 
     // Never publish an empty snapshot. The writer prunes TfL rows that are
     // missing from the snapshot it applies, so an empty one would read as
@@ -718,6 +801,17 @@ async fn poll_once(
 
     stream.publish(&reports, fetched_at).await?;
     Ok(())
+}
+
+/// `distant_signal_tfl_line_status_skipped_total{outcome}`: malformed line
+/// status entries, by what became of their lines (`carried_forward`: the
+/// last good report stood in; `refused`: the snapshot was not published).
+fn count_skipped(entries: usize, outcome: &'static str) {
+    metrics::counter!(
+        ds_runtime::metrics::metric_name("tfl_line_status_skipped_total"),
+        "outcome" => outcome
+    )
+    .increment(u64::try_from(entries).unwrap_or(u64::MAX));
 }
 
 async fn fetch_status_json(client: &Client, config: &Config) -> anyhow::Result<String> {
@@ -742,45 +836,129 @@ async fn fetch_json(
     config: &Config,
     what: &str,
 ) -> anyhow::Result<String> {
-    let mut attempt = 0;
-    // Tracks the status code of the most recent retryable failure, if any
-    // -- this is what distinguishes a same-cycle "succeeded on the first
-    // try" outcome from "succeeded after backing off from a 429/5xx",
-    // which the plain success/failure result of the call alone can't tell
-    // apart. See docs/superpowers/specs/2026-08-29-metrics-design.md's v1
-    // scope item 3.
-    let mut retried_status: Option<StatusCode> = None;
-    let policy = retry_policy(what);
-    loop {
-        let response = client
-            .get(url)
-            .header(TFL_AUTH_HEADER_NAME, &config.tfl_app_key)
-            .send()
-            .await?;
-        let status = response.status();
+    fetch_json_with(
+        client,
+        url,
+        config.tfl_app_key.expose(),
+        what,
+        retry_policy(what),
+    )
+    .await
+}
 
-        if status.is_success() {
-            let outcome = match retried_status {
-                None => "success",
-                Some(s) if s == StatusCode::TOO_MANY_REQUESTS => "retried_429",
-                Some(_) => "retried_5xx",
-            };
-            metrics::counter!(
-                ds_runtime::metrics::metric_name("tfl_fetch_total"),
-                "what" => what.to_string(),
-                "outcome" => outcome
-            )
-            .increment(1);
-            return Ok(response.text().await?);
+/// Worth retrying inside the cycle: a request that timed out or never
+/// connected (a blip, as a 5xx is), not one this poller built wrong.
+fn should_retry_transport(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect()
+}
+
+/// What a retryable failure was, for the metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retried {
+    TooManyRequests,
+    ServerError,
+    Transport,
+}
+
+impl Retried {
+    /// `tfl_fetch_total`'s `outcome` for a success after this.
+    fn outcome(self) -> &'static str {
+        match self {
+            Self::TooManyRequests => "retried_429",
+            Self::ServerError => "retried_5xx",
+            Self::Transport => "retried_transport",
         }
+    }
+
+    /// `tfl_fetch_retries_total`'s `status`.
+    fn label(self) -> &'static str {
+        match self {
+            Self::TooManyRequests => "429",
+            Self::ServerError => "5xx",
+            Self::Transport => "transport",
+        }
+    }
+}
+
+/// The body of a successful GET, or the transport error that ended it.
+async fn get_text(
+    client: &Client,
+    url: &str,
+    key: &str,
+) -> Result<Result<String, (StatusCode, Option<String>, String)>, reqwest::Error> {
+    let response = client
+        .get(url)
+        .header(TFL_AUTH_HEADER_NAME, key)
+        .send()
+        .await?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(Ok(response.text().await?));
+    }
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = response.text().await.unwrap_or_default();
+    Ok(Err((status, retry_after, body)))
+}
+
+async fn fetch_json_with(
+    client: &Client,
+    url: &str,
+    key: &str,
+    what: &str,
+    policy: RetryPolicy,
+) -> anyhow::Result<String> {
+    let mut attempt = 0;
+    // What the most recent retryable failure was, if any -- this is what
+    // distinguishes a same-cycle "succeeded on the first try" outcome from
+    // "succeeded after backing off from a 429/5xx/timeout", which the plain
+    // success/failure result of the call alone can't tell apart. See
+    // docs/superpowers/specs/2026-08-29-metrics-design.md's v1 scope item 3.
+    let mut retried: Option<Retried> = None;
+    loop {
+        let (status, retry_after, body) = match get_text(client, url, key).await {
+            Ok(Ok(text)) => {
+                metrics::counter!(
+                    ds_runtime::metrics::metric_name("tfl_fetch_total"),
+                    "what" => what.to_string(),
+                    "outcome" => retried.map_or("success", Retried::outcome)
+                )
+                .increment(1);
+                return Ok(text);
+            }
+            Ok(Err(failed)) => failed,
+            // A timeout or a refused connection: retried as a 5xx is (one
+            // blip among the routes job's hundreds of calls used to abort
+            // the whole daily run).
+            Err(err) => {
+                attempt += 1;
+                if attempt >= policy.max_attempts || !should_retry_transport(&err) {
+                    metrics::counter!(
+                        ds_runtime::metrics::metric_name("tfl_fetch_total"),
+                        "what" => what.to_string(),
+                        "outcome" => "exhausted"
+                    )
+                    .increment(1);
+                    return Err(err.into());
+                }
+                retried = Some(Retried::Transport);
+                count_retry(what, Retried::Transport);
+                let delay = policy.backoff.delay(attempt - 1);
+                tracing::warn!(
+                    error = %err,
+                    attempt,
+                    delay_secs = delay.as_secs(),
+                    "TfL {what} request failed; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        };
 
         attempt += 1;
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let body = response.text().await.unwrap_or_default();
         if attempt >= policy.max_attempts || !should_retry(status) {
             // A 404 is `TfL` not publishing the resource (a tram timetable
             // from anywhere but its timetabled origin), not a fault.
@@ -803,13 +981,13 @@ async fn fetch_json(
             .into());
         }
 
-        retried_status = Some(status);
-        metrics::counter!(
-            ds_runtime::metrics::metric_name("tfl_fetch_retries_total"),
-            "what" => what.to_string(),
-            "status" => if status == StatusCode::TOO_MANY_REQUESTS { "429" } else { "5xx" }
-        )
-        .increment(1);
+        let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+            Retried::TooManyRequests
+        } else {
+            Retried::ServerError
+        };
+        retried = Some(kind);
+        count_retry(what, kind);
         let asked = requested_wait(retry_after.as_deref(), &body);
         // At least what TfL asked for (jittered up by at most a quarter,
         // capped at 5 minutes), else the jittered exponential backoff.
@@ -825,8 +1003,21 @@ async fn fetch_json(
     }
 }
 
+/// `distant_signal_tfl_fetch_retries_total{what, status}`.
+fn count_retry(what: &str, kind: Retried) {
+    metrics::counter!(
+        ds_runtime::metrics::metric_name("tfl_fetch_retries_total"),
+        "what" => what.to_string(),
+        "status" => kind.label()
+    )
+    .increment(1);
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[test]
@@ -834,6 +1025,95 @@ mod tests {
         assert!(should_retry(StatusCode::TOO_MANY_REQUESTS));
         assert!(should_retry(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(should_retry(StatusCode::BAD_GATEWAY));
+    }
+
+    /// A policy that retries at once, for the transport tests.
+    const QUICK_RETRY: RetryPolicy = RetryPolicy {
+        max_attempts: 3,
+        backoff: ds_runtime::backoff::Backoff::new(
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        ),
+    };
+
+    /// A local server whose first `hangs` connections are accepted and
+    /// never answered; the rest get `200 ok`. Returns its URL and the
+    /// connections it has accepted.
+    async fn flaky_server(hangs: usize) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/Line", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                if counter.fetch_add(1, Ordering::SeqCst) < hangs {
+                    held.push(socket);
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 4096];
+                    let _ = socket.read(&mut request).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        (url, accepted)
+    }
+
+    fn quick_client() -> Client {
+        Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap()
+    }
+
+    /// One timeout among the routes job's hundreds of calls must not abort
+    /// the whole daily run: it is retried like a 5xx.
+    #[tokio::test]
+    async fn a_timeout_is_retried() {
+        let (url, accepted) = flaky_server(1).await;
+        let body = fetch_json_with(&quick_client(), &url, "k", "route-sequence", QUICK_RETRY)
+            .await
+            .unwrap();
+        assert_eq!(body, "ok");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn timeouts_give_up_after_the_policys_attempts() {
+        let (url, accepted) = flaky_server(usize::MAX).await;
+        let err = fetch_json_with(&quick_client(), &url, "k", "route-sequence", QUICK_RETRY)
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout),
+            "{err:#}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_retryable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        drop(listener);
+        let err = quick_client().get(&url).send().await.unwrap_err();
+        assert!(should_retry_transport(&err), "{err:?}");
+        assert!(
+            fetch_json_with(&quick_client(), &url, "k", "lines", QUICK_RETRY)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

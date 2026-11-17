@@ -114,8 +114,13 @@ alerts cover that case. Coverage is adequate, so no alert was added.
      #4). The fallback counts from when the sink connected (Postgres and the
      schema gate for a database writer), so a pod still waiting on either
      is never ready. Readiness then follows the cycles: three failed cycles
-     in a row make the pod unready until the next success. `/livez` is
-     unaffected, so a failing or quiet poller is never restarted for it;
+     in a row make the pod unready until the next success. In a process
+     with several loops (poller-tfl's status poll and daily jobs) each loop
+     has its own streak, and the pod is unready while any loop is on one;
+     poller-tfl is also unready while a stream producer's last write
+     failed. `/livez` is unaffected, so a failing or quiet poller is never
+     restarted for it; it follows each loop's own progress, so one loop
+     hanging is not hidden by another's idle beats;
    - the chart runs these Deployments with a surge (`pollers.<name>.rollout:
      surge`): RollingUpdate, `maxSurge: 1`, `maxUnavailable: 0`, with a
      readiness probe on `/healthz` (Distant-Signal/ds-deploy#24). The old
