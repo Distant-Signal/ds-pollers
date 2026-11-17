@@ -67,6 +67,9 @@ const CYCLE_TIME_BUDGET: Duration = Duration::from_secs(240);
 /// default of sending none at all. See `ds_runtime::user_agent`.
 const USER_AGENT: &str = ds_runtime::user_agent!();
 
+/// The most of an upstream body a debug log line carries.
+const LOG_BODY_LIMIT: usize = 4 * 1024;
+
 /// The most of the all-stations body read (decoded): about 170 stations,
 /// some 30 KB of XML, so 2 MiB is a wide margin.
 const MAX_STATIONS_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -330,7 +333,11 @@ async fn fetch_all_stations(
     let response = poller_http::ensure_success(response, "irish-rail-live")?;
     let body =
         poller_http::read_capped_text(response, MAX_STATIONS_BODY_BYTES, "irish-rail-live").await?;
-    tracing::debug!(body = %body, "raw getAllStationsXML response body");
+    tracing::debug!(
+        body = %poller_http::truncate_for_log(&body, LOG_BODY_LIMIT),
+        len = body.len(),
+        "raw getAllStationsXML response body (start)"
+    );
     schema::parse_all_stations(&body)
 }
 
@@ -360,7 +367,12 @@ async fn fetch_station_departures(
     let response = poller_http::ensure_success(response, "irish-rail-live")?;
     let body =
         poller_http::read_capped_text(response, MAX_BOARD_BODY_BYTES, "irish-rail-live").await?;
-    tracing::debug!(station_code = %station_code, body = %body, "raw getStationDataByCodeXML response body");
+    tracing::debug!(
+        station_code = %station_code,
+        body = %poller_http::truncate_for_log(&body, LOG_BODY_LIMIT),
+        len = body.len(),
+        "raw getStationDataByCodeXML response body (start)"
+    );
     schema::parse_station_departures(&body)
 }
 

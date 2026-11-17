@@ -162,6 +162,9 @@ async fn fetch_stations_json(
     .await
 }
 
+/// The most of the body a debug log line carries.
+const LOG_BODY_LIMIT: usize = 4 * 1024;
+
 /// The most of the stations body read (decoded). The real feed is about
 /// 37 MB of JSON; 96 MiB is about 2.5 times that, and the largest cap here
 /// because the pod holds the body and its parse together.
@@ -192,7 +195,12 @@ async fn fetch_capped(
     // `RUST_LOG=poller_stations=debug`, inspect the logged body against a
     // known station (e.g. `EUS`), and adjust `schema::RdmStation`'s
     // `rename_all`/per-field `rename` attributes if reality differs.
-    tracing::debug!(body = %String::from_utf8_lossy(&body), "raw stations response body");
+    // Only the start: the whole body is about 37 MB.
+    tracing::debug!(
+        body = %String::from_utf8_lossy(&body[..body.len().min(LOG_BODY_LIMIT)]),
+        len = body.len(),
+        "raw stations response body (start)"
+    );
 
     Ok(body)
 }
