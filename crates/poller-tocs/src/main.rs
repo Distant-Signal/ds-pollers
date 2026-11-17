@@ -28,6 +28,11 @@ use reqwest::Client;
 /// comfortably short relative to the 86400s recommended poll interval.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The most of the TOC list body read (decoded). The real feed is about 40
+/// rows of XML (a few KB); 8 MiB is orders of magnitude above that and
+/// still harmless to hold.
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 /// Once mode (`RUN_ONCE`, a scheduled Job; `common::poller_loop`): how long
 /// the run waits for its snapshot to reach the stream before failing (exit
 /// 1, so the Job retries). Inside the chart's `activeDeadlineSeconds`.
@@ -119,15 +124,54 @@ async fn poll_once(
 }
 
 async fn fetch_tocs_xml(client: &Client, config: &Config) -> anyhow::Result<String> {
+    fetch_capped(
+        client,
+        &config.rdm_tocs_base_url,
+        config.rdm_api_key.expose(),
+        MAX_BODY_BYTES,
+    )
+    .await
+}
+
+async fn fetch_capped(
+    client: &Client,
+    url: &str,
+    api_key: &str,
+    cap: usize,
+) -> anyhow::Result<String> {
     // Header per RSPS5050 P-03-00 Rev A §3 — corroborated for the RDM
     // platform generally via a different product's confirmed example, not
     // proven specifically for this product.
     let response = client
-        .get(&config.rdm_tocs_base_url)
-        .header(RDM_AUTH_HEADER_NAME, config.rdm_api_key.expose())
+        .get(url)
+        .header(RDM_AUTH_HEADER_NAME, api_key)
         .send()
         .await?
         .error_for_status()?;
 
-    Ok(response.text().await?)
+    Ok(poller_http::read_capped_text(response, cap, "tocs").await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn an_oversized_body_fails_the_cycle() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 4096]))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let ok = fetch_capped(&client, &server.uri(), "k", 4096).await;
+        assert_eq!(ok.unwrap().len(), 4096);
+        let err = fetch_capped(&client, &server.uri(), "k", 4095)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeded"), "{err}");
+    }
 }

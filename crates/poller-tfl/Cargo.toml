@@ -10,6 +10,7 @@ license.workspace = true
 # Readiness after the first successful cycle, and the SIGTERM drain
 # (docs/redeploy-safety.md).
 poller-lifecycle = { path = "../poller-lifecycle" }
+poller-http = { path = "../poller-http" }
 # The snapshot producer for `ds:ingest:tfl` (ingest plan 3c.2): the only
 # sink since release B.
 ingest-stream = { workspace = true }
@@ -30,6 +31,7 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
+wiremock = "0.6"
 # The fetch retry tests' local server.
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 

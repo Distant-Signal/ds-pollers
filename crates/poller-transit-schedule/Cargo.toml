@@ -22,6 +22,7 @@ dotenvy = "0.15.7"
 health-http = { workspace = true }
 # Per-loop liveness (`LoopProgress`); no database (check-crate-deps.py).
 poller-lifecycle = { path = "../poller-lifecycle" }
+poller-http = { path = "../poller-http" }
 # The `ds:ingest:transit-<network>` producer.
 ingest-stream = { workspace = true }
 metrics = "0.24"

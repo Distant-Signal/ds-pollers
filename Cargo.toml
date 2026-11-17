@@ -5,6 +5,7 @@
 # Cargo.lock is updated.
 resolver = "3"
 members = [
+    "crates/poller-http",
     "crates/poller-incidents",
     "crates/poller-irish-rail-gtfs",
     "crates/poller-irish-rail-live",

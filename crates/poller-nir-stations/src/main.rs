@@ -136,23 +136,21 @@ fn older_cursor(
     Some(a?.min(b?))
 }
 
+/// The most of one catalogue CSV read (decoded). The stations file is
+/// about 100 rows and the halts file a few hundred KB, so 8 MiB is a wide
+/// margin.
+const MAX_CSV_BYTES: usize = 8 * 1024 * 1024;
+
+async fn fetch_csv(client: &Client, url: &str, cap: usize) -> anyhow::Result<Vec<u8>> {
+    let response = client.get(url).send().await?.error_for_status()?;
+    Ok(poller_http::read_capped(response, cap, "nir-stations").await?)
+}
+
 async fn poll_once(client: &Client, config: &Config, sinks: &Sinks) -> anyhow::Result<()> {
     // The snapshots' `produced_at` (decision D13): the fetch time.
     let fetched_at = Utc::now();
-    let stations_csv = client
-        .get(&config.stations_csv_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
-    let halts_csv = client
-        .get(&config.halts_csv_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
+    let stations_csv = fetch_csv(client, &config.stations_csv_url, MAX_CSV_BYTES).await?;
+    let halts_csv = fetch_csv(client, &config.halts_csv_url, MAX_CSV_BYTES).await?;
 
     let stations = mapping::map_stations(&stations_csv, &halts_csv)?;
     let lines = mapping::map_lines();
@@ -208,6 +206,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_csv_fails_the_cycle() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/stations.csv"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 4096]))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let url = format!("{}/stations.csv", server.uri());
+
+        assert_eq!(fetch_csv(&client, &url, 4096).await.unwrap().len(), 4096);
+        let err = fetch_csv(&client, &url, 4095).await.unwrap_err();
+        assert!(err.to_string().contains("exceeded"), "{err}");
     }
 }
 

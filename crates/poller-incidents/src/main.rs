@@ -171,16 +171,60 @@ async fn poll_once(
         .map_err(sink::SinkError::into_anyhow)
 }
 
+/// The most of the incidents body read (decoded). The feed is a few
+/// hundred KB to a few MB of XML in a bad disruption; 32 MiB is a wide
+/// margin.
+const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 async fn fetch_incidents_xml(client: &Client, config: &Config) -> anyhow::Result<String> {
+    fetch_capped(
+        client,
+        &config.rdm_incidents_base_url,
+        config.rdm_api_key.expose(),
+        MAX_BODY_BYTES,
+    )
+    .await
+}
+
+async fn fetch_capped(
+    client: &Client,
+    url: &str,
+    api_key: &str,
+    cap: usize,
+) -> anyhow::Result<String> {
     // Header per RSPS5050 P-03-00 Rev A §10 — corroborated for the RDM
     // platform generally via a different product's confirmed example, not
     // proven specifically for this product.
     let response = client
-        .get(&config.rdm_incidents_base_url)
-        .header(RDM_AUTH_HEADER_NAME, config.rdm_api_key.expose())
+        .get(url)
+        .header(RDM_AUTH_HEADER_NAME, api_key)
         .send()
         .await?
         .error_for_status()?;
 
-    Ok(response.text().await?)
+    Ok(poller_http::read_capped_text(response, cap, "incidents").await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn an_oversized_body_fails_the_cycle() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 4096]))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let ok = fetch_capped(&client, &server.uri(), "k", 4096).await;
+        assert_eq!(ok.unwrap().len(), 4096);
+        let err = fetch_capped(&client, &server.uri(), "k", 4095)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeded"), "{err}");
+    }
 }

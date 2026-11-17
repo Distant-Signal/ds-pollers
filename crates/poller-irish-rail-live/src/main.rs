@@ -67,6 +67,14 @@ const CYCLE_TIME_BUDGET: Duration = Duration::from_secs(240);
 /// default of sending none at all. See `ds_runtime::user_agent`.
 const USER_AGENT: &str = ds_runtime::user_agent!();
 
+/// The most of the all-stations body read (decoded): about 170 stations,
+/// some 30 KB of XML, so 2 MiB is a wide margin.
+const MAX_STATIONS_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// The most of one station's departures body read (decoded): a few KB of
+/// XML at most, so 1 MiB is a wide margin.
+const MAX_BOARD_BODY_BYTES: usize = 1024 * 1024;
+
 /// Builds the HTTP client used for every upstream fetch and ingest POST.
 /// Split out of `main` so the test below can assert, over real HTTP, that
 /// the client actually sends [`USER_AGENT`].
@@ -310,13 +318,9 @@ async fn fetch_all_stations(
     config: &Config,
 ) -> anyhow::Result<Vec<IslandOfIrelandLiveStation>> {
     let url = format!("{}/getAllStationsXML", config.irish_rail_base_url);
-    let body = client
-        .get(&url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+    let response = client.get(&url).send().await?.error_for_status()?;
+    let body =
+        poller_http::read_capped_text(response, MAX_STATIONS_BODY_BYTES, "irish-rail-live").await?;
     tracing::debug!(body = %body, "raw getAllStationsXML response body");
     schema::parse_all_stations(&body)
 }
@@ -343,13 +347,9 @@ async fn fetch_station_departures(
     ))?;
     url.query_pairs_mut()
         .append_pair("StationCode", station_code.trim());
-    let body = client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+    let response = client.get(url).send().await?.error_for_status()?;
+    let body =
+        poller_http::read_capped_text(response, MAX_BOARD_BODY_BYTES, "irish-rail-live").await?;
     tracing::debug!(station_code = %station_code, body = %body, "raw getStationDataByCodeXML response body");
     schema::parse_station_departures(&body)
 }
@@ -410,6 +410,26 @@ mod tests {
 
     const EMPTY_STATION_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
         <ArrayOfObjStationData xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns="http://api.irishrail.ie/realtime/" />"#;
+
+    #[tokio::test]
+    async fn an_oversized_departures_body_fails_the_station() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/getStationDataByCodeXML"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_BOARD_BODY_BYTES + 1]),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = test_config(server.uri());
+
+        let err = fetch_station_departures(&Client::new(), &config, "BFSTC")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("exceeded"), "{err}");
+    }
 
     #[tokio::test]
     async fn station_code_is_trimmed_and_url_encoded_not_spliced_raw() {

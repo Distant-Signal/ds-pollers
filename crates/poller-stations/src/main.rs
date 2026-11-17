@@ -143,18 +143,38 @@ async fn fetch_stations_json(
     client: &Client,
     config: &Config,
 ) -> anyhow::Result<impl std::ops::Deref<Target = [u8]>> {
+    fetch_capped(
+        client,
+        &format!("{}/stations", config.rdm_stations_base_url),
+        config.rdm_api_key.expose(),
+        MAX_BODY_BYTES,
+    )
+    .await
+}
+
+/// The most of the stations body read (decoded). The real feed is about
+/// 37 MB of JSON; 96 MiB is about 2.5 times that, and the largest cap here
+/// because the pod holds the body and its parse together.
+const MAX_BODY_BYTES: usize = 96 * 1024 * 1024;
+
+async fn fetch_capped(
+    client: &Client,
+    url: &str,
+    api_key: &str,
+    cap: usize,
+) -> anyhow::Result<Vec<u8>> {
     // Header not stated specifically for the Stations product in
     // RSPS5050 P-03-00 Rev A §6 ("An API Key will be required to access
     // the JSON feed via RDM" — no header name given); this is the same
     // working assumption used for `poller-incidents` (Task 3).
     let response = client
-        .get(format!("{}/stations", config.rdm_stations_base_url))
-        .header(RDM_AUTH_HEADER_NAME, config.rdm_api_key.expose())
+        .get(url)
+        .header(RDM_AUTH_HEADER_NAME, api_key)
         .send()
         .await?
         .error_for_status()?;
 
-    let body = response.bytes().await?;
+    let body = poller_http::read_capped(response, cap, "stations").await?;
 
     // GAP: the JSON field casing for this feed is unconfirmed (see
     // `schema.rs` module docs). Logging the raw body here, before parsing,
@@ -165,4 +185,28 @@ async fn fetch_stations_json(
     tracing::debug!(body = %String::from_utf8_lossy(&body), "raw stations response body");
 
     Ok(body)
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn an_oversized_body_fails_the_cycle() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 4096]))
+            .mount(&server)
+            .await;
+        let client = Client::new();
+        let ok = fetch_capped(&client, &server.uri(), "k", 4096).await;
+        assert_eq!(ok.unwrap().len(), 4096);
+        let err = fetch_capped(&client, &server.uri(), "k", 4095)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeded"), "{err}");
+    }
 }
