@@ -26,7 +26,8 @@
 //!
 //! A second, optional lane (`tracked_stops.rs`, DS-127) polls the boards of
 //! tracked trains' own stops, narrowed to each train's booked time, with
-//! its own request cap; its boards ride the same snapshot.
+//! its own per-cycle request cap, inside the hourly request budget; its
+//! boards ride the same snapshot.
 
 mod budget;
 mod config;
@@ -179,8 +180,11 @@ async fn run() -> anyhow::Result<()> {
     // holds an undelivered snapshot.
     let sink = SampleSink::from_config(&config)?;
     tracing::info!("producing station samples to ds:ingest:station-samples");
-    // Postgres and the schema gate (the station list) passed above; the
-    // stream producer is lazy, so a Redis outage shows as failed cycles.
+    // Postgres and the schema gate (the station list) passed above. The
+    // stream producer connects lazily, but `SampleSink::deliver` waits for
+    // each snapshot's write receipt (up to `post_retry_budget`), so a Redis
+    // outage shows as failed cycles (`sink.rs`'s
+    // `redis_down_fails_the_cycle_transiently_and_holds_the_snapshot`).
     lifecycle.sink_connected();
 
     let policy = retry_policy(poll_interval);
@@ -330,6 +334,10 @@ struct CycleState<'a> {
 /// snapshot, the next cycle samples the same stations again (and its
 /// snapshot supersedes the held one), and the cycle reports failure. So a
 /// Redis outage costs no station its turn.
+///
+/// A cycle in which every LDBWS request failed also reports failure (after
+/// the rotation moves on as usual), so an upstream outage is not a run of
+/// successful empty cycles.
 async fn poll_once(
     client: &Client,
     config: &Config,
@@ -354,6 +362,7 @@ async fn poll_once(
     // Stations LDBWS rejected as invalid are left out until their hourly
     // re-probe is due -- see `rotation`'s module docs.
     let polled = rotation.pollable(&ordered, std::time::Instant::now());
+    state.platform_history.prune(std::time::Instant::now());
     state.request_budget.start_cycle();
     let CycleSampling {
         samples,
@@ -381,23 +390,36 @@ async fn poll_once(
     if sampled == 0 {
         tracing::warn!("no station samples collected this cycle");
     }
-    // The tracked-stop lane, after the rotation and within its own budget
-    // (DS-127). Its boards ride the same snapshot.
+    // The tracked-stop lane, after the rotation, within its own cap and the
+    // hourly request budget (DS-127, LEG-18). Its boards ride the same
+    // snapshot.
     let departures = if config.tracked_stop_poll_enabled {
-        sample_tracked_stops(client, config, state.cadence, state.platform_history).await
+        sample_tracked_stops(
+            client,
+            config,
+            state.cadence,
+            state.platform_history,
+            state.request_budget,
+        )
+        .await
     } else {
-        Vec::new()
+        LanePass::default()
     };
     // Its arrivals sub-lane (DS-152), within its own budget.
     let arrivals = if config.tracked_stop_arrivals_enabled {
         sample_tracked_arrivals(client, config, state.arrivals_cadence).await
     } else {
-        Vec::new()
+        LanePass::default()
     };
+    // Invalid CRS codes are a catalogue problem, flagged on their own
+    // (`record_invalid_crs`), not an outage.
+    let attempted =
+        completed.saturating_sub(invalid_crs.len()) + departures.attempted + arrivals.attempted;
     let tracked = TrackedBoards {
-        departures,
-        arrivals,
+        departures: departures.boards,
+        arrivals: arrivals.boards,
     };
+    let all_failed = every_request_failed(attempted, sampled, &tracked);
     let result = deliver_cycle(config, sink, samples, &tracked, now).await;
     let progressed = match &result {
         Ok(delivered) => {
@@ -424,7 +446,22 @@ async fn poll_once(
     let stalest = rotation.stalest_age(&ordered, now);
     record_cycle_metrics(ordered.len(), completed, sampled, stalest);
     record_rotation_progress(rotation, polled.len(), progressed, stalest, now);
-    result.map(|_| ())
+    result?;
+    // Nothing fetched although requests were made: an upstream outage (or
+    // a bad key) must fail the cycle, not report success. A cycle with
+    // nothing to fetch (an empty list, or a budget that allowed nothing)
+    // is still a success.
+    anyhow::ensure!(
+        !all_failed,
+        "every LDBWS request this cycle failed ({attempted} attempted); see the errors above"
+    );
+    Ok(())
+}
+
+/// Whether a cycle made LDBWS requests and every one of them failed: no
+/// station sample and no tracked-stop board from `attempted` requests.
+fn every_request_failed(attempted: usize, sampled: usize, tracked: &TrackedBoards) -> bool {
+    attempted > 0 && sampled == 0 && tracked.is_empty()
 }
 
 /// Delivers one cycle's `samples` through `sink` and returns what was
@@ -772,7 +809,7 @@ async fn sample_all_stations(
         }
         match fetch_departures(client, config, request_budget, crs).await {
             Ok(mut departures) => {
-                platform_history.apply(crs, &mut departures);
+                platform_history.apply(crs, &mut departures, std::time::Instant::now());
                 out.samples.push(StationSample {
                     crs: crs.clone(),
                     polled_at: Utc::now(),
@@ -838,8 +875,10 @@ fn register_tracked_stop_metrics() {
 
 /// The tracked-stop lane (`tracked_stops.rs`): reads the stops in the
 /// horizon, then polls the ones due, soonest first, up to the per-cycle
-/// cap and [`tracked_stops::LANE_TIME_BUDGET`]. A failed read or request is
-/// logged and skipped; the lane never fails the cycle.
+/// cap and [`tracked_stops::LANE_TIME_BUDGET`], each request charged to the
+/// hourly request budget (LEG-18, [`RequestBudget::try_acquire_hourly`]). A
+/// failed read or request is logged and skipped; the lane alone never fails
+/// the cycle (`poll_once` fails one in which every request failed).
 #[expect(
     clippy::cast_precision_loss,
     reason = "a gauge takes f64; the target count stays far below 2^52"
@@ -849,9 +888,10 @@ async fn sample_tracked_stops(
     config: &Config,
     cadence: &mut Cadence,
     platform_history: &mut PlatformHistory,
-) -> Vec<TrackedStopBoard> {
+    request_budget: &mut RequestBudget,
+) -> LanePass<TrackedStopBoard> {
     let Some(direct) = &config.reads.direct else {
-        return Vec::new();
+        return LanePass::default();
     };
     let now = Utc::now();
     let targets = match ds_store::reads::tracked_stop_targets::tracked_stop_targets(
@@ -865,7 +905,7 @@ async fn sample_tracked_stops(
         Ok(targets) => targets,
         Err(err) => {
             tracing::warn!(error = ?err, "could not read the tracked stops; skipping the lane");
-            return Vec::new();
+            return LanePass::default();
         }
     };
     metrics::gauge!(ds_runtime::metrics::metric_name(
@@ -874,17 +914,71 @@ async fn sample_tracked_stops(
     .set(targets.len() as f64);
     cadence.prune(now);
     let due = cadence.due(&targets, now);
+    let pass = poll_tracked_stops(
+        client,
+        config,
+        &due,
+        cadence,
+        platform_history,
+        request_budget,
+    )
+    .await;
+    let skipped = due.len().saturating_sub(pass.attempted);
+    metrics::counter!(ds_runtime::metrics::metric_name(
+        TRACKED_STOP_SKIPPED_METRIC
+    ))
+    .increment(u64::try_from(skipped).unwrap_or(u64::MAX));
+    pass
+}
+
+/// What one pass of a tracked-stop lane produced.
+#[derive(Debug)]
+struct LanePass<T> {
+    boards: Vec<T>,
+    /// Requests made, successful or not.
+    attempted: usize,
+}
+
+impl<T> Default for LanePass<T> {
+    fn default() -> Self {
+        Self {
+            boards: Vec::new(),
+            attempted: 0,
+        }
+    }
+}
+
+/// Polls the `due` tracked stops in order, up to the lane's per-cycle cap
+/// and time budget, and while the hourly request budget allows: once it
+/// refuses, the rest wait for a later cycle (logged once).
+async fn poll_tracked_stops(
+    client: &Client,
+    config: &Config,
+    due: &[&ds_store::reads::tracked_stop_targets::TrackedStopTarget],
+    cadence: &mut Cadence,
+    platform_history: &mut PlatformHistory,
+    request_budget: &mut RequestBudget,
+) -> LanePass<TrackedStopBoard> {
     let cap = usize::try_from(config.tracked_stop_max_requests_per_cycle).unwrap_or(usize::MAX);
     let mut boards = Vec::new();
     let mut attempted = 0usize;
+    let mut refused = None;
     {
         let work = async {
             for target in due.iter().take(cap) {
+                if let Err(limit) = request_budget.try_acquire_hourly(std::time::Instant::now()) {
+                    refused = Some(limit);
+                    break;
+                }
                 attempted += 1;
                 let (offset, window) = tracked_stops::window(target.departs_at, Utc::now());
                 match fetch_board_window(client, config, &target.crs, offset, window).await {
                     Ok(mut departures) => {
-                        platform_history.apply(&target.crs, &mut departures);
+                        platform_history.apply(
+                            &target.crs,
+                            &mut departures,
+                            std::time::Instant::now(),
+                        );
                         let polled_at = Utc::now();
                         cadence.polled(target, polled_at);
                         boards.push(TrackedStopBoard {
@@ -922,12 +1016,17 @@ async fn sample_tracked_stops(
             () = work => {}
         }
     }
-    let skipped = due.len().saturating_sub(attempted);
-    metrics::counter!(ds_runtime::metrics::metric_name(
-        TRACKED_STOP_SKIPPED_METRIC
-    ))
-    .increment(u64::try_from(skipped).unwrap_or(u64::MAX));
-    boards
+    if let Some(limit) = refused {
+        tracing::warn!(
+            stops_due = due.len(),
+            stops_polled = attempted,
+            limit = limit.as_str(),
+            hourly_request_budget = config.hourly_request_budget,
+            "LDBWS hourly request budget reached; the remaining tracked stops wait for a \
+             later cycle"
+        );
+    }
+    LanePass { boards, attempted }
 }
 
 /// `ldbws_tracked_stop_arrival_polls_total{outcome}`: arrival board
@@ -944,7 +1043,9 @@ const TRACKED_STOP_ARRIVAL_TARGETS_METRIC: &str = "ldbws_tracked_stop_arrival_ta
 /// stops in the horizon, then polls the arrivals product for the ones due,
 /// soonest arrival first, up to its own cap and
 /// [`tracked_stops::ARRIVALS_TIME_BUDGET`]. A failed read or request is
-/// logged and skipped; the sub-lane never fails the cycle.
+/// logged and skipped; the sub-lane alone never fails the cycle. Not charged
+/// to the hourly request budget: that caps `GetDepBoardWithDetails`, and
+/// the arrivals product is a separate RDM subscription with its own key.
 #[expect(
     clippy::cast_precision_loss,
     reason = "a gauge takes f64; the target count stays far below 2^52"
@@ -953,13 +1054,13 @@ async fn sample_tracked_arrivals(
     client: &Client,
     config: &Config,
     cadence: &mut Cadence,
-) -> Vec<TrackedStopArrivalBoard> {
+) -> LanePass<TrackedStopArrivalBoard> {
     let (Some(direct), Some(url), Some(key)) = (
         &config.reads.direct,
         config.ldbws_arrivals_url.as_deref(),
         config.ldbws_arrivals_consumer_key.as_ref(),
     ) else {
-        return Vec::new();
+        return LanePass::default();
     };
     let now = Utc::now();
     let targets = match ds_store::reads::tracked_stop_arrival_targets::tracked_stop_arrival_targets(
@@ -973,7 +1074,7 @@ async fn sample_tracked_arrivals(
         Ok(targets) => targets,
         Err(err) => {
             tracing::warn!(error = ?err, "could not read the tracked alighting stops; skipping the arrivals lane");
-            return Vec::new();
+            return LanePass::default();
         }
     };
     metrics::gauge!(ds_runtime::metrics::metric_name(
@@ -1044,7 +1145,7 @@ async fn sample_tracked_arrivals(
         TRACKED_STOP_ARRIVAL_SKIPPED_METRIC
     ))
     .increment(u64::try_from(skipped).unwrap_or(u64::MAX));
-    boards
+    LanePass { boards, attempted }
 }
 
 /// Where and how to ask the arrivals product (DS-152): the Secret's `url`
@@ -1102,7 +1203,7 @@ async fn fetch_board_window(
     );
     let response = client
         .get(&url)
-        .header(RDM_AUTH_HEADER_NAME, &config.rdm_api_key)
+        .header(RDM_AUTH_HEADER_NAME, config.rdm_api_key.expose())
         .send()
         .await?;
     let status = response.status();
@@ -1252,7 +1353,7 @@ async fn fetch_departures_once(
 
     let response = client
         .get(&url)
-        .header(RDM_AUTH_HEADER_NAME, &config.rdm_api_key)
+        .header(RDM_AUTH_HEADER_NAME, config.rdm_api_key.expose())
         .send()
         .await?;
 
@@ -1429,7 +1530,7 @@ mod tests {
     fn test_config(base_url: String, num_rows: u32) -> Config {
         Config {
             ldbws_base_url: base_url,
-            rdm_api_key: "test-api-key".to_string(),
+            rdm_api_key: "test-api-key".into(),
             num_rows,
             ingest: config::IngestArgs {
                 redis_url: Some("redis://127.0.0.1:1".to_owned()),
@@ -1576,9 +1677,9 @@ mod tests {
         config.tracked_stop_arrivals_enabled = true;
         config.ldbws_arrivals_url = Some(server.uri());
         config.ldbws_arrivals_consumer_key = Some("fake-arrivals-key".into());
-        let boards =
-            sample_tracked_arrivals(&Client::new(), &config, &mut Cadence::default()).await;
-        assert!(boards.is_empty());
+        let pass = sample_tracked_arrivals(&Client::new(), &config, &mut Cadence::default()).await;
+        assert!(pass.boards.is_empty());
+        assert_eq!(pass.attempted, 0);
     }
 
     /// Without a database the lane has nothing to read and polls nothing.
@@ -1591,14 +1692,105 @@ mod tests {
             .mount(&server)
             .await;
         let config = test_config(server.uri(), 10);
-        let boards = sample_tracked_stops(
+        let pass = sample_tracked_stops(
             &Client::new(),
             &config,
             &mut Cadence::default(),
             &mut PlatformHistory::new(),
+            &mut RequestBudget::unlimited(),
         )
         .await;
-        assert!(boards.is_empty());
+        assert!(pass.boards.is_empty());
+        assert_eq!(pass.attempted, 0);
+    }
+
+    fn tracked_target(
+        uid: &str,
+        crs: &str,
+        departs_in_minutes: i64,
+    ) -> ds_store::reads::tracked_stop_targets::TrackedStopTarget {
+        ds_store::reads::tracked_stop_targets::TrackedStopTarget {
+            train_uid: uid.to_string(),
+            service_date: Utc::now().date_naive(),
+            crs: crs.to_string(),
+            departs_at: Utc::now() + chrono::Duration::minutes(departs_in_minutes),
+        }
+    }
+
+    /// LEG-18: the tracked-stop lane's requests are charged to the hourly
+    /// request budget, and the lane stops when it is spent; the rest wait.
+    #[tokio::test]
+    async fn the_tracked_stop_lane_stops_at_the_hourly_request_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ONE_SERVICE_BODY))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut config = test_config(server.uri(), 10);
+        config.hourly_request_budget = 3;
+        // The rotation already spent one request of the hour this cycle.
+        let mut budget = RequestBudget::new(config.hourly_request_budget, 60);
+        budget.start_cycle();
+        assert_eq!(budget.try_acquire(std::time::Instant::now()), Ok(()));
+        let targets = [
+            tracked_target("A", "YRK", 10),
+            tracked_target("B", "LDS", 20),
+            tracked_target("C", "DON", 30),
+        ];
+        let due: Vec<_> = targets.iter().collect();
+
+        let pass = poll_tracked_stops(
+            &Client::new(),
+            &config,
+            &due,
+            &mut Cadence::default(),
+            &mut PlatformHistory::new(),
+            &mut budget,
+        )
+        .await;
+
+        assert_eq!(pass.attempted, 2);
+        let polled: Vec<&str> = pass.boards.iter().map(|b| b.crs.as_str()).collect();
+        assert_eq!(
+            polled,
+            ["YRK", "LDS"],
+            "soonest first, until the hour is spent"
+        );
+        assert_eq!(
+            budget.check(std::time::Instant::now()),
+            Err(BudgetLimit::Hour)
+        );
+    }
+
+    /// With no budget set (the default), the lane polls up to its own cap.
+    #[tokio::test]
+    async fn the_tracked_stop_lane_without_a_budget_polls_up_to_its_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ONE_SERVICE_BODY))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut config = test_config(server.uri(), 10);
+        config.tracked_stop_max_requests_per_cycle = 2;
+        let targets = [
+            tracked_target("A", "YRK", 10),
+            tracked_target("B", "LDS", 20),
+            tracked_target("C", "DON", 30),
+        ];
+        let due: Vec<_> = targets.iter().collect();
+        let pass = poll_tracked_stops(
+            &Client::new(),
+            &config,
+            &due,
+            &mut Cadence::default(),
+            &mut PlatformHistory::new(),
+            &mut RequestBudget::unlimited(),
+        )
+        .await;
+        assert_eq!(pass.attempted, 2);
+        assert_eq!(pass.boards.len(), 2);
     }
 
     #[tokio::test]
@@ -2207,6 +2399,8 @@ mod tests {
     /// `run` wires them, with the stream sink on an unreachable Redis.
     struct Outage {
         ldbws: MockServer,
+        /// The stations the fake LDBWS answers with a 500.
+        failing: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         config: Config,
         history: PlatformHistory,
         rotation: Rotation,
@@ -2230,9 +2424,10 @@ mod tests {
         /// every fetch fails and the cycle falls back on that list.
         async fn start(names: Option<&[&str]>) -> Self {
             let ldbws = MockServer::start().await;
+            let failing = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             Mock::given(method("GET"))
                 .respond_with(FakeLdbws {
-                    failing: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                    failing: std::sync::Arc::clone(&failing),
                 })
                 .mount(&ldbws)
                 .await;
@@ -2243,6 +2438,7 @@ mod tests {
             let sink = SampleSink::from_config(&config).expect("stream sink");
             Self {
                 ldbws,
+                failing,
                 config,
                 history: PlatformHistory::new(),
                 rotation: Rotation::new(std::time::Instant::now()),
@@ -2309,6 +2505,58 @@ mod tests {
         }
         assert_eq!(boards[0].len(), 2, "{boards:?}");
         assert_eq!(boards[0], boards[1], "the rotation held");
+    }
+
+    /// Every LDBWS request failing fails the cycle (it is not a successful
+    /// empty cycle), and the rotation still moves on to the next stations.
+    #[tokio::test]
+    async fn a_cycle_in_which_every_request_failed_reports_failure() {
+        let mut outage = Outage::start(Some(&["AAA", "BBB", "CCC", "DDD"])).await;
+        *outage.failing.lock().unwrap() = ["AAA", "BBB", "CCC", "DDD"].map(String::from).to_vec();
+        let mut seen = 0;
+
+        let err = outage.cycle().await.expect_err("nothing was fetched");
+        assert!(
+            format!("{err:#}").contains("every LDBWS request this cycle failed (2 attempted)"),
+            "{err:#}"
+        );
+        let first = outage.take_boards(&mut seen).await;
+        assert_eq!(first.len(), 2, "{first:?}");
+
+        outage.cycle().await.expect_err("still nothing fetched");
+        // A fresh rotation starts at a clock-derived offset, so compare
+        // sets: the second cycle polls the other two stations.
+        let mut both = outage.take_boards(&mut seen).await;
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(
+            both.iter().all(|crs| !first.contains(crs)),
+            "the rotation moved on: {first:?} then {both:?}"
+        );
+        both.extend(first);
+        both.sort();
+        assert_eq!(both, ["AAA", "BBB", "CCC", "DDD"]);
+    }
+
+    #[test]
+    fn only_a_cycle_whose_requests_all_failed_counts_as_failed() {
+        let none = TrackedBoards::default();
+        assert!(every_request_failed(3, 0, &none));
+        // Nothing to fetch (or a budget that allowed nothing) is not a
+        // failure.
+        assert!(!every_request_failed(0, 0, &none));
+        // One success is enough.
+        assert!(!every_request_failed(3, 1, &none));
+        let one_board = TrackedBoards {
+            departures: vec![TrackedStopBoard {
+                train_uid: "A".to_string(),
+                service_date: Utc::now().date_naive(),
+                crs: "YRK".to_string(),
+                polled_at: Utc::now(),
+                departures: Vec::new(),
+            }],
+            arrivals: Vec::new(),
+        };
+        assert!(!every_request_failed(3, 0, &one_board));
     }
 
     /// A fresh process has no station list to fall back on: while none can

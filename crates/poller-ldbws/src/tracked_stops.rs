@@ -15,10 +15,11 @@
 //!   [`BEHIND`] ago to [`HORIZON`] ahead.
 //! - **Cadence**: each stop every 2 minutes, every minute once its train is
 //!   within [`NEAR`] of departure ([`Cadence`]).
-//! - **Budget**: its own, separate from the station rotation's: at most
-//!   `TRACKED_STOP_MAX_REQUESTS_PER_CYCLE` requests and
-//!   [`LANE_TIME_BUDGET`] a cycle, soonest departure first. Off unless
-//!   `TRACKED_STOP_POLL_ENABLED`.
+//! - **Budget**: its own per-cycle one, separate from the station
+//!   rotation's: at most `TRACKED_STOP_MAX_REQUESTS_PER_CYCLE` requests and
+//!   [`LANE_TIME_BUDGET`] a cycle, soonest departure first. Each request
+//!   also counts against `HOURLY_REQUEST_BUDGET`'s rolling hour when that
+//!   is set (`budget.rs`). Off unless `TRACKED_STOP_POLL_ENABLED`.
 //! - **Output**: one `tracked-stop-boards/1` row per stop polled, in the
 //!   same snapshot as the cycle's station samples.
 //!
