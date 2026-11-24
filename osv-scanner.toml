@@ -4,10 +4,14 @@
 # finding is reported again at expiry: as a blocking error if it is
 # CVSS >= 9.0 with a fixed version by then, otherwise as a non-blocking
 # warning (see that workflow's header).
+#
+# Renewed 2026-11-24 to 2027-02-17 (DS-615): gtfs-structures 0.52 (latest) still
+# requires zip ^8.6 and zip 8 has no fix, so there is no upgrade path; the
+# reachability analysis in each reason is unchanged.
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0369"
-ignoreUntil = 2026-12-18T00:00:00Z
+ignoreUntil = 2027-02-17T00:00:00Z
 reason = """\
 zip 8.6.0 (GHSA-4684-h2q9-2vcp, Unix permissions applied through symlinks \
 by ZipArchive::extract()/ZipStreamReader::extract()). Unreachable: no code in \
@@ -22,7 +26,7 @@ otherwise review again.\
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0367"
-ignoreUntil = 2026-12-18T00:00:00Z
+ignoreUntil = 2027-02-17T00:00:00Z
 reason = """\
 zip 8.6.0 (GHSA-vv5m-jxxh-4627, SUID/SGID bits kept by \
 ZipArchive::extract() and stream extraction). Unreachable: no code in this \
@@ -36,7 +40,7 @@ Accepted by the user 2026-10-19; at expiry, bump gtfs-structures and \
 
 [[IgnoredVulns]]
 id = "GHSA-m665-v7pm-7grj"
-ignoreUntil = 2026-12-18T00:00:00Z
+ignoreUntil = 2027-02-17T00:00:00Z
 reason = """\
 zip 8.6.0 ("zip cloaking": local and central headers that disagree, so \
 two parsers see different entries; file overwrite or RCE on extraction). \
@@ -66,7 +70,7 @@ otherwise review again.\
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0429"
-ignoreUntil = 2026-12-18T00:00:00Z
+ignoreUntil = 2027-02-17T00:00:00Z
 reason = """\
 zip 8.6.0 (GHSA-q7v9-x93c-xqv3, CVSS 7.5: ZipArchive::extract() aborts \
 the process allocating a symlink-target buffer sized from the declared \
@@ -83,7 +87,7 @@ otherwise review again.\
 
 [[IgnoredVulns]]
 id = "GHSA-9hj8-73fh-9963"
-ignoreUntil = 2026-12-18T00:00:00Z
+ignoreUntil = 2027-02-17T00:00:00Z
 reason = """\
 zip 8.6.0 (CVSS 7.5: the legacy Shrink/Reduce/Implode decoders reserve \
 memory from an attacker-declared ZIP64 size and panic). Not compiled: \
@@ -99,7 +103,7 @@ shipped, otherwise review again.\
 
 [[IgnoredVulns]]
 id = "GHSA-hjqx-j4rw-g7xv"
-ignoreUntil = 2026-12-18T00:00:00Z
+ignoreUntil = 2027-02-17T00:00:00Z
 reason = """\
 zip 8.6.0 (CVSS 7.4: ZipArchive::extract() validates symlink targets \
 lexically, so an archive can write outside the extraction directory). \
@@ -113,7 +117,7 @@ creates files from entry names. No zip 8 fix exists and gtfs-structures \
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0368"
-ignoreUntil = 2026-12-18T00:00:00Z
+ignoreUntil = 2027-02-17T00:00:00Z
 reason = """\
 zip 8.6.0 (GHSA-4v9h-p7m9-rh26: ZipArchive::extract() creates symlinks \
 whose targets point outside the destination). Unreachable: no code in this \
@@ -126,7 +130,7 @@ still requires zip ^8.6 (DS-58). At expiry, bump gtfs-structures and \
 
 [[IgnoredVulns]]
 id = "GHSA-8hxf-qr8p-62x4"
-ignoreUntil = 2026-12-18T00:00:00Z
+ignoreUntil = 2027-02-17T00:00:00Z
 reason = """\
 zip 8.6.0 (CVSS 6.5: an AES-encrypted entry's HMAC is skipped on a \
 premature EOF). Not compiled: AES entries need zip's `aes-crypto` feature, \

@@ -36,16 +36,18 @@ ignore = [
     # a zip 8/9 parsing differential is theoretically possible. Mitigated
     # by the 64 MiB compressed cap, the https-only fetch from a single
     # transport-authority URL and the pod memory limit (768Mi). The
-    # reasoning and the 2026-12-18 review date are in osv-scanner.toml
+    # reasoning and the 2027-02-17 review date are in osv-scanner.toml
     # (DS-58, DS-350).
-    { id = "RUSTSEC-2026-0367", reason = "zip 8 extract() only, never called; see osv-scanner.toml" }, # expires 2026-12-18
-    { id = "RUSTSEC-2026-0368", reason = "zip 8 extract() only, never called; see osv-scanner.toml" }, # expires 2026-12-18
-    { id = "RUSTSEC-2026-0369", reason = "zip 8 extract() only, never called; see osv-scanner.toml" }, # expires 2026-12-18
-    { id = "RUSTSEC-2026-0429", reason = "zip 8 extract() only, never called; see osv-scanner.toml" }, # expires 2026-12-18
-    { id = "RUSTSEC-2026-0545", reason = "zip 8 aes-crypto feature not compiled (gtfs-structures enables deflate only); no decrypt API called; the feed is not encrypted" }, # expires 2026-12-18
-    { id = "RUSTSEC-2026-0546", reason = "zip 8 extract()/extract_unwrapped_root_dir only; never called, entries are read in memory" }, # expires 2026-12-18
-    { id = "RUSTSEC-2026-0547", reason = "zip 8 legacy-zip feature (Shrink/Reduce/Implode decoders) not compiled; unsupported methods return CompressionMethodNotSupported" }, # expires 2026-12-18
-    { id = "RUSTSEC-2026-0548", reason = "zip 8 ZipStreamReader/read_zipfile_from_stream only; never used, gtfs-structures reads via the seekable ZipArchive" }, # expires 2026-12-18
+    # Renewed 2026-11-24 to 2027-02-17 (DS-615): gtfs-structures 0.52 still
+    # requires zip ^8.6 and zip 8 has no fix, so no upgrade path; analysis unchanged.
+    { id = "RUSTSEC-2026-0367", reason = "zip 8 extract() only, never called; see osv-scanner.toml" }, # expires 2027-02-17
+    { id = "RUSTSEC-2026-0368", reason = "zip 8 extract() only, never called; see osv-scanner.toml" }, # expires 2027-02-17
+    { id = "RUSTSEC-2026-0369", reason = "zip 8 extract() only, never called; see osv-scanner.toml" }, # expires 2027-02-17
+    { id = "RUSTSEC-2026-0429", reason = "zip 8 extract() only, never called; see osv-scanner.toml" }, # expires 2027-02-17
+    { id = "RUSTSEC-2026-0545", reason = "zip 8 aes-crypto feature not compiled (gtfs-structures enables deflate only); no decrypt API called; the feed is not encrypted" }, # expires 2027-02-17
+    { id = "RUSTSEC-2026-0546", reason = "zip 8 extract()/extract_unwrapped_root_dir only; never called, entries are read in memory" }, # expires 2027-02-17
+    { id = "RUSTSEC-2026-0547", reason = "zip 8 legacy-zip feature (Shrink/Reduce/Implode decoders) not compiled; unsupported methods return CompressionMethodNotSupported" }, # expires 2027-02-17
+    { id = "RUSTSEC-2026-0548", reason = "zip 8 ZipStreamReader/read_zipfile_from_stream only; never used, gtfs-structures reads via the seekable ZipArchive" }, # expires 2027-02-17
     # chrono: informational "unmaintained" advisory
     # (RUSTSEC-2026-0543), not a vulnerability. All
     # versions are affected and no patched release exists. chrono is a
