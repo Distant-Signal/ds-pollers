@@ -20,7 +20,7 @@ use ds_runtime::metrics::metric_name;
 use crate::Context;
 use crate::adapter::gtfs::{self, GtfsOptions};
 use crate::adapter::txc::{self, TxcOptions};
-use crate::adapter::{FeedError, download_to_file, finish_download, ftp, part_path};
+use crate::adapter::{FeedError, Retry, download_zip_to_file, finish_download, ftp, part_path};
 use crate::model::TransitModel;
 use crate::network::AdapterKind;
 use crate::{feed_guard, item, naptan, rail_links};
@@ -65,12 +65,21 @@ fn fetched(ctx: &Context, source: &'static str, outcome: &'static str) {
 }
 
 /// Downloads the network's timetable zip to `path`: GTFS over HTTPS, or
-/// `TransXChange` over HTTPS or (TNDS) FTP with the login. The bytes.
+/// `TransXChange` over HTTPS or (TNDS) FTP with the login. The bytes. The
+/// HTTPS downloads are checked complete and retried if cut short
+/// ([`download_zip_to_file`]).
 async fn download(ctx: &Context, path: &std::path::Path) -> Result<u64, FeedError> {
     let config = &ctx.config;
     match ctx.network.adapter {
         AdapterKind::Gtfs => {
-            download_to_file(&ctx.client, &config.gtfs_url, path, config.gtfs_max_bytes).await
+            download_zip_to_file(
+                &ctx.client,
+                &config.gtfs_url,
+                path,
+                config.gtfs_max_bytes,
+                &Retry::new(&ctx.network.id, "gtfs"),
+            )
+            .await
         }
         AdapterKind::Txc if config.txc_over_ftp() => {
             let login = ftp::Login {
@@ -92,7 +101,14 @@ async fn download(ctx: &Context, path: &std::path::Path) -> Result<u64, FeedErro
             .await
         }
         AdapterKind::Txc => {
-            download_to_file(&ctx.client, &config.txc_url, path, config.txc_max_bytes).await
+            download_zip_to_file(
+                &ctx.client,
+                &config.txc_url,
+                path,
+                config.txc_max_bytes,
+                &Retry::new(&ctx.network.id, "txc"),
+            )
+            .await
         }
     }
 }
