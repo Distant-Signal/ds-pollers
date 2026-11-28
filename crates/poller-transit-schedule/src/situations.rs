@@ -19,7 +19,11 @@ use ingest_stream::snapshot::Snapshot;
 use ingest_stream::{Envelope, SchemaId};
 
 use crate::Context;
-use crate::adapter::{FeedError, sirisx};
+use crate::adapter::diagnostics::{
+    Class, Failure, PREVIEW_BYTES, ResponseInfo, Seen, attempted, has_zip_magic, report,
+    retry_pause, safe_url_str, unreadable_body,
+};
+use crate::adapter::{FeedError, Retry, sirisx};
 
 /// The archive's download cap (290 KB on 2026-10-09).
 pub(crate) const MAX_ARCHIVE_BYTES: u64 = 50 * 1024 * 1024;
@@ -33,26 +37,73 @@ pub(crate) const UNMAPPED_LINE_REFS: &str = "transit_situation_unmapped_line_ref
 /// network's own, else `other`).
 pub(crate) const SITUATIONS_SKIPPED: &str = "transit_situations_skipped_total";
 
-/// The archive, or `None` when it is unchanged (HTTP 304).
-async fn download(ctx: &Context) -> Result<Option<Vec<u8>>, FeedError> {
-    let io = |err: &dyn std::fmt::Display| FeedError::Io(format!("SIRI-SX download: {err}"));
+/// One attempt: the archive and its `ETag`, or `None` when it is
+/// unchanged (HTTP 304). The body is checked to be a readable zip, so a
+/// 200 with an error page or a cut archive fails here with what the
+/// response looked like ([`diagnostics::report`]).
+#[expect(clippy::too_many_lines, reason = "one request, checked at each step")]
+async fn fetch_once(ctx: &Context) -> Result<Option<(Vec<u8>, Option<String>)>, Box<Failure>> {
+    let target = safe_url_str(&ctx.config.situations_url);
+    let mut seen = Seen::default();
+    let fail = |seen: &Seen, class, retryable, err| {
+        Box::new(Failure {
+            err,
+            class,
+            retryable,
+            seen: seen.clone(),
+        })
+    };
+    // reqwest's own text names the URL, query included, so it is left out.
+    let transport = |seen: &Seen, err: reqwest::Error| {
+        let class = if seen.info.is_some() {
+            Class::TruncatedZip
+        } else {
+            Class::Error
+        };
+        fail(
+            seen,
+            class,
+            true,
+            FeedError::Io(format!("SIRI-SX download: {}", err.without_url())),
+        )
+    };
     let mut request = ctx.client.get(&ctx.config.situations_url);
     let etag = ctx.situations_etag.lock().ok().and_then(|e| e.clone());
     if let Some(etag) = &etag {
         request = request.header(reqwest::header::IF_NONE_MATCH, etag);
     }
-    let mut response = request.send().await.map_err(|err| io(&err))?;
+    let mut response = request.send().await.map_err(|err| transport(&seen, err))?;
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         return Ok(None);
     }
-    if let Err(err) = poller_http::check_status(&response, "transit-situations") {
-        return Err(io(&err));
+    let info = ResponseInfo::from_response(&response);
+    seen.info = Some(info.clone());
+    let status = response.status();
+    if !status.is_success() {
+        let _ = poller_http::check_status(&response, "transit-situations");
+        let after = info
+            .retry_after
+            .map_or_else(String::new, |d| format!(", retry-after {}s", d.as_secs()));
+        return Err(fail(
+            &seen,
+            Class::HttpStatus,
+            status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error(),
+            FeedError::Io(format!(
+                "SIRI-SX download: HTTP {status} from {target}{after}"
+            )),
+        ));
     }
-    if response
-        .content_length()
-        .is_some_and(|len| len > MAX_ARCHIVE_BYTES)
-    {
-        return Err(FeedError::Oversize("the SIRI-SX archive".to_owned()));
+    seen.declared = response.content_length();
+    let oversize = |seen: &Seen| {
+        fail(
+            seen,
+            Class::Error,
+            false,
+            FeedError::Oversize("the SIRI-SX archive".to_owned()),
+        )
+    };
+    if seen.declared.is_some_and(|len| len > MAX_ARCHIVE_BYTES) {
+        return Err(oversize(&seen));
     }
     let new_etag = response
         .headers()
@@ -60,16 +111,82 @@ async fn download(ctx: &Context) -> Result<Option<Vec<u8>>, FeedError> {
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|err| io(&err))? {
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(err) => return Err(transport(&seen, err)),
+        };
+        if seen.head.len() < PREVIEW_BYTES {
+            let take = (PREVIEW_BYTES - seen.head.len()).min(chunk.len());
+            seen.head.extend_from_slice(&chunk[..take]);
+        }
         body.extend_from_slice(&chunk);
-        if body.len() as u64 > MAX_ARCHIVE_BYTES {
-            return Err(FeedError::Oversize("the SIRI-SX archive".to_owned()));
+        seen.received = body.len() as u64;
+        if seen.received > MAX_ARCHIVE_BYTES {
+            return Err(oversize(&seen));
         }
     }
-    if let Ok(mut slot) = ctx.situations_etag.lock() {
-        *slot = new_etag;
+    if let Some(declared) = seen.declared
+        && declared != seen.received
+    {
+        return Err(fail(
+            &seen,
+            Class::TruncatedZip,
+            true,
+            FeedError::Io(format!(
+                "SIRI-SX download: received {} of {declared} bytes",
+                seen.received
+            )),
+        ));
     }
-    Ok(Some(body))
+    let readable = if has_zip_magic(&seen.head) {
+        zip::ZipArchive::new(std::io::Cursor::new(&body))
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    } else {
+        Err("no zip signature".to_owned())
+    };
+    match readable {
+        Ok(()) => Ok(Some((body, new_etag))),
+        Err(zip_error) => Err(unreadable_body(seen, &zip_error, "SIRI-SX: ")),
+    }
+}
+
+/// The archive, or `None` when it is unchanged (HTTP 304), with the
+/// retries of [`crate::adapter::download_zip_to_file`] (a truncated body
+/// again, a page that is not a zip once, a 429 or 5xx with its short
+/// `Retry-After`), then the failure.
+async fn download(ctx: &Context) -> Result<Option<Vec<u8>>, FeedError> {
+    let retry = Retry::new(&ctx.network.id, "sirisx");
+    let started = std::time::Instant::now();
+    let mut attempt = 1;
+    loop {
+        let failure = match fetch_once(ctx).await {
+            Ok(Some((body, new_etag))) => {
+                attempted(retry.network, retry.source, "ok");
+                if let Ok(mut slot) = ctx.situations_etag.lock() {
+                    *slot = new_etag;
+                }
+                return Ok(Some(body));
+            }
+            Ok(None) => return Ok(None),
+            Err(failure) => failure,
+        };
+        report(retry.network, retry.source, attempt, &failure);
+        let Some(pause) = retry_pause(
+            &failure,
+            attempt,
+            retry.attempts,
+            retry.backoff,
+            started.elapsed(),
+            retry.window,
+        ) else {
+            return Err(failure.err);
+        };
+        tokio::time::sleep(pause).await;
+        attempt += 1;
+    }
 }
 
 /// Counts (and, for the network's own, logs) the situations skipped for an

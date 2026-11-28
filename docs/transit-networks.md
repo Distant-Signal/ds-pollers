@@ -572,6 +572,41 @@ only the open data download.
    change counts enough to trip the sharp-drop guard
    (`feedMaxDropFraction`; `transit_feed_refused_total{reason="sharp_drop"}`).
 
+## A failed download
+
+The GTFS (and TXC over HTTPS) timetable download and the SIRI-SX fetch
+check what they received before anything is parsed or sent: the byte count
+against a `Content-Length` when the server sent one, then that the zip's
+central directory reads. Nothing partial is ever parsed, written to the
+stream or left in the work dir. Each failed attempt logs one `WARN`, "the
+timetable download failed", with `class`, `status`, the final `target`
+(scheme, host and path only: the query, which can carry a key, is never
+logged), `headers` (content-type, content-length, content-encoding, server,
+retry-after, x-ratelimit*), `received_bytes`, `expected_bytes`, `zip_magic`
+and, only when the body is not a zip, a `preview` of its first 120 bytes
+(printable ASCII). It also counts
+`transit_feed_download_attempts_total{network, source, outcome}`, with
+`outcome` `ok`, `not_a_zip`, `truncated_zip`, `http_status` or `error`.
+
+- `truncated_zip` (the zip magic but an unreadable archive, a body shorter
+  than its `Content-Length`, or a cut connection): up to 3 attempts, with
+  a pause of 5 s then 10 s plus jitter, and no retry started 10 minutes
+  after the first (an attempt itself runs up to the 15-minute request
+  timeout, and the Job's `activeDeadlineSeconds` is the chart's, in
+  ds-deploy).
+- `not_a_zip` (an error page, an empty body, a changed format, a redirect
+  to a login page): one retry, then the failure names the status and
+  content-type. Read the `preview` and `target` first: a retry will not
+  fix it.
+- `http_status`: a 429 or 5xx is retried like a truncation, waiting for its
+  `Retry-After` (seconds, at most 30); any other status fails at once.
+
+After the attempts the run fails as before (`malformed` or `fetch` in
+`transit_feed_refused_total`, so `DistantSignalTransitFeedRefused` still
+fires, and a once-mode Job fails and is retried by the CronJob's
+`backoffLimit`). The situations loop retries within its 5-minute cycle the
+same way, and a failed cycle drops the `ETag`.
+
 ## Adding a network
 
 Each network is compiled in and has its own stream, user and switches.
